@@ -158,7 +158,7 @@ d.qpos[0]=6; d.qpos[1]=6; mujoco.mj_forward(m,d)
 
 yaw=0.0; bounce=0; force_steps=0; escaping=False
 wp_idx=0; step=0; speed=SPEED; t0=time.time()
-stuck_t=0; stuck_x=0.0; stuck_y=0.0; target=None
+stuck_t=0; stuck_x=0.0; stuck_y=0.0; target=None; RENDER_SKIP=3
 
 print(f"=== algo2 体素 v5 === {VOXEL}m³ LIDAR={LIDAR_RANGE}m", flush=True)
 
