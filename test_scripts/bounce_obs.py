@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """bounce_obs — V8 + 障碍物 + 1.5m预判碰撞 + 防卡死"""
 import sys, os, math, time, random
-import numpy as np, cv2, mujoco, mujoco.viewer
+import numpy as np, mujoco, mujoco.viewer
+from PIL import Image
 
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
-hf = cv2.imread(MAP, cv2.IMREAD_GRAYSCALE)
+hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 DETECT_R = 0.5  # 预判检测半径 (0.2s冲0.3m可脱身)
