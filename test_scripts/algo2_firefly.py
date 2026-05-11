@@ -103,8 +103,9 @@ def find_gate_path(bx, by, wp_idx):
         
         # 出口=FREE体素(扫描过但没走过的)
         if vox[cy, cx] == FREE:
-            score = -cg  # 越近越好
             dot = ((cx-sx)*wp_dx + (cy-sy)*wp_dy) / max(1, math.hypot(cx-sx, cy-sy))
+            if dot < 0: continue      # 禁止往回走, 交给wall following
+            score = -cg  # 越近越好
             score += (dot+1)*30  # 朝WP加分
             # UNKNOWN邻居加分(鼓励去新区附近)
             unk_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
@@ -284,8 +285,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                     for ndx in range(-15, 16):
                         nx, ny = sx+ndx, sy+ndy
                         if 0<=nx<W and 0<=ny<W and vox[ny,nx]==WALL:
-                            d = math.hypot(ndx, ndy)
-                            if d < best_wd: best_wd = d; wx, wy = nx, ny
+                            dd = math.hypot(ndx, ndy)
+                            if dd < best_wd: best_wd = dd; wx, wy = nx, ny
                 if best_wd < 999:
                     dx_r = bx-(wx+0.5)*VOXEL; dy_r = by-(wy+0.5)*VOXEL
                     d_r = math.hypot(dx_r, dy_r) or 0.01
