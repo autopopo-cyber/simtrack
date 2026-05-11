@@ -179,7 +179,7 @@ wp_idx=0; step=0; speed=SPEED; current_lane="中"; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep); lidar_tick=0
 RENDER_SKIP = 3
 stuck_step=0; stuck_x=0.0; stuck_y=0.0
-clr={"中":(999,5),"左":(999,5),"右":(999,5)}
+clr={"中":(999,5),"左":(999,5),"右":(999,5)}; exit_result=None
 
 print(f"=== algo2_lane_switch v2 === 居中找出口 前方<{FWD_BLOCKED}m触发", flush=True)
 
