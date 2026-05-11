@@ -313,7 +313,25 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                         last_gate = path[-1]
                         print(f"  🚪 next gate=({last_gate[0]:.0f},{last_gate[1]:.0f}) len={len(path)}", flush=True)
                     else:
-                        print(f"  ⚡ no next gate", flush=True)
+                        print(f"  ⚡ no next gate, retreat+rescan", flush=True)
+                    # 退后2m: 反向移动
+                    bx2, by2 = d.qpos[0], d.qpos[1]
+                    wp_tx, wp_ty = nav_wps[min(wp_idx, len(nav_wps)-1)]
+                    retreat_yaw = math.atan2(by2-wp_ty, bx2-wp_tx)  # 朝远离WP方向
+                    mv.yaw = retreat_yaw
+                    for _ in range(80):  # 0.4s后退
+                        d.qvel[0] = math.cos(retreat_yaw) * 2.0
+                        d.qvel[1] = math.sin(retreat_yaw) * 2.0
+                        if step % LIDAR_TICK == 0: scan_voxels(d.qpos[0], d.qpos[1])
+                        mujoco.mj_step(m, d); step += 1
+                        if step % RENDER_SKIP == 0: v.sync()
+                    path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+                    path_idx = 0
+                    if path:
+                        gate = path[-1]
+                        print(f"  🚪 retreat gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
+                    else:
+                        print(f"  ⚡ still no gate after retreat", flush=True)
             else:
                 mv.step(tx, ty, step)
         else:
