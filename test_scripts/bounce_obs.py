@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""bounce_obs — V8原版 + 障碍物"""
+"""bounce_obs — V8原版 + 障碍物 + 碰撞转30~90°"""
 import sys, os, math, time, random
 import numpy as np, cv2, mujoco, mujoco.viewer
 
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 hf = cv2.imread(MAP, cv2.IMREAD_GRAYSCALE)
 
-SCALE = 2.0
-HF_RES = 2000
-PIX_PER_M = 40
-ROAD_PIX = 128
+SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 
 def sample_hfield_at(wx, wy):
     mx, my = wx / SCALE, wy / SCALE
@@ -27,7 +24,7 @@ def detect_collision(wx, wy, radius=0.6):
                 return True
     return False
 
-# ── 障碍物 (中心线+随机, 世界坐标) ──
+# ── 障碍物 ──
 def gen_centerline():
     pts = []
     y0 = 2.5
@@ -44,8 +41,7 @@ def gen_centerline():
 
 rng = random.Random()
 obs_world = []
-idx = 0
-cl = gen_centerline()
+idx = 0; cl = gen_centerline()
 while idx < len(cl):
     cx, cy = cl[idx]
     wx, wy = cx * SCALE, cy * SCALE
@@ -60,19 +56,27 @@ obs_xml = "".join(
 
 def detect_obs(wx, wy):
     for ox, oy in obs_world:
-        if math.hypot(wx - ox, wy - oy) < 1.55:  # 障碍半径1.0 + 机器人半径0.55
+        if math.hypot(wx - ox, wy - oy) < 1.55:
             return True
     return False
 
+# ── 检查点 ──
+cps_maze = [(3,3),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
+cps_world = [(x*SCALE,y*SCALE) for x,y in cps_maze]
+cp_xml = "".join(
+    f'<body mocap="true" pos="{x} {y} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>'
+    for x, y in cps_world[1:]
+)
+
 print(f"V8+障碍物: {len(obs_world)}个  speed=1.5", flush=True)
 
-# ── 场景 ──
 xml = f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
   <asset><hfield name="track" size="50.0 50.0 4.0 2.0" file="{MAP}"/></asset>
   <worldbody>
     <light pos="50 50 80" dir="0 0 -1"/>
+    {cp_xml}
     {obs_xml}
     <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
     <body name="bot" pos="0 0 0.5">
@@ -104,11 +108,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         nx = bx + vx * m.opt.timestep; ny = by + vy * m.opt.timestep
 
         if detect_collision(nx, ny, 0.55) or detect_obs(nx, ny):
-            yaw = random.uniform(0, 2 * np.pi)
+            deg = random.uniform(30, 90) * random.choice([-1, 1])
+            yaw += math.radians(deg)
             d.qvel[:] = 0
             bounce += 1
             if bounce <= 10 or bounce % 20 == 0:
-                print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f})", flush=True)
+                print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) Δ{deg:+.0f}°", flush=True)
         else:
             d.qvel[0] = vx; d.qvel[1] = vy
 
