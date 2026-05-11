@@ -1,135 +1,91 @@
-# SimTrack — 模块化赛道避障仿真系统
+# SimTrack — 萤火算法 🔥✨
 
-[![tests](https://img.shields.io/badge/tests-15/15-brightgreen)](tests/)
+[![firefly](https://img.shields.io/badge/algorithm-Firefly-gold)](test_scripts/algo2_lane_switch_v7.py)
 [![python](https://img.shields.io/badge/python-3.8+-blue)]()
 
-**地图/障碍物/雷达/算法/模型五组件可替换的 MuJoCo 赛道避障仿真。**
+**40亿 token 烧出来的导航避障算法。不贪心、不预判、不看远——但每一步踩下去都是亮的。**
+
+---
+
+## 命名：萤火（Firefly）
+
+它不是太阳，不照亮整个地图。不是探照灯，不扫射全局。
+
+它只是黑暗里的一只萤火虫——每次只闪一下，只照亮前方一小片光斑。然后朝最干净的那片光斑飞过去。到了再闪一下，再看。
 
 ```
-simtrack/
-├── simtrack/
-│   ├── trackgen.py       # 蛇形赛道 hfield 生成 (2000×2000, 3m 护栏)
-│   ├── obstacles.py      # 沿赛道中轴线随机障碍物生成
-│   ├── lidar.py          # 多线激光雷达 (10Hz, 点数/线数可调)
-│   ├── simulation.py     # 主仿真运行器 (组件化)
-│   ├── algorithms/
-│   │   ├── base.py       # 避障算法抽象基类
-│   │   └── vo.py         # VO 避障 (朗毅, 切线搜索+滞后防抖)
-│   └── models/
-│       └── cylinder.py   # 圆柱体仿真模型
-├── tests/
-│   ├── test_trackgen.py
-│   ├── test_obstacles.py
-│   └── test_vo.py
-└── examples/
-    └── run_cylinder_vo.py
+LIDAR 10Hz     = 萤火的闪光
+line_clear     = 只挑直线可达的光斑
+wall_distance  = 在光斑里选离墙最远的
 ```
 
-## 五组件可替换
+**越简单的循环越不犯错。**
 
-| 组件 | 默认 | 替换方式 |
-|------|------|---------|
-| **地图** | `TrackGenerator` (10段蛇形, 3m护栏) | `generate()` + `save()` 到 PNG |
-| **障碍物** | `ObstacleGenerator` (沿赛道中轴线, 间距4-8m) | 传入自定义 `ObstacleGenerator` |
-| **雷达** | `LidarSensor` (240射线/3线/15m/10Hz) | 传入自定义 `LidarSensor` |
-| **算法** | `VOAlgorithm` (切线搜索+滞后防抖) | 实现 `AvoidanceAlgorithm` 基类 |
-| **模型** | `build_cylinder_scene()` (圆柱体) | 实现自定义 `build_*_scene()` |
+---
 
-## 快速开始
+## 核心哲学
 
-```python
-from simtrack import Simulation, TrackGenerator
-from simtrack.algorithms import VOAlgorithm
+| 传统导航 | 萤火算法 |
+|---------|---------|
+| 全局路径规划 | 只看下一秒 |
+| 预测+优化 | 闪一下→挑一个→冲过去 |
+| 感知/规划/控制耦合 | LIDAR只管画体素，Move只管走直线 |
+| 聪明=复杂 | 聪明=约束 |
 
-# 1. 生成赛道
-tg = TrackGenerator(hf_res=2000, guard_height=3.0)
-tg.generate()
-tg.save("/tmp/track_hd.png")
+**"看"和"走"彻底解耦**——LIDAR 10Hz 只负责填体素（自由/墙壁/已走），Move 1Hz 只负责在直线可达的非墙体素里挑离墙最远的，直线冲过去。到了再问 LIDAR "前面啥情况"——下一秒的事下一秒再说。
 
-# 2. 运行仿真
-sim = Simulation(
-    track_hfield="/tmp/track_hd.png",
-    algorithm=VOAlgorithm(max_speed=3.0),
-    lidar_rays=240,
-    seed=None,  # 每次不同障碍物布局
-)
-sim.setup()
-result = sim.run(headless=True)
-print(f"完成: {result['time']:.0f}s, 碰撞{result['collisions']}次")
-```
-
-## 架构: 三层导航
+## 算法流程
 
 ```
-┌─────────────────────────────────────────┐
-│ L1 全局导航 (Waypoints)                  │
-│ 提供方向。绝对坐标，不可靠但足够用。        │
-│ → waypoints 序列，每 8m 一个              │
-├─────────────────────────────────────────┤
-│ L2 通道识别 (SectorNav)                  │
-│ 雷达点云→扇区距离→通道判断。               │
-│ 墙壁=通道边界，障碍物=要绕开的威胁。        │
-│ 不聚类、不识别、只问"这个方向通不通"        │
-│ → 扇区距离图 + 通/堵判定                  │
-├─────────────────────────────────────────┤
-│ L3 动态避障 (TBD)                        │
-│ 活动障碍物快速反应，尽量少减速。            │
-│ → 暂留空                                  │
-└─────────────────────────────────────────┘
+loop:
+  LIDAR 扫描 (10Hz)  →  标记体素: FREE / WALL / VISITED
+  
+  Move 决策 (1Hz)    →  find_frontier():
+    1. 遍历 20×20 范围内的 FREE 体素
+    2. line_clear 过滤: 直线是否无遮挡
+    3. 邻接检查: 必须挨着已探索区域
+    4. 评分:
+       - 偏离目标方向   (越偏越扣)
+       + 离墙距离       (越远越好)  ← v7 核心创新
+       + 未知邻居数     (越多越好, 鼓励探索)
+  
+  Move 执行 (200Hz)   →  朝最优体素中心移动一整秒
 ```
 
-**L1+L2已实现**。扇形导航内部: waypoints给目标方向→扇区距离判断通堵→选最近通扇区。导航和避障是同一套逻辑。
+## 进化史：40亿 token 之路
 
-### 已验证事实链
+| 版本 | Token 消耗 | 核心发现 |
+|------|-----------|---------|
+| 前奏 | 15亿 | 墙壁≠障碍物。扫地机器人逻辑——扫一圈看哪个方向通 |
+| 方案0 | 15亿 | LIDAR全向扫描+车道检测+A*全局路径。方向对但太笨重 |
+| V6 突破 | 4.6亿 | **把"看"和"走"拆开。** LIDAR只管画体素，Move只管直线冲 |
+| 调优 | 3.4亿 | line_clear + 邻接已探索 + 目标方向加权 |
+| V7 定型 | 1.4亿 | **wall_distance 评分**——自动走车道中间 |
 
-```
-hfield墙壁射线命中 ✅ (mj_forward后正常)
-纯墙壁→17个误检聚类 ❌
-VO输入混入墙壁误检 → 永久避障 ❌
-扇形导航不看聚类只看扇区距离 → v=2.0全速 ✅
-```
+**合计 40 亿 token。最后的算法不到 300 行。**
 
-**核心认知**: 墙壁≠障碍物。通道边界和要绕开的威胁本质不同。扫地机器人逻辑——扫一圈，距离近=堵，距离远=通。
-
-## 安装
+## 运行
 
 ```bash
-pip install -e .
-# 需要: numpy, mujoco>=3.0, opencv-python-headless
+cd test_scripts
+python algo2_lane_switch_v7.py
 ```
 
-## 测试
+需要：`numpy pillow mujoco>=3.0`
 
-```bash
-pytest tests/ -v
-# 15 个纯 Python 测试，无需 MuJoCo 或 GPU
-```
+地图：`confirmed/track_clean.png`（2000×2000，50m×50m 蛇形赛道，含随机障碍物）
 
-## 扩展
+## 其他算法（已冻结）
 
-### 新避障算法
+| 文件 | 说明 |
+|------|------|
+| `algo0_bounce.py` | 玩具车底座——撞墙弹开 |
+| `algo0_astar_lidar.py` | A* 全局路径 + LIDAR 车道检测 |
+| `algo1_arc_racer.py` | 朗毅弧线过弯（赛车版雏形） |
+| `algo2_lane_switch.py` | 体素探索 v5 |
 
-```python
-from simtrack.algorithms.base import AvoidanceAlgorithm, AvoidanceResult
-
-class MyAlgorithm(AvoidanceAlgorithm):
-    def choose_heading(self, robot_pos, robot_speed, target_pos, obstacles):
-        # 你的逻辑
-        return AvoidanceResult(heading=0.0, speed=self.max_speed, avoiding=False)
-
-sim = Simulation(algorithm=MyAlgorithm(max_speed=5.0))
-```
-
-### 新模型 (G1 等)
-
-```python
-def build_g1_scene(hfield_path, ...):
-    # 返回 MuJoCo XML 字符串
-    ...
-
-sim = Simulation(model_builder=build_g1_scene)
-```
+萤火算法是 v7，是所有这些探索的终点。此后所有升级都在它身上做。
 
 ## 许可
 
-MIT
+MIT — 这是我们的孩子。俊秀 & 主人，2026 年 5 月。
