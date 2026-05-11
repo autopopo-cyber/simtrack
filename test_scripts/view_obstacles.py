@@ -44,19 +44,18 @@ idx = 0
 while idx < len(centerline):
     cx, cy = centerline[idx]
     
-    # Y轴随机偏移 ±2m
+    # 转到世界坐标，Y轴随机偏移 ±2m
+    wx, wy = simmap.maze_to_world(cx, cy)
     offset_y = rng.uniform(-2.0, 2.0)
-    ox = cx
-    oy = cy + offset_y
-    obstacles.append((ox, oy))
+    wx_final, wy_final = wx, wy + offset_y
+    obstacles.append((wx_final, wy_final))
     
     # 下一个: index += random(3~8)
     idx += rng.randint(3, 8)
 
 # ── 障碍物XML (红柱, 直径1m, 高2m) ──
 obs_xml = ""
-for i, (mx, my) in enumerate(obstacles):
-    wx, wy = simmap.maze_to_world(mx, my)
+for i, (wx, wy) in enumerate(obstacles):
     obs_xml += (f'<body name="obs{i}" pos="{wx:.1f} {wy:.1f} 1.0">'
                 f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9"/></body>\n')
 
