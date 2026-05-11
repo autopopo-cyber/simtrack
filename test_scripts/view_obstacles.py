@@ -57,7 +57,7 @@ while idx < len(centerline):
 obs_xml = ""
 for i, (wx, wy) in enumerate(obstacles):
     obs_xml += (f'<body name="obs{i}" pos="{wx:.1f} {wy:.1f} 1.0">'
-                f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9"/></body>\n')
+                f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>\n')
 
 print(f"障碍物: {len(obstacles)} 个 (步长3~8, Y偏移±2m)", flush=True)
 
