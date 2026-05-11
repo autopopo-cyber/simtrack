@@ -181,8 +181,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 break
             continue
 
-        # ── A*路径跟随 ──
-        astar = all_astar_paths[wp_idx]
+        # ── A*路径跟随 (wp_idx-1: 当前段→下一个CP) ──
+        astar = all_astar_paths[wp_idx-1] if wp_idx>0 else all_astar_paths[0]
         # 推进到最近的路径点
         best_d = float('inf'); best_i = path_idx
         for i in range(path_idx, min(path_idx+10, len(astar))):
