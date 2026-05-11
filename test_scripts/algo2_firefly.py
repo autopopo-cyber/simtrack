@@ -14,11 +14,11 @@ hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
-CP_RADIUS = 2.0; LIDAR_RANGE = 15.0; VOXEL = 1.0
+CP_RADIUS = 2.0; LIDAR_RANGE = 15.0; VOXEL = 0.5
 WALL_SAFE = 0.8  # 体素离墙至少1.5m才算FREE
 
 UNKNOWN, FREE, WALL, VISITED = 0, 1, 2, 3
-W = 100; vox = np.zeros((W, W), dtype=np.int8)
+W = 200; vox = np.zeros((W, W), dtype=np.int8)
 
 def gen_centerline():
     pts = []; y0 = 2.5
@@ -66,7 +66,7 @@ def scan_voxels(bx, by):
     """LIDAR射线扫描标记 FREE 和 WALL"""
     for a in np.linspace(0, 2*np.pi, 120):
         cos_a, sin_a = math.cos(a), math.sin(a)
-        for d in np.arange(0.5, LIDAR_RANGE+0.1, 0.5):
+        for d in np.arange(0.25, LIDAR_RANGE+0.1, 0.25):
             wx, wy = bx+cos_a*d, by+sin_a*d
             vx, vy = int(wx), int(wy)
             if not (0 <= vx < W and 0 <= vy < W): break
@@ -78,13 +78,13 @@ def scan_voxels(bx, by):
 def clean_free_voxels(bx, by):
     """只清理机器人周围30x30: 离WALL<1.5m的FREE撤标"""
     brx, bry = int(bx), int(by)
-    for vy in range(max(0,bry-15), min(W,bry+16)):
-        for vx in range(max(0,brx-15), min(W,brx+16)):
+    for vy in range(max(0,bry-30), min(W,bry+61)):
+        for vx in range(max(0,brx-30), min(W,brx+61)):
             if vox[vy, vx] != FREE: continue
             min_d = 999.0
             cx, cy = vx+0.5, vy+0.5
-            for ndy in range(-15, 16):
-                for ndx in range(-15, 16):
+            for ndy in range(-30, 31):
+                for ndx in range(-30, 31):
                     nx, ny = vx+ndx, vy+ndy
                     if 0 <= nx < W and 0 <= ny < W and vox[ny, nx] == WALL:
                         d = math.hypot(cx-(nx+0.5), cy-(ny+0.5))
@@ -97,7 +97,7 @@ def line_clear(bx, by, wx, wy):
     dx, dy = wx-bx, wy-by
     dist = math.hypot(dx, dy)
     if dist < 0.1: return True
-    steps = int(dist / 0.3)
+    steps = int(dist / 0.15)
     for i in range(1, steps):
         t = i / steps
         if blocked(bx+dx*t, by+dy*t): return False
@@ -109,8 +109,8 @@ def find_frontier(bx, by, wp_idx):
     wp_yaw = target_yaw(bx, by, wp_idx)
     best_score = -9999; best = None
     
-    for dy in range(-20, 21):
-        for dx in range(-20, 21):
+    for dy in range(-40, 41):
+        for dx in range(-40, 41):
             vx, vy = cx+dx, cy+dy
             if not (0 <= vx < W and 0 <= vy < W): continue
             if vox[vy, vx] != FREE: continue
