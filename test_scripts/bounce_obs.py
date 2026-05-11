@@ -118,7 +118,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             yaw += math.radians(deg)
             d.qvel[:] = 0
             bounce += 1
-            cooldown = 50
+            cooldown = 20
             if bounce <= 10 or bounce % 20 == 0:
                 print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) Δ{deg:+.0f}°", flush=True)
         else:
