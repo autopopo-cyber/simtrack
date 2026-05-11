@@ -4,7 +4,7 @@
 迷宫系 (maze):  0-50m, 入口(3,3), 出口(3,48)
 世界系 (world): MuJoCo全局坐标, hfield跨度0-100m
 PNG像素系:      2000×2000, 左侧/底部对应迷宫0
-高度编码:       pixel→h = (pixel/255)*4.0 - 2.0, 路面128→0m, 墙191→1m
+高度编码:       pixel→h = (pixel/255)*4.0 - 2.0, 路面128→0m, 墙255→2m
 
 所有导航算法统一使用此模块, 保证坐标一致。
 """
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     print("世界↔迷宫: (6,6) →", world_to_maze(6,6))
     print("迷宫↔像素: (3,3) →", maze_to_pixel(3,3))
     print("高度128→", pixel_to_height(128), "m")
-    print("高度191→", pixel_to_height(191), "m")
+    print("高度255→", pixel_to_height(191), "m")
     print("1m→pixel:", height_to_pixel(1.0))
     wps = get_checkpoints_world()
     print(f"Checkpoints: {len(wps)}个, start={wps[0]}, end={wps[-1]}")
