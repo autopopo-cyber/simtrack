@@ -16,7 +16,7 @@ MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
+SAFE_R = 1.0; SPEED = 8.0; SPEED_MAX = 10.0; YAW_RATE = 6.0
 CP_RADIUS = 1.5; LIDAR_RANGE = 15.0
 VOXEL = 0.5; W = 200
 
@@ -214,7 +214,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
     LIDAR_TICK = 20; DECIDE_TICK = 200
-    target = None
+    target = None; no_target_ticks = 0
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
@@ -245,6 +245,13 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         if step % DECIDE_TICK == 0 or target is None:
             target = find_frontier(bx, by, wp_idx)
+            if target:
+                no_target_ticks = 0
+            else:
+                no_target_ticks += 1
+                if no_target_ticks > 3:  # 3秒无体素→bounce
+                    mv._bounce(30, 120)
+                    no_target_ticks = 0
             if target and step % 400 == 0:
                 print(f"  🎯 [{step}] target=({target[0]:.0f},{target[1]:.0f}) V{int(np.sum(vox==VISITED))}", flush=True)
 
