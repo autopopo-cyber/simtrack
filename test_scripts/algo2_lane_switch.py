@@ -160,6 +160,8 @@ wp_idx=0; step=0; speed=SPEED; current_lane="中"; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep); lidar_tick=0
 RENDER_SKIP = 3  # 每3帧渲染一次提速
 stuck_step = 0; stuck_x = 0.0; stuck_y = 0.0  # 卡死检测
+is_turn = False; d_turn = 999; turn_mode = False  # 弯道状态默认值
+clr = {"中":(999,5),"左":(999,5),"右":(999,5)}  # 车道默认
 
 print(f"=== algo3_lane_switch === 默认中路 探测{LIDAR_RANGE}m →{SPEED_MAX}m/s", flush=True)
 
@@ -258,8 +260,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         elif blocked:
             if not escaping:
                 bounce+=1; escaping=True; speed=SPEED
-                deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
-                print(f"💥 BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) lane={current_lane} Δ{deg:+.0f}°", flush=True)
+                # 弯道卡死: 大角度荡开
+                angle_range = (120, 180) if (is_turn and d_turn<10) else (45, 120)
+                deg=random.uniform(*angle_range)*random.choice([-1,1]); yaw+=math.radians(deg)
+                print(f"💥 BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) lane={current_lane} Δ{deg:+.0f}° {'弯道大回旋' if angle_range[0]>100 else ''}", flush=True)
             else:
                 deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
             d.qvel[:]=0; force_steps=int(0.4/(SPEED*m.opt.timestep))
@@ -271,7 +275,6 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             v.sync()
 
         if step%200==0:
-            c = clr.get("中",(0,0)) if 'clr' in dir() else (0,0)
-            print(f"  [{step}] ({bx:.1f},{by:.1f}) CP{wp_idx} v={speed:.1f} {current_lane} d={dist_to_cp:.1f}", flush=True)
+            print(f"  [{step}] ({bx:.1f},{by:.1f}) CP{wp_idx} v={speed:.1f} {current_lane} d={dist_to_cp:.1f}{' TURN' if turn_mode else ''}", flush=True)
 
     print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s bounces={bounce}", flush=True)
