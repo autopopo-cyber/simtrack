@@ -265,10 +265,33 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 print(f"  🎯 [{step}] target=({target[0]:.0f},{target[1]:.0f}) V{int(np.sum(vox==VISITED))}", flush=True)
 
         if target is None:
-            mv._bounce(90, 180)
-            mujoco.mj_step(m, d); step += 1
-            if step % RENDER_SKIP == 0: v.sync()
-            continue
+            # ── wall following: 沿最近墙绕行, LIDAR自然扫到墙后FREE ──
+            # 找最近WALL体素
+            best_wd = 999; wx = wy = 0
+            for ndy in range(-6, 7):
+                for ndx in range(-6, 7):
+                    nx, ny = vx+ndx, vy+ndy
+                    if 0<=nx<W and 0<=ny<W and vox[ny,nx]==WALL:
+                        d = math.hypot(ndx, ndy)
+                        if d < best_wd: best_wd = d; wx, wy = nx, ny
+            if best_wd < 999:
+                # 切线方向 (右手法则: 墙在右, 沿墙逆时针)
+                dx_r, dy_r = bx-(wx+0.5), by-(wy+0.5)
+                d_r = math.hypot(dx_r, dy_r) or 0.01
+                # 旋转-90° = 沿墙往右前方走
+                tx_wf = bx + (-dy_r/d_r) * 2.0  # 切线步长2m
+                ty_wf = by + (dx_r/d_r) * 2.0
+                # 如果切线方向被堵, 反方向
+                if blocked(tx_wf, ty_wf):
+                    tx_wf = bx + (dy_r/d_r) * 2.0
+                    ty_wf = by + (-dx_r/d_r) * 2.0
+                target = (tx_wf, ty_wf)
+            else:
+                mv._bounce(90, 180)
+            if target is None:
+                mujoco.mj_step(m, d); step += 1
+                if step % RENDER_SKIP == 0: v.sync()
+                continue
 
         mv.step(target[0], target[1], step)
         step += 1
