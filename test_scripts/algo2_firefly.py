@@ -45,7 +45,7 @@ while idx < len(cl):
 obs_world = [(x,y) for x,y in obs_world if math.hypot(x-10,y-5)>5.0]
 OBS_R = 1.0; OBS_CLEAR = OBS_R+SAFE_R
 
-cps_maze = [(5,2.5),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
+cps_maze = [(5,2.5),(49,5),(1,10),(49,15),(1,20),(49,25),(1,30),(49,35),(1,40),(49,45),(1,48)]
 nav_wps = [(x*SCALE, y*SCALE) for x,y in cps_maze]
 
 def sample_hf(wx, wy):
