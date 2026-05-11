@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""simtrack runner — 中心线导航 + 可碰撞障碍物 + 扇区寻路"""
+"""simtrack runner — 10检查点导航 + 中心线障碍生成 + 扇区寻路"""
 import sys, os, math, random, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import mujoco, mujoco.viewer, numpy as np
@@ -7,7 +7,7 @@ from simtrack import map as simmap
 from simtrack.lidar import LidarSensor
 from simtrack.nav import SectorNav
 
-# ── 中心线生成 (同 view_obstacles.py) ──
+# ── 中心线 (隐藏, 仅供障碍生成) ──
 def gen_centerline():
     pts = []
     y0 = 2.5
@@ -26,7 +26,6 @@ def gen_centerline():
             pts.append((mx, my + gy*10.0))
     return pts
 
-# ── 障碍物生成 ──
 def gen_obstacles(centerline, rng):
     obs = []
     idx = 0
@@ -38,38 +37,26 @@ def gen_obstacles(centerline, rng):
         idx += rng.randint(3, 8)
     return obs
 
-# ── 导航点: 中心线每N个取一个 ──
-def nav_from_centerline(centerline, step=4):
-    nav = []
-    for i in range(0, len(centerline), step):
-        mx, my = centerline[i]
-        nav.append(simmap.maze_to_world(mx, my))
-    if nav[-1] != simmap.maze_to_world(*centerline[-1]):
-        nav.append(simmap.maze_to_world(*centerline[-1]))
-    return nav
+# ── 导航点: 最开始的10个检查点 ──
+nav_wps = simmap.get_checkpoints_world()  # 11个, 含起点
 
-# ═══════════════════════════════════════
+# ═════════════════════════════
 SPEED = 2.0
 LIDAR_RAYS = 360
 LIDAR_RANGE = 15.0
 LIDAR_HEIGHT = 1.2
 SAFE_DIST = 2.0
 CP_RADIUS = 3.0
-NAV_STEP = 4
 
-centerline = gen_centerline()
-nav_wps = nav_from_centerline(centerline, step=NAV_STEP)
 rng = random.Random()
-obstacles = gen_obstacles(centerline, rng)
+obstacles = gen_obstacles(gen_centerline(), rng)
+print(f"导航点: {len(nav_wps)} 检查点", flush=True)
+print(f"障碍物: {len(obstacles)} 个", flush=True)
 
-print(f"中心线: {len(centerline)} 点", flush=True)
-print(f"导航点: {len(nav_wps)} 个 (每{NAV_STEP}取1)", flush=True)
-print(f"障碍物: {len(obstacles)} 个 (可碰撞)", flush=True)
-
-# ── 场景XML ──
+# ── 场景 ──
 cp_xml = ""
 for i, (wx, wy) in enumerate(nav_wps[1:], 1):
-    cp_xml += f'<body mocap="true" pos="{wx:.1f} {wy:.1f} 2"><geom type="sphere" size="1.0" rgba="0.2 0.5 1 0.8"/></body>\n'
+    cp_xml += f'<body mocap="true" pos="{wx:.1f} {wy:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>\n'
 
 obs_xml = ""
 for i, (wx, wy) in enumerate(obstacles):
@@ -105,14 +92,15 @@ mujoco.mj_forward(m, d)
 
 lidar = LidarSensor(m, d, site_name="lidar_top", rays=LIDAR_RAYS, lines=1, range_m=LIDAR_RANGE, hz=10)
 nav = SectorNav(n_sectors=36, safe_dist=SAFE_DIST, speed=SPEED, cp_radius=CP_RADIUS)
+hf = simmap.load()
 
 wp_idx = 0
 step = 0
 lidar_step = 0
 t0 = time.time()
-hf = simmap.load()
-
+print(f"起点: ({start_wx:.1f},{start_wy:.1f})", flush=True)
 print("viewer starting...", flush=True)
+
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
     v.cam.distance = 40
@@ -132,7 +120,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         
         if reached:
             wp_idx += 1
-            print(f"  ✓ WP{wp_idx-1} step={step} ({bx:.1f},{by:.1f})", flush=True)
+            print(f"  ✓ CP{wp_idx-1} step={step} ({bx:.1f},{by:.1f})", flush=True)
             if wp_idx >= len(nav_wps):
                 print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounces={nav.bounces}", flush=True)
                 break
@@ -144,9 +132,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         step += 1
         v.sync()
         
-        if step % 100 == 0:
+        if step % 200 == 0:
             d_cp = math.hypot(tx - bx, ty - by)
-            print(f"  [{step}] ({bx:.1f},{by:.1f}) → WP{wp_idx}/{len(nav_wps)} d={d_cp:.1f}", flush=True)
+            print(f"  [{step}] ({bx:.1f},{by:.1f}) → CP{wp_idx}/{len(nav_wps)} d={d_cp:.1f}", flush=True)
     
     t_elapsed = time.time() - t0
-    print(f"done: step={step} wp={wp_idx}/{len(nav_wps)} time={t_elapsed:.1f}s bounces={nav.bounces}", flush=True)
+    print(f"done: step={step} cp={wp_idx}/{len(nav_wps)} time={t_elapsed:.1f}s bounces={nav.bounces}", flush=True)
