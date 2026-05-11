@@ -158,6 +158,8 @@ lidar_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "lidar_top")
 yaw=0.0; bounce=0; force_steps=0; escaping=False
 wp_idx=0; step=0; speed=SPEED; current_lane="中"; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep); lidar_tick=0
+RENDER_SKIP = 3  # 每3帧渲染一次提速
+stuck_step = 0; stuck_x = 0.0; stuck_y = 0.0  # 卡死检测
 
 print(f"=== algo3_lane_switch === 默认中路 探测{LIDAR_RANGE}m →{SPEED_MAX}m/s", flush=True)
 
@@ -240,10 +242,17 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             dyaw = max(-YAW_RATE*m.opt.timestep, min(YAW_RATE*m.opt.timestep, yaw_err))
             yaw += dyaw
 
-        # ── 碰撞 ──
+        # ── 碰撞 + 卡死检测 ──
         vx=math.cos(yaw)*speed; vy=math.sin(yaw)*speed
         nx=bx+vx*m.opt.timestep; ny=by+vy*m.opt.timestep
         blocked = is_wall(nx,ny) or is_obs(nx,ny)
+        
+        # 卡死: 300步位移<1m
+        if step - stuck_step > 300:
+            if math.hypot(bx-stuck_x, by-stuck_y) < 1.0:
+                blocked = True
+                print(f"  ⚠ 卡死检测 step={step} Δ={math.hypot(bx-stuck_x,by-stuck_y):.1f}m", flush=True)
+            stuck_step = step; stuck_x = bx; stuck_y = by
         if force_steps>0:
             force_steps-=1; d.qvel[0]=vx; d.qvel[1]=vy
         elif blocked:
@@ -257,7 +266,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         else:
             escaping=False; d.qvel[0]=vx; d.qvel[1]=vy
 
-        mujoco.mj_step(m,d); step+=1; v.sync()
+        mujoco.mj_step(m,d); step+=1
+        if step % RENDER_SKIP == 0:
+            v.sync()
 
         if step%200==0:
             c = clr.get("中",(0,0)) if 'clr' in dir() else (0,0)
