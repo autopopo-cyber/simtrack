@@ -259,7 +259,7 @@ m = mujoco.MjModel.from_xml_string(xml); d = mujoco.MjData(m)
 d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
-wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
+wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
 
 print(f"=== 萤火算法 Firefly v11 === gate WD + soft dot on no gate", flush=True)
@@ -362,6 +362,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             mv._bounce(90, 180)
         
         step += 1
+        if step % 1000 == 0:
+            print(f"  ... step={step} V{int(np.sum(vox==VISITED))} F{int(np.sum(vox==FREE))} wp={wp_idx}", flush=True)
         if step % RENDER_SKIP == 0: v.sync()
 
     print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s", flush=True)
