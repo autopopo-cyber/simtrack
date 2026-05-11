@@ -207,7 +207,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             for name, off in offsets.items():
                 lx = bx+nx_dir*off; ly = by+ny_dir*off
                 for d in np.arange(1.0, LOOKAHEAD+0.1, 1.0):
-                    cx = lx+rdx*d; cy = ly+ry*d
+                    cx = lx+rdx*d; cy = ly+rdy*d
                     if is_wall(cx, cy) or is_obs(cx, cy):
                         lane_hits[name] += 1
                     elif any(math.hypot(px-cx, py-cy) < 0.8 for px, py in lidar_cache):
