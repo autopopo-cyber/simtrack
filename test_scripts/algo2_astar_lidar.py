@@ -218,16 +218,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 elif lane_hits[best_lane] >= 3: speed = max(speed-0.5, SPEED)
                 else: speed = max(speed-0.1, SPEED)
 
-            # 转向: 车道目标 + A*目标
-            off = {"左":-1.5, "中":0.0, "右":1.5}[best_lane]
-            lx = bx+nx_dir*off+rdx*2.0; ly = by+ny_dir*off+rdy*2.0
-            lane_yaw = math.atan2(ly-by, lx-bx)
+            # 转向: 纯A*路点跟随，车道只调速不拉方向
             astar_yaw = math.atan2(gy-by, gx-bx)
-            diff = (lane_yaw-astar_yaw+math.pi)%(2*math.pi)-math.pi
-            steer_yaw = astar_yaw + diff*0.6
-            
             old_yaw = yaw
-            err = (steer_yaw-old_yaw+math.pi)%(2*math.pi)-math.pi
+            err = (astar_yaw-old_yaw+math.pi)%(2*math.pi)-math.pi
             dyaw = max(-YAW_RATE*m.opt.timestep, min(YAW_RATE*m.opt.timestep, err))
             yaw += dyaw
 
