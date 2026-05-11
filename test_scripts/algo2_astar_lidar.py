@@ -186,8 +186,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         # 推进到最近的路径点
         best_d = float('inf'); best_i = path_idx
         for i in range(path_idx, min(path_idx+10, len(astar))):
-            d = math.hypot(astar[i][0]-bx, astar[i][1]-by)
-            if d < best_d: best_d = d; best_i = i
+            dist_i = math.hypot(astar[i][0]-bx, astar[i][1]-by)
+            if dist_i < best_d: best_d = dist_i; best_i = i
         path_idx = best_i
         gx, gy = astar[min(path_idx+3, len(astar)-1)]  # 前瞻3步
 
