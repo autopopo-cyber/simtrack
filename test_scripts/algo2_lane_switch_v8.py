@@ -146,10 +146,7 @@ def find_frontier(bx, by, wp_idx, prev_target=None, verbose=True):
                            if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx]==UNKNOWN)
             score += unknown_nb * 15    # v8: 从20降到15
             
-            # hysteresis: 如果一个体素接近prev_target, 给bonus防晃
-            if prev_target:
-                if abs(vx+0.5 - prev_target[0]) < 2.0 and abs(vy+0.5 - prev_target[1]) < 2.0:
-                    score += 12
+
             
             if score > best_score:
                 best_score = score
