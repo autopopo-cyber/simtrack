@@ -158,14 +158,16 @@ def update_viz(bx, by, wp_idx, best_lane):
         rgba = [float(x) for x in rgba_str.split()]
         for i, (wx, wy, blocked) in enumerate(pts):
             bid = viz_ids[(lane_name,i)]
-            d.mocap_pos[bid][0] = wx; d.mocap_pos[bid][1] = wy; d.mocap_pos[bid][2] = 0.5
+            mid = m.body_mocapid[bid]
+            d.mocap_pos[mid][0] = wx; d.mocap_pos[mid][1] = wy; d.mocap_pos[mid][2] = 0.5
             m.geom_rgba[m.body_geomadr[bid]] = rgba
-    # 方向指示球: 在最佳车道前方
+    # 方向指示球
     offset = LANES.get(best_lane, 0.0)
     rdx, rdy = road_direction(wp_idx); nx_dir, ny_dir = -rdy, rdx
-    d.mocap_pos[viz_dir_id][0] = bx+rdx*1.5+nx_dir*offset
-    d.mocap_pos[viz_dir_id][1] = by+rdy*1.5+ny_dir*offset
-    d.mocap_pos[viz_dir_id][2] = 0.6
+    mid = m.body_mocapid[viz_dir_id]
+    d.mocap_pos[mid][0] = bx+rdx*1.5+nx_dir*offset
+    d.mocap_pos[mid][1] = by+rdy*1.5+ny_dir*offset
+    d.mocap_pos[mid][2] = 0.6
     m.geom_rgba[m.body_geomadr[viz_dir_id]] = [0.1, 0.5, 1.0, 0.9]
 
 print(f"=== algo2_lane_nav === 车道:{LANE_NAMES} lookahead={LOOKAHEAD_M}m v={SPEED_MIN}→{SPEED_MAX}", flush=True)
