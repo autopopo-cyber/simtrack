@@ -75,19 +75,14 @@ def scan_voxels(bx, by):
                 vox[vy, vx] = WALL; break
             vox[vy, vx] = max(vox[vy, vx], FREE)
 
-def clean_free_voxels():
-    """扫描后清理: 离WALL<1.5m的FREE体素撤标, 从源头杜绝碰撞"""
-    # 收集所有WALL体素坐标
-    walls = [(wx, wy) for wy in range(W) for wx in range(W) if vox[wy, wx] == WALL]
-    if not walls: return
-    walls_arr = np.array(walls, dtype=np.float64)
-    # 遍历所有FREE, 查最近WALL距离
-    for vy in range(W):
-        for vx in range(W):
+def clean_free_voxels(bx, by):
+    """只清理机器人周围30x30: 离WALL<1.5m的FREE撤标"""
+    brx, bry = int(bx), int(by)
+    for vy in range(max(0,bry-15), min(W,bry+16)):
+        for vx in range(max(0,brx-15), min(W,brx+16)):
             if vox[vy, vx] != FREE: continue
-            cx, cy = vx+0.5, vy+0.5
-            # 只检查附近15格内的WALL
             min_d = 999.0
+            cx, cy = vx+0.5, vy+0.5
             for ndy in range(-15, 16):
                 for ndx in range(-15, 16):
                     nx, ny = vx+ndx, vy+ndy
@@ -95,7 +90,7 @@ def clean_free_voxels():
                         d = math.hypot(cx-(nx+0.5), cy-(ny+0.5))
                         if d < min_d: min_d = d
             if min_d < WALL_SAFE:
-                vox[vy, vx] = UNKNOWN  # 不安全, 撤销FREE
+                vox[vy, vx] = UNKNOWN
 
 # ── 决策 ──
 def line_clear(bx, by, wx, wy):
@@ -246,7 +241,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
         if step % LIDAR_TICK == 0:
             scan_voxels(bx, by)
-            clean_free_voxels()  # ← 唯一的安全防线
+            clean_free_voxels(bx, by)  # ← 唯一的安全防线
 
         if step % DECIDE_TICK == 0 or target is None:
             target = find_frontier(bx, by, wp_idx)

@@ -236,7 +236,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
     LIDAR_TICK = 20; DECIDE_TICK = 200
-    target = None
+    target = None; stall_step = 0; stall_v = 0
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
