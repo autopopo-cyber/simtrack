@@ -35,13 +35,13 @@ rng = random.Random(); cl = gen_centerline(); obs_world = []; idx = 0
 while idx < len(cl):
     cx, cy = cl[idx]; wx, wy = cx*SCALE, cy*SCALE
     obs_world.append((wx, wy+rng.uniform(-2.0,2.0))); idx += rng.randint(3,8)
-obs_world = [(x,y) for x,y in obs_world if math.hypot(x-6,y-6)>5.0]
+obs_world = [(x,y) for x,y in obs_world if math.hypot(x-10,y-5)>5.0]
 OBS_R = 1.0; OBS_CLEAR = OBS_R+SAFE_R
 
-cps_maze = [(3,3),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
+cps_maze = [(5,2.5),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
 nav_wps = [(x*SCALE, y*SCALE) for x,y in cps_maze]
 
-# ── 检测 ──
+# ── 体素集合 ──
 def sample_hf(wx, wy):
     mx, my = wx/SCALE, wy/SCALE
     px, py = int(mx*PIX_PER_M), HF_RES-1-int(my*PIX_PER_M)
@@ -154,7 +154,7 @@ xml = f"""<mujoco>
 </mujoco>"""
 
 m = mujoco.MjModel.from_xml_string(xml); d = mujoco.MjData(m)
-d.qpos[0]=6; d.qpos[1]=6; mujoco.mj_forward(m,d)
+d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
 yaw=0.0; bounce=0; force_steps=0; escaping=False
 wp_idx=0; step=0; speed=SPEED; t0=time.time()
