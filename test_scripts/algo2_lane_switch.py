@@ -215,34 +215,39 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
+    LIDAR_TICK = 20    # 10Hz 扫描填体素
+    DECIDE_TICK = 200  # 1Hz 挑目标
+    target = None
+
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
         if bx<1 or bx>99 or by<1 or by>99:
             d.qpos[0]=max(1,min(99,bx)); d.qpos[1]=max(1,min(99,by))
-            d.qvel[:]=0; yaw=random.uniform(0,2*math.pi)
+            d.qvel[:]=0; mv.yaw=random.uniform(0,2*math.pi)
         v.cam.lookat[:]=np.array([bx, by, 0.5], dtype=np.float64)
 
         tx, ty = nav_wps[wp_idx]; dist_to_cp = math.hypot(tx-bx, ty-by)
         if dist_to_cp < CP_RADIUS:
             wp_idx+=1
             vis = int(np.sum(vox==VISITED)); f = int(np.sum(vox==FREE))
-            print(f"✓ CP{wp_idx-1} step={step} visited={vis} free={f} walls={int(np.sum(vox==WALL))}", flush=True)
+            print(f"✓ CP{wp_idx-1} step={step} V{vis}/F{f}/W{int(np.sum(vox==WALL))}", flush=True)
             if wp_idx>=len(nav_wps):
-                print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s", flush=True)
+                print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                 break
             continue
 
-        # 标记已走
+        # 体素: 标记已走 + LIDAR扫描(10Hz)
         vx, vy = int(bx), int(by)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
+        if step % LIDAR_TICK == 0: scan_voxels(bx, by)
 
-        # 扫描 (10Hz)
-        if step % 20 == 0: scan_voxels(bx, by)
+        # 决策(1Hz): 挑直线可达+邻接已探索+朝wp的最佳体素
+        if step % DECIDE_TICK == 0 or target is None:
+            target = find_frontier(bx, by, wp_idx)
+            if target and step % 400 == 0:
+                print(f"  🎯 [{step}] target=({target[0]:.0f},{target[1]:.0f}) V{int(np.sum(vox==VISITED))}", flush=True)
 
-        # 决策
-        target = find_frontier(bx, by, wp_idx)
-
-        # 执行: 朝目标体素中心移动
+        # 运动(200Hz): 朝目标体素中心移动一整秒
         if target is None:
             mv._bounce(90, 180)
             mujoco.mj_step(m, d); step += 1
@@ -251,9 +256,6 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         mv.step(target[0], target[1], step)
         step += 1
-        if step%RENDER_SKIP==0: v.sync()
-        if step%200==0:
-            vis=int(np.sum(vox==VISITED)); f=int(np.sum(vox==FREE))
-            print(f"  [{step}] ({bx:.0f},{by:.0f}) CP{wp_idx} v={mv.speed:.1f} d={dist_to_cp:.0f} V{vis}/F{f}", flush=True)
+        if step % RENDER_SKIP == 0: v.sync()
 
     print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s", flush=True)
