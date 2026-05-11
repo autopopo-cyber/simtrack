@@ -80,8 +80,8 @@ def wall_distance(vx, vy):
     """体素中心到最近WALL的距离, 搜索半径8格"""
     best = 999.0
     cx, cy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
-    for ndy in range(-8, 9):
-        for ndx in range(-8, 9):
+    for ndy in range(-15, 16):
+        for ndx in range(-15, 16):
             nx, ny = vx+ndx, vy+ndy
             if 0 <= nx < W and 0 <= ny < W and vox[ny, nx] == WALL:
                 d = math.hypot(cx-(nx+0.5)*VOXEL, cy-(ny+0.5)*VOXEL)
@@ -117,7 +117,7 @@ def find_frontier(bx, by, wp_idx):
             if not adjacent: continue
             
             # 安全: 体素中心离墙至少0.8m
-            if wall_distance(vx, vy) < 0.5: continue
+            if wall_distance(vx, vy) < 0.3: continue
             
             score = 0
             ang = math.atan2(wy-by, wx-bx)
@@ -216,7 +216,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
     LIDAR_TICK = 20; DECIDE_TICK = 200
-    target = None; no_target_ticks = 0; away_dist = 999; away_ticks = 0
+    target = None; no_target_ticks = 0; stall_v = 0; stall_step = 0
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
