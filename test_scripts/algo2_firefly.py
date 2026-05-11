@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v10 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v11 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -104,13 +104,22 @@ def find_gate_path(bx, by, wp_idx):
         # 出口=FREE体素(扫描过但没走过的)
         if vox[cy, cx] == FREE:
             dot = ((cx-sx)*wp_dx + (cy-sy)*wp_dy) / max(1, math.hypot(cx-sx, cy-sy))
-            if dot < 0: continue      # 禁止往回走, 交给wall following
             score = -cg  # 越近越好
-            score += (dot+1)*30  # 朝WP加分
+            score += (dot+1)*30  # 朝WP加分 (负dot自动扣分, 不硬过滤)
             # UNKNOWN邻居加分(鼓励去新区附近)
             unk_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
                         if 0<=cx+ndx<W and 0<=cy+ndy<W and vox[cy+ndy,cx+ndx]==UNKNOWN)
             score += unk_nb * 20
+            # gate自身离墙距离——太近扣重分, 防选墙边死角
+            gate_wd = 999
+            for ndy2 in range(-5, 6):
+                for ndx2 in range(-5, 6):
+                    tnx, tny = cx+ndx2, cy+ndy2
+                    if 0<=tnx<W and 0<=tny<W and vox[tny,tnx]==WALL:
+                        dd = math.hypot(ndx2, ndy2)
+                        if dd < gate_wd: gate_wd = dd
+            if gate_wd < 3.0:
+                score -= (3.0-gate_wd) * 30
             if score > best_gate_score:
                 best_gate_score = score
                 best_gate = (cx, cy)
@@ -253,7 +262,7 @@ mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 path = None; path_idx = 0
 
-print(f"=== 萤火算法 Firefly v10 === path_to_unk backtrack on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v11 === gate WD + soft dot on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
