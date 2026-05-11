@@ -157,14 +157,6 @@ def find_gate_path(bx, by, wp_idx):
         cur = came_from[cur]
     path.reverse()  # 从sx,sy到gate
     
-    # 标记非出口体素为OLD
-    for (ax, ay) in visited_a_star:
-        is_g = any(vox[ay+ndy, ax+ndx] == UNKNOWN
-                  for ndy in (-1,0,1) for ndx in (-1,0,1)
-                  if 0<=ax+ndx<W and 0<=ay+ndy<W)
-        if not is_g and vox[ay, ax] != WALL:
-            vox[ay, ax] = max(vox[ay, ax], VISITED)
-    
     # 转换: 体素坐标→世界坐标
     world_path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return world_path
