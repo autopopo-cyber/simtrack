@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v15 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v16 — 恢复v6初始扫描+gate_wd放宽+v6前向fallback
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -121,8 +121,8 @@ def find_gate_path(bx, by, wp_idx):
                     if 0<=tnx<W and 0<=tny<W and vox[tny,tnx]==WALL:
                         dd = math.hypot(ndx2, ndy2)
                         if dd < gate_wd: gate_wd = dd
-            if gate_wd < 3.0:
-                score -= (3.0-gate_wd) * 30
+            if gate_wd < 1.5:
+                score -= (1.5-gate_wd) * 20
             if score > best_gate_score:
                 best_gate_score = score
                 best_gate = (cx, cy)
@@ -160,6 +160,36 @@ def find_gate_path(bx, by, wp_idx):
     
     world_path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return world_path
+
+def seek_farthest_visited(bx, by, wp_idx):
+    """v6风格fallback: A*在VISITED空间搜朝WP方向最远的体素, 不回溯"""
+    sx, sy = int(bx/VOXEL), int(by/VOXEL)
+    if not (0<=sx<W and 0<=sy<W and vox[sy,sx]==VISITED): return None
+    wp_dx, wp_dy = target_yaw_dir(wp_idx)
+    best_v = None; best_score = -9999
+    open_set = [(0, sx, sy)]; came = {}; vin = set()
+    while open_set and len(came) < 10000:
+        _, cx, cy = heapq.heappop(open_set)
+        if (cx,cy) in vin: continue
+        vin.add((cx,cy))
+        if vox[cy,cx] == VISITED:
+            dot = ((cx-sx)*wp_dx + (cy-sy)*wp_dy) / max(1, math.hypot(cx-sx, cy-sy))
+            score = math.hypot(cx-sx, cy-sy)*0.5 + dot*50
+            if score > best_score:
+                best_score = score; best_v = (cx, cy)
+        for ndx, ndy in [(0,-1),(0,1),(-1,0),(1,0)]:
+            nx, ny = cx+ndx, cy+ndy
+            if 0<=nx<W and 0<=ny<W and vox[ny,nx] in (VISITED, FREE) and (nx,ny) not in vin:
+                came[(nx,ny)] = (cx,cy)
+                heapq.heappush(open_set, (0, nx, ny))
+    if best_v is None: return None
+    path = []; cur = best_v
+    while cur != (sx,sy):
+        path.append(cur)
+        if cur not in came: break
+        cur = came[cur]
+    path.reverse()
+    return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
 
 def path_to_unk(bx, by):
     """A*在VISITED空间找最近UNKNOWN邻居, 返回完整路径"""
@@ -266,7 +296,7 @@ wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
 last_progress_step = 0; last_progress_wp = 0
 
-print(f"=== 萤火算法 Firefly v15 === gate WD + soft dot on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v16 === init scan 200 + gate_wd 1.5 + v6 fallback", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -274,9 +304,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
     LIDAR_TICK = 20
 
-    # 初始扫描(减少,保留大量UNKNOWN供后续探索)
-    print("  🔍 initial scan (limited)...", flush=True)
-    for _ in range(40):
+    # 初始扫描(恢复v6量级, FREE铺够才能过CP2窄弯)
+    print("  🔍 initial scan (200 steps)...", flush=True)
+    for _ in range(200):
         bx, by = d.qpos[0], d.qpos[1]
         vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
@@ -332,13 +362,20 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 gate = path[-1]
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
-                bk_path = path_to_unk(bx, by)
-                if bk_path:
-                    path = bk_path; path_idx = 0
+                # v6优先: 朝WP方向找最远VISITED(不回溯)
+                fwd_path = seek_farthest_visited(bx, by, wp_idx)
+                if fwd_path:
+                    path = fwd_path; path_idx = 0
                     gate = path[-1]
-                    print(f"  🔍 [{step}] no gate, path_to_unk→({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
+                    print(f"  🧭 [{step}] no gate, seek_fwd→({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
                 else:
-                    mv._bounce(90, 180)
+                    bk_path = path_to_unk(bx, by)
+                    if bk_path:
+                        path = bk_path; path_idx = 0
+                        gate = path[-1]
+                        print(f"  🔍 [{step}] no gate, path_to_unk→({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
+                    else:
+                        mv._bounce(90, 180)
         
         if path is not None and path_idx < len(path):
             tx, ty = path[path_idx]
