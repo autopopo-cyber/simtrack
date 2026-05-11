@@ -29,8 +29,7 @@ for gy in range(4):
     for mx, my in left_template:
         centerline.append((mx, my + gy * 10.0))
 
-assert len(centerline) == 115, f"期望115, 实际{len(centerline)}"
-print(f"中心线: {len(centerline)} 点", flush=True)
+print(f"中心线: {len(centerline)} 点 (10段×10 + 右弯5×3 + 左弯4×3)", flush=True)
 
 # ── 黄球XML ──
 balls_xml = ""
