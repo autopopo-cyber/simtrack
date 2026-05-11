@@ -301,11 +301,29 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         
         if path is not None and path_idx < len(path):
             tx, ty = path[path_idx]
-            # 到达当前路径点(1m内)就切下一个
             if math.hypot(tx-bx, ty-by) < 1.0:
                 path_idx += 1
+                if path_idx >= len(path):
+                    # 到出口: scan 10 rounds + re-A*
+                    print(f"  🚪 [{step}] at gate, scanning...", flush=True)
+                    for _ in range(200):
+                        if _ % LIDAR_TICK == 0: scan_voxels(d.qpos[0], d.qpos[1])
+                        mujoco.mj_step(m, d); step += 1
+                        if step % RENDER_SKIP == 0: v.sync()
+                    path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+                    path_idx = 0
+                    if path:
+                        last_gate = path[-1]
+                        print(f"  🚪 next gate=({last_gate[0]:.0f},{last_gate[1]:.0f}) len={len(path)}", flush=True)
+                    else:
+                        print(f"  ⚡ no next gate", flush=True)
             else:
                 mv.step(tx, ty, step)
+        elif target is not None:
+            if math.hypot(target[0]-bx, target[1]-by) < 1.0:
+                target = None
+            else:
+                mv.step(target[0], target[1], step)
         else:
             mv._bounce(90, 180)
         
