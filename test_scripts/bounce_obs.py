@@ -7,7 +7,7 @@ MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 hf = cv2.imread(MAP, cv2.IMREAD_GRAYSCALE)
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-DETECT_R = 1.5  # 预判检测半径
+DETECT_R = 0.5  # 预判检测半径 (0.2s冲0.3m可脱身)
 
 def sample_hfield_at(wx, wy):
     mx, my = wx / SCALE, wy / SCALE
