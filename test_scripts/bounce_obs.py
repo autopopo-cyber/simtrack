@@ -16,7 +16,7 @@ def sample_hfield_at(wx, wy):
         return int(hf[py, px])
     return -1
 
-def detect_collision(wx, wy, radius=0.6):
+def detect_wall(wx, wy, radius=0.55):
     for dy in np.arange(-radius, radius + 0.01, 0.15):
         max_dx = np.sqrt(max(0, radius**2 - dy**2))
         for dx in np.arange(-max_dx, max_dx + 0.01, 0.15):
@@ -48,21 +48,25 @@ while idx < len(cl):
     obs_world.append((wx, wy + rng.uniform(-2.0, 2.0)))
     idx += rng.randint(3, 8)
 
-# 去掉起点(6,6)附近障碍物(5m)
 before = len(obs_world)
 obs_world = [(x,y) for x,y in obs_world if math.hypot(x-6, y-6) > 5.0]
-print(f"障碍物: {before}→{len(obs_world)} (去掉起点5m内)", flush=True)
+print(f"障碍物: {before}→{len(obs_world)} (去掉起点5m)", flush=True)
+
 obs_xml = "".join(
     f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
     f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
     for i, (x, y) in enumerate(obs_world)
 )
 
+OBS_R = 1.0  # 障碍物半径
+BOT_R = 0.55  # 机器人碰撞半径
+OBS_CLEAR = OBS_R + BOT_R  # 1.55
+
 def detect_obs(wx, wy):
-    for ox, oy in obs_world:
-        if math.hypot(wx - ox, wy - oy) < 1.55:
-            return True
-    return False
+    for i, (ox, oy) in enumerate(obs_world):
+        if math.hypot(wx - ox, wy - oy) < OBS_CLEAR:
+            return i  # 返回障碍索引
+    return -1
 
 # ── 检查点 ──
 cps_maze = [(3,3),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
@@ -72,8 +76,7 @@ cp_xml = "".join(
     for x, y in cps_world[1:]
 )
 
-print(f"V8+障碍物: {len(obs_world)}个  speed=1.5", flush=True)
-
+# ── 场景 ──
 xml = f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
@@ -96,8 +99,10 @@ d = mujoco.MjData(m)
 d.qpos[0] = 6; d.qpos[1] = 6
 mujoco.mj_forward(m, d)
 
-SPEED = 1.5; yaw = 0.0; bounce = 0; cooldown = 0
+SPEED = 1.5; yaw = 0.0; bounce = 0; force_step = 0
 step = 0; t0 = time.time()
+
+print(f"speed={SPEED} yaw={yaw:.1f} 起点(6,6)", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -111,27 +116,32 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         vx = np.cos(yaw) * SPEED; vy = np.sin(yaw) * SPEED
         nx = bx + vx * m.opt.timestep; ny = by + vy * m.opt.timestep
 
-        if cooldown > 0:
-            cooldown -= 1
-            d.qvel[:] = 0
-            mujoco.mj_step(m, d)
-            step += 1; v.sync()
-            continue
-        elif detect_collision(nx, ny, 0.55) or detect_obs(nx, ny):
-            deg = random.uniform(30, 90) * random.choice([-1, 1])
-            yaw += math.radians(deg)
-            d.qvel[:] = 0
-            bounce += 1
-            cooldown = 20
-            if bounce <= 10 or bounce % 20 == 0:
-                print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) Δ{deg:+.0f}°", flush=True)
-        else:
+        if force_step > 0:
+            # 强制前进: 碰撞后脱离期，不检测
+            force_step -= 1
             d.qvel[0] = vx; d.qvel[1] = vy
+        else:
+            wall = detect_wall(nx, ny, BOT_R)
+            obs_idx = detect_obs(nx, ny)
+            
+            if wall or obs_idx >= 0:
+                deg = random.uniform(30, 90) * random.choice([-1, 1])
+                yaw += math.radians(deg)
+                d.qvel[:] = 0
+                bounce += 1
+                force_step = 40
+                if wall:
+                    print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 墙 Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
+                else:
+                    ox, oy = obs_world[obs_idx]
+                    print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 障碍#{obs_idx}({ox:.1f},{oy:.1f}) Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
+            else:
+                d.qvel[0] = vx; d.qvel[1] = vy
 
         mujoco.mj_step(m, d)
         step += 1; v.sync()
 
-        if step <= 20 or step % 200 == 0:
-            print(f"step={step} pos=({bx:.2f},{by:.2f}) bounce={bounce}", flush=True)
+        if step % 500 == 0:
+            print(f"  [{step}] ({bx:.1f},{by:.1f}) bounces={bounce}", flush=True)
 
     print(f"done: {step}s {bounce}b {time.time()-t0:.1f}s", flush=True)
