@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v11 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v12 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -261,8 +261,9 @@ d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
+stuck_step = 0; stuck_bx = 0; stuck_by = 0; stuck_bounces = 0
 
-print(f"=== 萤火算法 Firefly v11 === gate WD + soft dot on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v12 === gate WD + soft dot on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -312,8 +313,18 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # 路径规划/执行
         if path is None or path_idx >= len(path):
-            path = find_gate_path(bx, by, wp_idx)
-            path_idx = 0
+            # 卡死检测: 500步内位移<2m且bounce增长→强制path_to_unk
+            if step - stuck_step > 500 or math.hypot(bx-stuck_bx, by-stuck_by) > 2.0:
+                stuck_step = step; stuck_bx = bx; stuck_by = by; stuck_bounces = mv.bounce
+            elif mv.bounce > stuck_bounces + 3:
+                print(f"  ⚠️  [{step}] stuck! force path_to_unk bounce={mv.bounce}", flush=True)
+                path = path_to_unk(bx, by)
+                if path:
+                    path_idx = 0
+                    stuck_step = step; stuck_bx = bx; stuck_by = by; stuck_bounces = mv.bounce
+            if path is None:
+                path = find_gate_path(bx, by, wp_idx)
+                path_idx = 0
             if path:
                 gate = path[-1]
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
