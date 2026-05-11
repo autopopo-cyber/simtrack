@@ -113,6 +113,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         if cooldown > 0:
             cooldown -= 1
+            d.qvel[:] = 0
+            mujoco.mj_step(m, d)
+            step += 1; v.sync()
+            continue
         elif detect_collision(nx, ny, 0.55) or detect_obs(nx, ny):
             deg = random.uniform(30, 90) * random.choice([-1, 1])
             yaw += math.radians(deg)
