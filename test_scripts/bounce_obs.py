@@ -48,9 +48,10 @@ while idx < len(cl):
     obs_world.append((wx, wy + rng.uniform(-2.0, 2.0)))
     idx += rng.randint(3, 8)
 
-# 去掉起点(6,6)附近的障碍物
-obs_world = [(x,y) for x,y in obs_world if math.hypot(x-6, y-6) > 4.0]
-
+# 去掉起点(6,6)附近障碍物(5m)
+before = len(obs_world)
+obs_world = [(x,y) for x,y in obs_world if math.hypot(x-6, y-6) > 5.0]
+print(f"障碍物: {before}→{len(obs_world)} (去掉起点5m内)", flush=True)
 obs_xml = "".join(
     f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
     f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
