@@ -52,7 +52,7 @@ is_wall = lambda wx, wy: sample_hf(wx, wy) != ROAD_PIX
 is_obs = lambda wx, wy: any(math.hypot(wx-ox, wy-oy) < OBS_CLEAR for ox, oy in obs_world)
 blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
 unexplored = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, UNKNOWN)
-walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] != WALL
+walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, VISITED)
 
 def target_yaw_dir(wp_idx):
     if wp_idx >= len(nav_wps): return (1,0)
@@ -92,7 +92,7 @@ def find_gate_path(bx, by, wp_idx):
     非出口的可达UNEXPLORED体素标为VISITED(消除回头路)。
     返回: [((vx,vy), (wx,wy)), ...] 体素路径列表, 或None"""
     sx, sy = int(bx/VOXEL), int(by/VOXEL)
-    if not walkable(sx, sy): return None
+    if sx<0 or sx>=W or sy<0 or sy>=W or vox[sy,sx]==WALL: return None
     
     wp_dx, wp_dy = target_yaw_dir(wp_idx)
     tx, ty = nav_wps[min(wp_idx, len(nav_wps)-1)]
