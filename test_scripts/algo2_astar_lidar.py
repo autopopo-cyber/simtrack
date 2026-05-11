@@ -146,6 +146,7 @@ for i in range(len(nav_wps)-1):
         print(f"  CP{i}→CP{i+1}: A*失败, 直连", flush=True)
         all_astar_paths.append([nav_wps[i], nav_wps[i+1]])
 
+best_lane="中"; lane_hits={"左":0,"中":0,"右":0}; gx,gy=6,6
 yaw=0.0; bounce=0; force_steps=0; escaping=False
 wp_idx=0; path_idx=0; step=0; speed=SPEED; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep); lidar_tick=0; lidar_cache=[]
@@ -196,32 +197,29 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             lidar_cache = lidar_scan(bx, by, m, d, lidar_site)
 
         if not escaping:
-            # 三车道检测: 沿A*路径方向分车道
-            rdx, rdy = gx-bx, gy-by; dg = math.hypot(rdx, rdy)
-            if dg > 0.01: rdx/=dg; rdy/=dg
-            else: rdx, rdy = 1, 0
-            nx_dir, ny_dir = -rdy, rdx
-            
-            lane_hits = {"左":0, "中":0, "右":0}
-            offsets = {"左":-1.5, "中":0.0, "右":1.5}
-            for name, off in offsets.items():
-                lx = bx+nx_dir*off; ly = by+ny_dir*off
-                for dd in np.arange(1.0, LOOKAHEAD+0.1, 1.0):
-                    cx = lx+rdx*dd; cy = ly+rdy*dd
-                    if is_wall(cx, cy) or is_obs(cx, cy):
-                        lane_hits[name] += 1
-                    elif any(math.hypot(px-cx, py-cy) < 0.8 for px, py in lidar_cache):
-                        lane_hits[name] += 1
-            
-            best_lane = min(lane_hits, key=lane_hits.get) if lane_hits else "中"
-            
-            # 速度: 通畅加速
-            if lane_hits[best_lane] == 0: speed = min(speed+0.2, SPEED_MAX)
-            elif lane_hits[best_lane] >= 3: speed = max(speed-0.5, SPEED)
-            else: speed = max(speed-0.1, SPEED)
+            # 只在lidar刷新时评估车道 (默认值保留上次结果)
+            if lidar_tick % lidar_interval == 1:
+                rdx, rdy = gx-bx, gy-by; dg = math.hypot(rdx, rdy)
+                if dg > 0.01: rdx/=dg; rdy/=dg
+                else: rdx, rdy = 1, 0
+                nx_dir, ny_dir = -rdy, rdx
+                
+                lane_hits = {"左":0, "中":0, "右":0}
+                for name, off in [("左",-1.5), ("中",0.0), ("右",1.5)]:
+                    lx = bx+nx_dir*off; ly = by+ny_dir*off
+                    for dd in np.arange(1.0, LOOKAHEAD+0.1, 1.0):
+                        cx = lx+rdx*dd; cy = ly+rdy*dd
+                        if is_wall(cx, cy) or is_obs(cx, cy):
+                            lane_hits[name] += 1
+                
+                best_lane = min(lane_hits, key=lane_hits.get)
+                # 速度
+                if lane_hits[best_lane] == 0: speed = min(speed+0.3, SPEED_MAX)
+                elif lane_hits[best_lane] >= 3: speed = max(speed-0.5, SPEED)
+                else: speed = max(speed-0.1, SPEED)
 
             # 转向: 车道目标 + A*目标
-            off = offsets[best_lane]
+            off = {"左":-1.5, "中":0.0, "右":1.5}[best_lane]
             lx = bx+nx_dir*off+rdx*2.0; ly = by+ny_dir*off+rdy*2.0
             lane_yaw = math.atan2(ly-by, lx-bx)
             astar_yaw = math.atan2(gy-by, gx-bx)
