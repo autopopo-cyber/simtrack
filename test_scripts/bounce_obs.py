@@ -96,8 +96,7 @@ d.qpos[0] = 6; d.qpos[1] = 6
 mujoco.mj_forward(m, d)
 
 SPEED = 1.5; yaw = 0.0; bounce = 0
-stuck_timer = 0        # 卡住计时(step)
-clear_count = 0         # 连续无碰撞步数
+stuck = False; stuck_steps = 0; clear_steps = 0
 step = 0; t0 = time.time()
 
 print(f"speed={SPEED} 检测圈={DETECT_R}m 起点(6,6)", flush=True)
@@ -119,24 +118,33 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         colliding = wall or obs_idx >= 0
 
         if colliding:
-            stuck_timer += 1
-            clear_count = 0
-            
-            # 初次碰撞 或 卡住1秒: 旋转
-            if stuck_timer == 1 or stuck_timer >= 200:
+            if not stuck:
+                # 首次碰到: 停, 转, 记一次碰撞
+                stuck = True; stuck_steps = 0; clear_steps = 0
                 deg = random.uniform(30, 90) * random.choice([-1, 1])
                 yaw += math.radians(deg)
                 d.qvel[:] = 0
                 bounce += 1
-                stuck_timer = 0
                 if wall:
                     print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 墙 Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
                 else:
                     ox, oy = obs_world[obs_idx]
                     print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 障碍#{obs_idx}({ox:.1f},{oy:.1f}) Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
+            else:
+                # 卡住中: 计数, 1秒未脱身再转
+                stuck_steps += 1
+                if stuck_steps >= 200:
+                    deg = random.uniform(30, 90) * random.choice([-1, 1])
+                    yaw += math.radians(deg)
+                    d.qvel[:] = 0
+                    bounce += 1
+                    stuck_steps = 0
+                    print(f"STUCK#{bounce} step={step} ({bx:.1f},{by:.1f}) 转{deg:+.0f}°→yaw={math.degrees(yaw):.0f}°", flush=True)
         else:
-            clear_count += 1
-            stuck_timer = 0
+            clear_steps += 1
+            if stuck and clear_steps >= 20:
+                stuck = False
+                print(f"  恢复 step={step} ({bx:.1f},{by:.1f})", flush=True)
             d.qvel[0] = vx; d.qvel[1] = vy
 
         mujoco.mj_step(m, d)
