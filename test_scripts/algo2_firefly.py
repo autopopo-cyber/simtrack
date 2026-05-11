@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""萤火算法 (Firefly) v2 — 细体素 0.5m, No大扫描
+"""萤火算法 Firefly v5 — "门"方案: A*找出口, 走到出口再扫描, 循环推进
 
-键改动:
-- 体素 0.5m, W=200 — 精度不卡死在粗格子上
-- 不要 clean_free_voxels 全图/局部大扫描
-- find_frontier 里 wall_distance(8格) 快速硬过滤 <1.0m
-- 候选体素 line_clear 后通常只剩几十个, 每个搜 289 邻居=万级操作
+体素: OLD=VISITED(不回去), UNEXPLORED=FREE+UNKNOWN(可走)
+出口: 邻接UNKNOWN的UNEXPLORED体素 → 站在那能看到新区
+循环: 当前位置→A*到出口→沿路径走→到出口→LIDAR扫描→找下一个出口
 """
-import sys, os, math, time, random
+import sys, os, math, time, random, heapq
+from collections import deque
 import numpy as np
 from PIL import Image
 import mujoco, mujoco.viewer
@@ -17,7 +16,7 @@ hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
-CP_RADIUS = 1.5; LIDAR_RANGE = 15.0
+CP_RADIUS = 2.0; LIDAR_RANGE = 15.0
 VOXEL = 0.5; W = 200
 
 UNKNOWN, FREE, WALL, VISITED = 0, 1, 2, 3
@@ -52,17 +51,18 @@ def sample_hf(wx, wy):
 is_wall = lambda wx, wy: sample_hf(wx, wy) != ROAD_PIX
 is_obs = lambda wx, wy: any(math.hypot(wx-ox, wy-oy) < OBS_CLEAR for ox, oy in obs_world)
 blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
+unexplored = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, UNKNOWN)
+walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] not in (WALL, VISITED)
 
-def target_yaw(bx, by, wp_idx):
-    tx, ty = nav_wps[wp_idx]; dist = math.hypot(tx-bx, ty-by)
-    ang = math.atan2(ty-by, tx-bx)
-    if wp_idx+1<len(nav_wps) and dist<CP_RADIUS*2.5:
+def target_yaw_dir(wp_idx):
+    if wp_idx >= len(nav_wps): return (1,0)
+    tx, ty = nav_wps[wp_idx]
+    if wp_idx+1 < len(nav_wps):
         nx, ny = nav_wps[wp_idx+1]
-        ang2 = math.atan2(ny-by, nx-bx)
-        t = 1.0-dist/(CP_RADIUS*2.5)
-        diff = (ang2-ang+math.pi)%(2*math.pi)-math.pi
-        ang += diff*t
-    return ang
+        dx, dy = nx-tx, ny-ty
+        d = math.hypot(dx, dy)
+        if d > 0.01: return (dx/d, dy/d)
+    return (1,0)
 
 def scan_voxels(bx, by):
     for a in np.linspace(0, 2*np.pi, 120):
@@ -76,18 +76,6 @@ def scan_voxels(bx, by):
                 vox[vy, vx] = WALL; break
             vox[vy, vx] = max(vox[vy, vx], FREE)
 
-def wall_distance(vx, vy):
-    """体素中心到最近WALL的距离, 搜索半径8格"""
-    best = 999.0
-    cx, cy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
-    for ndy in range(-15, 16):
-        for ndx in range(-15, 16):
-            nx, ny = vx+ndx, vy+ndy
-            if 0 <= nx < W and 0 <= ny < W and vox[ny, nx] == WALL:
-                d = math.hypot(cx-(nx+0.5)*VOXEL, cy-(ny+0.5)*VOXEL)
-                if d < best: best = d
-    return best
-
 def line_clear(bx, by, wx, wy):
     dx, dy = wx-bx, wy-by
     dist = math.hypot(dx, dy)
@@ -98,42 +86,79 @@ def line_clear(bx, by, wx, wy):
         if blocked(bx+dx*t, by+dy*t): return False
     return True
 
-def find_frontier(bx, by, wp_idx):
-    cx, cy = int(bx/VOXEL), int(by/VOXEL)
-    wp_yaw = target_yaw(bx, by, wp_idx)
-    best_score = -9999; best = None
+def find_gate_path(bx, by, wp_idx):
+    """A*找从当前位置到最佳"出口"的路径。
+    出口 = 邻接UNKNOWN的UNEXPLORED体素。
+    非出口的可达UNEXPLORED体素标为VISITED(消除回头路)。
+    返回: [((vx,vy), (wx,wy)), ...] 体素路径列表, 或None"""
+    sx, sy = int(bx/VOXEL), int(by/VOXEL)
+    if not walkable(sx, sy): return None
     
-    for dy in range(-40, 41):
-        for dx in range(-40, 41):
-            vx, vy = cx+dx, cy+dy
-            if not (0 <= vx < W and 0 <= vy < W): continue
-            if vox[vy, vx] not in (FREE, UNKNOWN): continue
-            wx, wy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
-            if not line_clear(bx, by, wx, wy): continue
-            
-            adjacent = any(vox[vy+ndy, vx+ndx] in (VISITED, FREE, UNKNOWN)
-                          for ndy in (-1,0,1) for ndx in (-1,0,1)
-                          if 0<=vx+ndx<W and 0<=vy+ndy<W)
-            if not adjacent: continue
-            
-            # 安全: 体素中心离墙至少0.8m
-            if wall_distance(vx, vy) < 0.3: continue
-            
-            score = 0
-            ang = math.atan2(wy-by, wx-bx)
-            diff = abs((ang-wp_yaw+math.pi)%(2*math.pi)-math.pi)
-            score -= diff * 30
-            score -= math.hypot(dx, dy) * 0.5
-            
-            unknown_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
-                           if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx] not in (WALL, VISITED))
-            score += unknown_nb * 10
-            
-            if score > best_score:
-                best_score = score
-                best = (wx, wy)
+    wp_dx, wp_dy = target_yaw_dir(wp_idx)
+    tx, ty = nav_wps[min(wp_idx, len(nav_wps)-1)]
     
-    return best
+    # A* 
+    open_set = []
+    heapq.heappush(open_set, (0, sx, sy))
+    came_from = {}
+    g_score = {(sx, sy): 0}
+    best_gate = None; best_gate_score = -9999
+    visited_a_star = set()
+    
+    while open_set and len(came_from) < 5000:
+        _, cx, cy = heapq.heappop(open_set)
+        if (cx, cy) in visited_a_star: continue
+        visited_a_star.add((cx, cy))
+        cg = g_score.get((cx, cy), 9999)
+        
+        # 出口检查: 这个体素邻接UNKNOWN?
+        is_gate = any(vox[cy+ndy, cx+ndx] == UNKNOWN
+                     for ndy in (-1,0,1) for ndx in (-1,0,1)
+                     if 0<=cx+ndx<W and 0<=cy+ndy<W)
+        if is_gate:
+            wx, wy = (cx+0.5)*VOXEL, (cy+0.5)*VOXEL
+            score = -cg  # 越近越好
+            # 朝WP方向加分
+            dot = ((cx-sx)*wp_dx + (cy-sy)*wp_dy) / max(1, math.hypot(cx-sx, cy-sy))
+            score += (dot+1)*50
+            if score > best_gate_score:
+                best_gate_score = score
+                best_gate = (cx, cy)
+        
+        # 扩4邻域
+        for ndx, ndy in [(0,-1),(0,1),(-1,0),(1,0)]:
+            nx, ny = cx+ndx, cy+ndy
+            if not walkable(nx, ny): continue
+            ng = cg + 1
+            if (nx, ny) not in g_score or ng < g_score[(nx, ny)]:
+                g_score[(nx, ny)] = ng
+                came_from[(nx, ny)] = (cx, cy)
+                h = math.hypot(tx-(nx+0.5)*VOXEL, ty-(ny+0.5)*VOXEL) * 0.1
+                heapq.heappush(open_set, (ng+h, nx, ny))
+    
+    if best_gate is None:
+        return None
+    
+    # 回溯路径
+    path = []
+    cur = best_gate
+    while cur != (sx, sy):
+        path.append(cur)
+        if cur not in came_from: break
+        cur = came_from[cur]
+    path.reverse()  # 从sx,sy到gate
+    
+    # 标记非出口体素为OLD
+    for (ax, ay) in visited_a_star:
+        is_g = any(vox[ay+ndy, ax+ndx] == UNKNOWN
+                  for ndy in (-1,0,1) for ndx in (-1,0,1)
+                  if 0<=ax+ndx<W and 0<=ay+ndy<W)
+        if not is_g and vox[ay, ax] != WALL:
+            vox[ay, ax] = max(vox[ay, ax], VISITED)
+    
+    # 转换: 体素坐标→世界坐标
+    world_path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
+    return world_path
 
 # ── XML ──
 CP_XML = "".join(f'<body mocap="true" pos="{x} {y} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>' for x,y in nav_wps[1:])
@@ -197,7 +222,7 @@ class Mover:
         if not self.escaping:
             self.bounce += 1; self.escaping = True
             bx, by = self.d.qpos[0], self.d.qpos[1]
-            print(f"  💥 bounce#{self.bounce} @({bx:.1f},{by:.1f}) yaw={math.degrees(self.yaw):.0f}deg", flush=True)
+            print(f"  💥 bounce#{self.bounce} @({bx:.1f},{by:.1f})", flush=True)
         deg = random.uniform(lo, hi)*random.choice([-1,1])
         self.yaw += math.radians(deg)
         self.d.qvel[:] = 0
@@ -208,15 +233,16 @@ d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
+path = None; path_idx = 0; rescans = 0
 
-print(f"=== 萤火算法 Firefly v2 === {VOXEL}m voxel W={W}", flush=True)
+print(f"=== 萤火算法 Firefly v5 === GATE mode | {VOXEL}m voxel | A*→出口→扫描→循环", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
-    LIDAR_TICK = 20; DECIDE_TICK = 200
-    target = None; no_target_ticks = 0; stall_v = 0; stall_step = 0
+    LIDAR_TICK = 20
+    path_tick = 0
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
@@ -225,19 +251,17 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             d.qvel[:]=0; mv.yaw=random.uniform(0,2*math.pi)
         v.cam.lookat[:]=np.array([bx, by, 0.5], dtype=np.float64)
 
-        # 保留全部路点: 检查所有CP, 走到哪个算哪个
+        # CP检测
         new_wp = wp_idx
         for i in range(len(nav_wps)):
-            tx, ty = nav_wps[i]
-            if math.hypot(tx-bx, ty-by) < CP_RADIUS:
-                if i+1 > new_wp:
-                    new_wp = i+1
+            if math.hypot(nav_wps[i][0]-bx, nav_wps[i][1]-by) < CP_RADIUS:
+                new_wp = max(new_wp, i+1)
         if new_wp > wp_idx:
             wp_idx = new_wp
-            vis = int(np.sum(vox==VISITED)); f = int(np.sum(vox==FREE))
+            vis = int(np.sum(vox==VISITED))
             print(f"  🏁 CP{wp_idx-1} @({bx:.1f},{by:.1f}) | step={step} V{vis}", flush=True)
             if wp_idx>=len(nav_wps):
-                print(f"\U0001f3c1 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
+                print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                 break
             continue
 
@@ -246,26 +270,31 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % LIDAR_TICK == 0:
             scan_voxels(bx, by)
 
-        if step % DECIDE_TICK == 0 or target is None:
-            target = find_frontier(bx, by, wp_idx)
-            if target:
-                no_target_ticks = 0
+        # 路径规划/执行
+        if path is None or path_idx >= len(path):
+            rescans += 1
+            if rescans % 20 == 0 or path is None:
+                print(f"  🚪 [{step}] A* gate search... V{int(np.sum(vox==VISITED))} FREE{int(np.sum(vox==FREE))}", flush=True)
+            path = find_gate_path(bx, by, wp_idx)
+            path_idx = 0
+            if path:
+                gate = path[-1]
+                print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) path_len={len(path)}", flush=True)
             else:
-                no_target_ticks += 1
-                if no_target_ticks > 3:  # 3秒无体素→bounce
-                    print(f"  ⚡ [{step}] no free voxel for 3s, perturb", flush=True)
-                    mv._bounce(30, 120)
-                    no_target_ticks = 0
-            if target and step % 400 == 0:
-                print(f"  🎯 [{step}] target=({target[0]:.0f},{target[1]:.0f}) V{int(np.sum(vox==VISITED))}", flush=True)
-
-        if target is None:
+                print(f"  ⚡ [{step}] no gate found, bounce", flush=True)
+                mv._bounce(90, 180)
+                path = None
+        
+        if path is not None and path_idx < len(path):
+            tx, ty = path[path_idx]
+            # 到达当前路径点(1m内)就切下一个
+            if math.hypot(tx-bx, ty-by) < 1.0:
+                path_idx += 1
+            else:
+                mv.step(tx, ty, step)
+        else:
             mv._bounce(90, 180)
-            mujoco.mj_step(m, d); step += 1
-            if step % RENDER_SKIP == 0: v.sync()
-            continue
-
-        mv.step(target[0], target[1], step)
+        
         step += 1
         if step % RENDER_SKIP == 0: v.sync()
 
