@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v5 — "门"方案: A*找出口, 走到出口再扫描, 循环推进
+"""萤火算法 Firefly v5 — "门"方案 + A*墙距代价
 
-体素: OLD=VISITED(不回去), UNEXPLORED=FREE+UNKNOWN(可走)
-出口: 邻接UNKNOWN的UNEXPLORED体素 → 站在那能看到新区
-循环: 当前位置→A*到出口→沿路径走→到出口→LIDAR扫描→找下一个出口
+体素: OLD=FREE+VISITED(WALL已分析) | NEW=UNKNOWN
+A*: 在OLD里搜到最近NEW体素, 墙距罚分自动走宽路
+循环: scan→A*→沿路径走→到门→scan→A*→...
 """
 import sys, os, math, time, random, heapq
 from collections import deque
@@ -129,7 +129,16 @@ def find_gate_path(bx, by, wp_idx):
         for ndx, ndy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx+ndx, cy+ndy
             if not walkable(nx, ny): continue
-            ng = cg + 1
+            # wall距离惩罚: 搜周围找最近WALL, 越近代价越高
+            wd = 999.0; wx2, wy2 = (nx+0.5)*VOXEL, (ny+0.5)*VOXEL
+            for ndy2 in range(-6, 7):
+                for ndx2 in range(-6, 7):
+                    tnx, tny = nx+ndx2, ny+ndy2
+                    if 0<=tnx<W and 0<=tny<W and vox[tny,tnx]==WALL:
+                        d = math.hypot(wx2-(tnx+0.5)*VOXEL, wy2-(tny+0.5)*VOXEL)
+                        if d < wd: wd = d
+            penalty = max(0, 2.0 - wd) * 3  # 2m内开始罚, 越近越重
+            ng = cg + 1 + penalty
             if (nx, ny) not in g_score or ng < g_score[(nx, ny)]:
                 g_score[(nx, ny)] = ng
                 came_from[(nx, ny)] = (cx, cy)
@@ -233,7 +242,7 @@ d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
-path = None; path_idx = 0; rescans = 0
+path = None; path_idx = 0
 
 print(f"=== 萤火算法 Firefly v5 === GATE mode | {VOXEL}m voxel | A*→出口→扫描→循环", flush=True)
 
@@ -242,9 +251,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
 
     LIDAR_TICK = 20
-    path_tick = 0
-
-    # 初始扫描10轮 (2秒=400步)
+        # 初始扫描10轮 (2秒=400步)
     print("  🔍 initial scan 10 rounds...", flush=True)
     for _ in range(400):
         bx, by = d.qpos[0], d.qpos[1]
@@ -256,7 +263,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     
     # 第一次A*
     path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
-    if path: last_gate = path[-1]; print(f"  🚪 init gate=({last_gate[0]:.0f},{last_gate[1]:.0f}) path_len={len(path)}", flush=True)
+    if path: gate = path[-1]; print(f"  🚪 init gate=({gate[0]:.0f},{gate[1]:.0f}) path_len={len(path)}", flush=True)
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
@@ -286,9 +293,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # 路径规划/执行
         if path is None or path_idx >= len(path):
-            rescans += 1
-            if rescans % 20 == 0 or path is None:
-                print(f"  🚪 [{step}] A* gate search... V{int(np.sum(vox==VISITED))} FREE{int(np.sum(vox==FREE))}", flush=True)
+            print(f"  🚪 [{step}] A* gate search... V{int(np.sum(vox==VISITED))} FREE{int(np.sum(vox==FREE))}", flush=True)
             path = find_gate_path(bx, by, wp_idx)
             path_idx = 0
             if path:
@@ -319,11 +324,6 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                         print(f"  ⚡ no next gate", flush=True)
             else:
                 mv.step(tx, ty, step)
-        elif target is not None:
-            if math.hypot(target[0]-bx, target[1]-by) < 1.0:
-                target = None
-            else:
-                mv.step(target[0], target[1], step)
         else:
             mv._bounce(90, 180)
         
