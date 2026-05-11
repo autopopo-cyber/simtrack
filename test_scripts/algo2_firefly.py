@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v13 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v14 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -264,9 +264,9 @@ d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
-stuck_step = 0; stuck_bx = 0; stuck_by = 0; stuck_bounces = 0
+last_progress_step = 0; last_progress_wp = 0
 
-print(f"=== 萤火算法 Firefly v13 === gate WD + soft dot on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v14 === gate WD + soft dot on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -302,6 +302,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 new_wp = max(new_wp, i+1)
         if new_wp > wp_idx:
             wp_idx = new_wp
+            last_progress_step = step; last_progress_wp = wp_idx
             print(f"  🏁 CP{wp_idx-1} @({bx:.1f},{by:.1f}) step={step} V{int(np.sum(vox==VISITED))}", flush=True)
             if wp_idx>=len(nav_wps):
                 print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
@@ -316,16 +317,15 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # 路径规划/执行
         if path is None or path_idx >= len(path):
-            # 卡死检测: 500步内位移<2m且bounce增长→强制path_to_unk
-            if step - stuck_step > 500 or math.hypot(bx-stuck_bx, by-stuck_by) > 2.0:
-                stuck_step = step; stuck_bx = bx; stuck_by = by; stuck_bounces = mv.bounce
-            elif mv.bounce > stuck_bounces + 3:
-                print(f"  ⚠️  [{step}] stuck! force path_to_unk bounce={mv.bounce}", flush=True)
+            # 卡死检测: 2000步未过新CP→强制path_to_unk
+            if step - last_progress_step > 2000 and wp_idx == last_progress_wp:
+                print(f"  ⚠️  [{step}] stuck {step-last_progress_step} steps! force path_to_unk", flush=True)
                 path = path_to_unk(bx, by)
-                if path:
-                    path_idx = 0
-                    stuck_step = step; stuck_bx = bx; stuck_by = by; stuck_bounces = mv.bounce
-            if path is None:
+                if not path:
+                    path = find_gate_path(bx, by, wp_idx)
+                path_idx = 0
+                last_progress_step = step  # 给path_to_unk一次机会再卡再说
+            else:
                 path = find_gate_path(bx, by, wp_idx)
                 path_idx = 0
             if path:
