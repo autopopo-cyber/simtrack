@@ -18,7 +18,7 @@ SAFE_R = 1.0
 SPEED = 2.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
 CP_RADIUS = 3.0
 GRID_RES = 0.5          # A*网格分辨率(m)
-LIDAR_RANGE = 15.0; LIDAR_RAYS = 240; LIDAR_HZ = 10
+LIDAR_RANGE = 15.0; LIDAR_RAYS = 60; LIDAR_HZ = 10
 LOOKAHEAD = 6.0
 
 # ── 中心线 & 障碍物 ──
@@ -183,12 +183,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # ── A*路径跟随 ──
         astar = all_astar_paths[wp_idx]
-        # 找最近路径点
-        while path_idx < len(astar)-1:
-            nx_pt, ny_pt = astar[path_idx+1]
-            if math.hypot(nx_pt-bx, ny_pt-by) < math.hypot(astar[path_idx][0]-bx, astar[path_idx][1]-by):
-                path_idx += 1
-            else: break
+        # 推进到最近的路径点
+        best_d = float('inf'); best_i = path_idx
+        for i in range(path_idx, min(path_idx+10, len(astar))):
+            d = math.hypot(astar[i][0]-bx, astar[i][1]-by)
+            if d < best_d: best_d = d; best_i = i
+        path_idx = best_i
         gx, gy = astar[min(path_idx+3, len(astar)-1)]  # 前瞻3步
 
         # ── lidar ──
