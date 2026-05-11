@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v9 — OLD/FREE gate + 无门时找最近UNKNOWN邻居
+"""萤火算法 Firefly v10 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -149,6 +149,38 @@ def find_gate_path(bx, by, wp_idx):
     world_path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return world_path
 
+def path_to_unk(bx, by):
+    """A*在VISITED空间找最近UNKNOWN邻居, 返回完整路径"""
+    sx, sy = int(bx/VOXEL), int(by/VOXEL)
+    if vox[sy,sx]==WALL: return None
+    open_set = [(0, sx, sy)]
+    came_from = {}; g_score = {(sx,sy): 0}
+    best_unk = None; best_g = 99999
+    while open_set and len(came_from) < 5000:
+        _, cx, cy = heapq.heappop(open_set)
+        cg = g_score.get((cx,cy), 9999)
+        has_unk = any(vox[cy+ndy,cx+ndx]==UNKNOWN
+                     for ndy in (-1,0,1) for ndx in (-1,0,1)
+                     if 0<=cx+ndx<W and 0<=cy+ndy<W)
+        if has_unk and cg < best_g:
+            best_g = cg; best_unk = (cx, cy)
+        for ndx, ndy in [(0,-1),(0,1),(-1,0),(1,0)]:
+            nx, ny = cx+ndx, cy+ndy
+            if not (0<=nx<W and 0<=ny<W and vox[ny,nx]==VISITED): continue
+            ng = cg + 1
+            if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
+                g_score[(nx,ny)] = ng
+                came_from[(nx,ny)] = (cx,cy)
+                heapq.heappush(open_set, (ng, nx, ny))
+    if best_unk is None: return None
+    path = []; cur = best_unk
+    while cur != (sx,sy):
+        path.append(cur)
+        if cur not in came_from: break
+        cur = came_from[cur]
+    path.reverse()
+    return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
+
 # ── XML & Mover (不变) ──
 CP_XML = "".join(f'<body mocap="true" pos="{x} {y} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>' for x,y in nav_wps[1:])
 OBS_XML = "".join(f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0"><geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>' for i,(x,y) in enumerate(obs_world))
@@ -221,7 +253,7 @@ mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 path = None; path_idx = 0
 
-print(f"=== 萤火算法 Firefly v9 === FREE=gate | seek nearest UNK on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v10 === path_to_unk backtrack on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -277,23 +309,11 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 gate = path[-1]
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
-                src_free = int(np.sum(vox==FREE))
-                sx, sy = int(bx/VOXEL), int(by/VOXEL)
-                # 找最近的毗邻UNKNOWN的VISITED或FREE体素
-                best_v = None; best_dist = 9999
-                for vy2 in range(max(0,sy-30), min(W,sy+31)):
-                    for vx2 in range(max(0,sx-30), min(W,sx+31)):
-                        if vox[vy2,vx2] not in (VISITED, FREE): continue
-                        has_unk = any(vox[vy2+ndy,vx2+ndx]==UNKNOWN
-                                    for ndy in (-1,0,1) for ndx in (-1,0,1)
-                                    if 0<=vx2+ndx<W and 0<=vy2+ndy<W)
-                        if not has_unk: continue
-                        dd = math.hypot(vx2-sx, vy2-sy)
-                        if dd < best_dist: best_dist = dd; best_v = (vx2, vy2)
-                if best_v:
-                    gx, gy = (best_v[0]+0.5)*VOXEL, (best_v[1]+0.5)*VOXEL
-                    path = [(gx, gy)]; path_idx = 0
-                    print(f"  🔍 [{step}] no gate, seek nearest UNK@({gx:.0f},{gy:.0f}) F{src_free}", flush=True)
+                bk_path = path_to_unk(bx, by)
+                if bk_path:
+                    path = bk_path; path_idx = 0
+                    gate = path[-1]
+                    print(f"  🔍 [{step}] no gate, path_to_unk→({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
                 else:
                     mv._bounce(90, 180)
         
