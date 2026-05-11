@@ -166,7 +166,7 @@ wp_idx=0; step=0; speed=SPEED; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep)
 lidar_tick = 0; lidar_cache = []
 
-print(f"=== algo2_lane_lidar === 15m lidar@10Hz 三车道 安全{r}={SAFE_R}m", flush=True)
+print(f"=== algo2_lane_lidar === 15m lidar@10Hz 三车道 safe_r={SAFE_R}m", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
