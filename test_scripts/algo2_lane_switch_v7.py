@@ -93,8 +93,7 @@ def wall_distance(vx, vy):
     """计算体素中心到最近WALL体素中心的欧几里得距离 (可搜索半径15格)"""
     best = 999.0
     cx, cy = vx+0.5, vy+0.5
-    # 先搜小范围, 找不到再扩
-    for r in (5, 10, 15):
+    r = 8  # 固定搜索半径
         for ndy in range(-r, r+1):
             for ndx in range(-r, r+1):
                 nx, ny = vx+ndx, vy+ndy
