@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v14 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v15 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -266,7 +266,7 @@ wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
 last_progress_step = 0; last_progress_wp = 0
 
-print(f"=== 萤火算法 Firefly v14 === gate WD + soft dot on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v15 === gate WD + soft dot on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -274,9 +274,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
     LIDAR_TICK = 20
 
-    # 初始扫描
-    print("  🔍 initial scan...", flush=True)
-    for _ in range(400):
+    # 初始扫描(减少,保留大量UNKNOWN供后续探索)
+    print("  🔍 initial scan (limited)...", flush=True)
+    for _ in range(40):
         bx, by = d.qpos[0], d.qpos[1]
         vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
