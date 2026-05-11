@@ -83,54 +83,51 @@ def target_yaw(bx, by, wp_idx):
     return ang
 
 # ── 体素决策 ──
+def line_clear(bx, by, wx, wy):
+    """检查从(bx,by)到(wx,wy)的直线是否有墙"""
+    dx, dy = wx-bx, wy-by
+    dist = math.hypot(dx, dy)
+    if dist < 0.1: return True
+    steps = int(dist / 0.3)  # 每0.3m采样
+    for i in range(1, steps):
+        t = i / steps
+        if blocked(bx+dx*t, by+dy*t): return False
+    return True
+
 def find_frontier(bx, by, wp_idx):
-    """找最佳未探索体素: 邻接已探索区域的未知格子, 朝wp方向"""
+    """找最佳未探索体素: 直线可达 + 邻接已探索 + 朝wp"""
     cx, cy = int(bx), int(by)
     wp_yaw = target_yaw(bx, by, wp_idx)
     best_score = -9999; best = None
     
-    # 搜索范围: 当前位置周围20m
     for dy in range(-20, 21):
         for dx in range(-20, 21):
             vx, vy = cx+dx, cy+dy
             if not (0 <= vx < W and 0 <= vy < W): continue
-            if vox[vy, vx] != FREE: continue  # 只要已扫描通畅但未走过的
+            if vox[vy, vx] != FREE: continue
             
-            # 必须邻接VISITED或FREE(探索边缘)
-            adjacent = False
-            for ndy in (-1,0,1):
-                for ndx in (-1,0,1):
-                    nvx, nvy = vx+ndx, vy+ndy
-                    if 0 <= nvx < W and 0 <= nvy < W:
-                        if vox[nvy, nvx] in (VISITED, FREE):
-                            adjacent = True; break
-                if adjacent: break
+            # 必须直线可达
+            if not line_clear(bx, by, vx+0.5, vy+0.5): continue
+            
+            # 邻接已探索
+            adjacent = any(vox[vy+ndy, vx+ndx] in (VISITED, FREE)
+                          for ndy in (-1,0,1) for ndx in (-1,0,1)
+                          if 0<=vx+ndx<W and 0<=vy+ndy<W)
             if not adjacent: continue
             
             # 评分
             score = 0
-            # 朝wp加分
             ang = math.atan2(vy+0.5-by, vx+0.5-bx)
             diff = abs((ang-wp_yaw+math.pi)%(2*math.pi)-math.pi)
-            score -= diff * 30  # 偏离wp扣分
-            
-            # 距离惩罚
-            dist = math.hypot(dx, dy)
-            score -= dist * 5
-            
-            # 未知邻接加分(前沿)
-            unknown_neighbors = 0
-            for ndy in (-1,0,1):
-                for ndx in (-1,0,1):
-                    nvx2, nvy2 = vx+ndx, vy+ndy
-                    if 0 <= nvx2 < W and 0 <= nvy2 < W:
-                        if vox[nvy2, nvx2] == UNKNOWN:
-                            unknown_neighbors += 1
-            score += unknown_neighbors * 20
+            score -= diff * 30
+            score -= math.hypot(dx, dy) * 5
+            unknown_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
+                           if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx]==UNKNOWN)
+            score += unknown_nb * 20
             
             if score > best_score:
                 best_score = score
-                best = (vx+0.5, vy+0.5)  # 格子中心
+                best = (vx+0.5, vy+0.5)
     
     return best
 
@@ -153,14 +150,66 @@ xml = f"""<mujoco>
   </worldbody>
 </mujoco>"""
 
+# ── 运动函数 ──
+class Mover:
+    """只管朝目标体素中心移动+转向, 不关心决策"""
+    def __init__(self, m, d):
+        self.m, self.d = m, d
+        self.yaw = 0.0; self.speed = SPEED; self.bounce = 0
+        self.force = 0; self.escaping = False
+        self.stuck_t = 0; self.stuck_x = 0.0; self.stuck_y = 0.0
+    
+    def step(self, tx, ty, step):
+        """朝(tx,ty)移动一步, 返回是否存活"""
+        bx, by = self.d.qpos[0], self.d.qpos[1]
+        dt = self.m.opt.timestep
+        
+        if not self.escaping:
+            tgt_yaw = math.atan2(ty-by, tx-bx)
+            err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
+            dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
+            self.yaw += dyaw
+            clear = math.hypot(tx-bx, ty-by)
+            self.speed = max(1.5, min(SPEED_MAX, clear*0.5))
+        
+        vx = math.cos(self.yaw)*self.speed
+        vy = math.sin(self.yaw)*self.speed
+        nx, ny = bx+vx*dt, by+vy*dt
+        
+        # 卡死
+        if step-self.stuck_t > 300:
+            if math.hypot(bx-self.stuck_x, by-self.stuck_y) < 0.5:
+                self._bounce(90, 180)
+            self.stuck_t = step; self.stuck_x = bx; self.stuck_y = by
+        
+        if self.force > 0:
+            self.force -= 1
+            self.d.qvel[0] = vx; self.d.qvel[1] = vy
+        elif blocked(nx, ny):
+            self._bounce(45, 120)
+        else:
+            self.escaping = False
+            self.d.qvel[0] = vx; self.d.qvel[1] = vy
+        
+        mujoco.mj_step(self.m, self.d); return True
+    
+    def _bounce(self, lo, hi):
+        if not self.escaping:
+            self.bounce += 1; self.escaping = True
+        deg = random.uniform(lo, hi)*random.choice([-1,1])
+        self.yaw += math.radians(deg)
+        self.d.qvel[:] = 0
+        self.force = int(0.3/(SPEED*self.m.opt.timestep))
+
 m = mujoco.MjModel.from_xml_string(xml); d = mujoco.MjData(m)
 d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
-yaw=0.0; bounce=0; force_steps=0; escaping=False
-wp_idx=0; step=0; speed=SPEED; t0=time.time()
-stuck_t=0; stuck_x=0.0; stuck_y=0.0; target=None; RENDER_SKIP=3
+# ... Mover class ...
 
-print(f"=== algo2 体素 v5 === {VOXEL}m³ LIDAR={LIDAR_RANGE}m", flush=True)
+mv = Mover(m, d)
+wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
+
+print(f"=== algo2 体素 v6 === {VOXEL}m³ Mover", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -193,47 +242,15 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         # 决策
         target = find_frontier(bx, by, wp_idx)
 
+        # 执行: 朝目标体素中心移动
         if target is None:
-            if not escaping:
-                bounce+=1; escaping=True
-                deg=random.uniform(90,180)*random.choice([-1,1]); yaw+=math.radians(deg)
-                d.qvel[:]=0; force_steps=int(0.3/(SPEED*m.opt.timestep))
-            mujoco.mj_step(m,d); step+=1
-            if step%RENDER_SKIP==0: v.sync()
+            mv._bounce(90, 180)
+            mujoco.mj_step(m, d); step += 1
+            if step % RENDER_SKIP == 0: v.sync()
             continue
 
-        # 执行
-        if not escaping:
-            tgt_yaw = math.atan2(target[1]-by, target[0]-bx)
-            yaw_err = (tgt_yaw-yaw+math.pi)%(2*math.pi)-math.pi
-            dyaw = max(-YAW_RATE*m.opt.timestep, min(YAW_RATE*m.opt.timestep, yaw_err))
-            yaw += dyaw
-            clear = math.hypot(target[0]-bx, target[1]-by)
-            speed = max(1.5, min(SPEED_MAX, clear*0.5))
-
-        vx_m=math.cos(yaw)*speed; vy_m=math.sin(yaw)*speed
-        nx, ny = bx+vx_m*m.opt.timestep, by+vy_m*m.opt.timestep
-
-        # 卡死检测
-        if step-stuck_t>300:
-            if math.hypot(bx-stuck_x, by-stuck_y)<0.5:
-                if not escaping:
-                    bounce+=1; escaping=True
-                    deg=random.uniform(90,180)*random.choice([-1,1]); yaw+=math.radians(deg)
-                    d.qvel[:]=0; force_steps=int(0.3/(SPEED*m.opt.timestep))
-            stuck_t=step; stuck_x=bx; stuck_y=by
-
-        if force_steps>0:
-            force_steps-=1; d.qvel[0]=vx_m; d.qvel[1]=vy_m
-        elif blocked(nx, ny):
-            if not escaping:
-                bounce+=1; escaping=True
-                deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
-                d.qvel[:]=0; force_steps=int(0.4/(SPEED*m.opt.timestep))
-        else:
-            escaping=False; d.qvel[0]=vx_m; d.qvel[1]=vy_m
-
-        mujoco.mj_step(m,d); step+=1
+        mv.step(target[0], target[1], step)
+        step += 1
         if step%RENDER_SKIP==0: v.sync()
         if step%200==0:
             vis=int(np.sum(vox==VISITED)); f=int(np.sum(vox==FREE))
