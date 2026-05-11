@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bounce_obs — V8原版 + 障碍物 + 碰撞转30~90°"""
+"""bounce_obs — V8 + 障碍物 + 1.5m预判碰撞 + 防卡死"""
 import sys, os, math, time, random
 import numpy as np, cv2, mujoco, mujoco.viewer
 
@@ -7,6 +7,7 @@ MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 hf = cv2.imread(MAP, cv2.IMREAD_GRAYSCALE)
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
+DETECT_R = 1.5  # 预判检测半径
 
 def sample_hfield_at(wx, wy):
     mx, my = wx / SCALE, wy / SCALE
@@ -16,7 +17,7 @@ def sample_hfield_at(wx, wy):
         return int(hf[py, px])
     return -1
 
-def detect_wall(wx, wy, radius=0.55):
+def detect_wall(wx, wy, radius=DETECT_R):
     for dy in np.arange(-radius, radius + 0.01, 0.15):
         max_dx = np.sqrt(max(0, radius**2 - dy**2))
         for dx in np.arange(-max_dx, max_dx + 0.01, 0.15):
@@ -31,8 +32,7 @@ def gen_centerline():
     for seg in range(10):
         y = y0 + seg * 5.0
         x0, x1 = (5.0, 45.0) if seg % 2 == 0 else (45.0, 5.0)
-        for j in range(10):
-            pts.append((x0 + (j/9.0)*(x1-x0), y))
+        for j in range(10): pts.append((x0 + (j/9.0)*(x1-x0), y))
     for mx, my in [(46.5, 3.75), (47.5, 5.0), (46.5, 6.25)]:
         for gy in range(5): pts.append((mx, my + gy*10.0))
     for mx, my in [(3.5, 8.75), (2.5, 10.0), (3.5, 11.25)]:
@@ -47,10 +47,9 @@ while idx < len(cl):
     wx, wy = cx * SCALE, cy * SCALE
     obs_world.append((wx, wy + rng.uniform(-2.0, 2.0)))
     idx += rng.randint(3, 8)
-
 before = len(obs_world)
 obs_world = [(x,y) for x,y in obs_world if math.hypot(x-6, y-6) > 5.0]
-print(f"障碍物: {before}→{len(obs_world)} (去掉起点5m)", flush=True)
+print(f"障碍物: {before}→{len(obs_world)}", flush=True)
 
 obs_xml = "".join(
     f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
@@ -58,14 +57,12 @@ obs_xml = "".join(
     for i, (x, y) in enumerate(obs_world)
 )
 
-OBS_R = 1.0  # 障碍物半径
-BOT_R = 0.55  # 机器人碰撞半径
-OBS_CLEAR = OBS_R + BOT_R  # 1.55
+OBS_R = 1.0; BOT_R = 0.55; OBS_CLEAR = OBS_R + DETECT_R
 
 def detect_obs(wx, wy):
     for i, (ox, oy) in enumerate(obs_world):
         if math.hypot(wx - ox, wy - oy) < OBS_CLEAR:
-            return i  # 返回障碍索引
+            return i
     return -1
 
 # ── 检查点 ──
@@ -76,7 +73,6 @@ cp_xml = "".join(
     for x, y in cps_world[1:]
 )
 
-# ── 场景 ──
 xml = f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
@@ -99,10 +95,12 @@ d = mujoco.MjData(m)
 d.qpos[0] = 6; d.qpos[1] = 6
 mujoco.mj_forward(m, d)
 
-SPEED = 1.5; yaw = 0.0; bounce = 0; force_step = 0
+SPEED = 1.5; yaw = 0.0; bounce = 0
+stuck_timer = 0        # 卡住计时(step)
+clear_count = 0         # 连续无碰撞步数
 step = 0; t0 = time.time()
 
-print(f"speed={SPEED} yaw={yaw:.1f} 起点(6,6)", flush=True)
+print(f"speed={SPEED} 检测圈={DETECT_R}m 起点(6,6)", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -116,27 +114,30 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         vx = np.cos(yaw) * SPEED; vy = np.sin(yaw) * SPEED
         nx = bx + vx * m.opt.timestep; ny = by + vy * m.opt.timestep
 
-        if force_step > 0:
-            # 强制前进: 碰撞后脱离期，不检测
-            force_step -= 1
-            d.qvel[0] = vx; d.qvel[1] = vy
-        else:
-            wall = detect_wall(nx, ny, BOT_R)
-            obs_idx = detect_obs(nx, ny)
+        wall = detect_wall(nx, ny, DETECT_R)
+        obs_idx = detect_obs(nx, ny)
+        colliding = wall or obs_idx >= 0
+
+        if colliding:
+            stuck_timer += 1
+            clear_count = 0
             
-            if wall or obs_idx >= 0:
+            # 初次碰撞 或 卡住1秒: 旋转
+            if stuck_timer == 1 or stuck_timer >= 200:
                 deg = random.uniform(30, 90) * random.choice([-1, 1])
                 yaw += math.radians(deg)
                 d.qvel[:] = 0
                 bounce += 1
-                force_step = 40
+                stuck_timer = 0
                 if wall:
                     print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 墙 Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
                 else:
                     ox, oy = obs_world[obs_idx]
                     print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) 障碍#{obs_idx}({ox:.1f},{oy:.1f}) Δ{deg:+.0f}° yaw={math.degrees(yaw):.0f}°", flush=True)
-            else:
-                d.qvel[0] = vx; d.qvel[1] = vy
+        else:
+            clear_count += 1
+            stuck_timer = 0
+            d.qvel[0] = vx; d.qvel[1] = vy
 
         mujoco.mj_step(m, d)
         step += 1; v.sync()
