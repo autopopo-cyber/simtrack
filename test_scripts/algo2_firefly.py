@@ -244,6 +244,20 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     LIDAR_TICK = 20
     path_tick = 0
 
+    # 初始扫描10轮 (2秒=400步)
+    print("  🔍 initial scan 10 rounds...", flush=True)
+    for _ in range(400):
+        bx, by = d.qpos[0], d.qpos[1]
+        vx, vy = int(bx/VOXEL), int(by/VOXEL)
+        if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
+        if _ % LIDAR_TICK == 0: scan_voxels(bx, by)
+        mujoco.mj_step(m, d)
+    print(f"  ✅ scan done F{int(np.sum(vox==FREE))} W{int(np.sum(vox==WALL))}", flush=True)
+    
+    # 第一次A*
+    path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+    if path: last_gate = path[-1]; print(f"  🚪 init gate=({last_gate[0]:.0f},{last_gate[1]:.0f}) path_len={len(path)}", flush=True)
+
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
         if bx<1 or bx>99 or by<1 or by>99:
