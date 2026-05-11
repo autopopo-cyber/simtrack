@@ -15,7 +15,7 @@ hf = np.array(Image.open(MAP))
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
 CP_RADIUS = 2.0  # 2m内就算到达
-LIDAR_RANGE = 15.0; DOOR_SIZE = 1.0   # 每米一道门
+LIDAR_RANGE = 15.0; DOOR_SIZE = 1.0; LIDAR_HZ = 10  # 每米一道门
 LANES = {"左": -1.5, "中": 0.0, "右": 1.5}
 LANE_ORDER = ["中", "右", "左"]  # 优先顺序
 
