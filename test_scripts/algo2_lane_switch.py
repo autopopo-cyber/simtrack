@@ -64,6 +64,24 @@ def road_direction(wp_idx):
 def road_normal(wp_idx):
     rdx, rdy = road_direction(wp_idx); return (-rdy, rdx)
 
+def turn_info(wp_idx):
+    """检测是否接近弯道: (is_turn, outer_side) outer_side='左'/'右'"""
+    if wp_idx >= len(nav_wps)-2: return (False, None)
+    rdx1, rdy1 = road_direction(wp_idx)
+    rdx2, rdy2 = road_direction(wp_idx+1)
+    cross = rdx1*rdy2 - rdy1*rdx2
+    dot = rdx1*rdx2 + rdy1*rdy2
+    angle = math.degrees(math.acos(max(-1, min(1, dot))))
+    if angle > 30:
+        return (True, "左" if cross > 0 else "右")
+    return (False, None)
+
+def dist_to_turn(bx, by, wp_idx):
+    """到达弯道起点的距离"""
+    if wp_idx >= len(nav_wps): return 999
+    tx, ty = nav_wps[wp_idx]
+    return math.hypot(tx-bx, ty-by)
+
 def target_yaw(bx, by, wp_idx):
     tx, ty = nav_wps[wp_idx]; dist = math.hypot(tx-bx, ty-by)
     ang = math.atan2(ty-by, tx-bx)
@@ -168,30 +186,43 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         lidar_tick += 1
         if lidar_tick % lidar_interval == 0:
             clr = lane_clearance(bx, by, wp_idx)
-            
-            # 规则: 默认中路。如果中路前方<8m有障, 选最通畅的
+            is_turn, outer_side = turn_info(wp_idx)
+            d_turn = dist_to_turn(bx, by, wp_idx)
             mid_clear, mid_width = clr["中"]
-            if mid_clear < 8.0:
-                # 中路被堵: 评估左右
-                best_lane = max(clr, key=lambda n: clr[n][0]*0.7 + clr[n][1]*0.3)
-            elif current_lane != "中":
-                # 当前不在中路: 如果中路畅通(>12m), 回归
-                if mid_clear > 12.0:
-                    best_lane = "中"
-                else:
-                    best_lane = current_lane
+            
+            # ── 弯道策略: 靠外墙扩视野 ──
+            if is_turn and d_turn < 15.0:
+                turn_mode = True
+                # 外侧=视野更好的一侧
+                best_lane = outer_side  # outer_side='左'或'右'
             else:
-                best_lane = "中"
+                turn_mode = False
+                # 直道规则: 默认中路。如果中路前方<8m有障, 选最通畅的
+                if mid_clear < 8.0:
+                    best_lane = max(clr, key=lambda n: clr[n][0]*0.7 + clr[n][1]*0.3)
+                elif current_lane != "中":
+                    if mid_clear > 12.0:
+                        best_lane = "中"
+                    else:
+                        best_lane = current_lane
+                else:
+                    best_lane = "中"
             
             if best_lane != current_lane:
-                print(f"  🔄 变道 step={step} {current_lane}→{best_lane} 中(clear={mid_clear:.1f}m,w={mid_width:.1f}m)", flush=True)
+                reason = f"弯道靠外={outer_side}" if turn_mode else f"中(clear={mid_clear:.1f}m)"
+                print(f"  🔄 变道 step={step} {current_lane}→{best_lane} {reason}", flush=True)
                 current_lane = best_lane
             
-            # 调速
+            # 调速: 弯道减速, 直道加速
             cur_clear = clr[current_lane][0]
-            if cur_clear > 12: speed = min(speed+0.3, SPEED_MAX)
-            elif cur_clear < 4: speed = max(speed-0.5, SPEED)
-            else: speed = max(speed-0.1, SPEED)
+            if turn_mode:
+                speed = max(2.0, speed - 0.5)  # 弯道减速到2m/s
+            elif cur_clear > 12:
+                speed = min(speed+0.3, SPEED_MAX)
+            elif cur_clear < 4:
+                speed = max(speed-0.5, SPEED)
+            else:
+                speed = max(speed-0.1, SPEED)
 
         # ── 转向: 朝CP + 车道偏移 ──
         if not escaping:
