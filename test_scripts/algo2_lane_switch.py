@@ -254,6 +254,6 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step%RENDER_SKIP==0: v.sync()
         if step%200==0:
             vis=int(np.sum(vox==VISITED)); f=int(np.sum(vox==FREE))
-            print(f"  [{step}] ({bx:.0f},{by:.0f}) CP{wp_idx} v={speed:.1f} d={dist_to_cp:.0f} V{vis}/F{f}", flush=True)
+            print(f"  [{step}] ({bx:.0f},{by:.0f}) CP{wp_idx} v={mv.speed:.1f} d={dist_to_cp:.0f} V{vis}/F{f}", flush=True)
 
     print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s", flush=True)
