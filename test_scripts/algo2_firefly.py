@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v12 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
+"""萤火算法 Firefly v13 — no gate时path_to_unk(VISITED空间A*)靠谱回溯
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -59,14 +59,17 @@ blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
 walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, VISITED)
 
 def target_yaw_dir(wp_idx):
+    """返回当前应走路段的方向 (prev_cp → wp_idx)"""
     if wp_idx >= len(nav_wps): return (1,0)
-    tx, ty = nav_wps[wp_idx]
-    if wp_idx+1 < len(nav_wps):
-        nx, ny = nav_wps[wp_idx+1]
-        dx, dy = nx-tx, ny-ty
-        d = math.hypot(dx, dy)
-        if d > 0.01: return (dx/d, dy/d)
-    return (1,0)
+    if wp_idx == 0:
+        tx, ty = nav_wps[0]
+        dx, dy = tx-10, ty-5  # 从起点到CP0
+    else:
+        px, py = nav_wps[wp_idx-1]
+        tx, ty = nav_wps[wp_idx]
+        dx, dy = tx-px, ty-py
+    d = math.hypot(dx, dy)
+    return (dx/d, dy/d) if d > 0.01 else (1,0)
 
 def scan_voxels(bx, by):
     for a in np.linspace(0, 2*np.pi, 120):
@@ -263,7 +266,7 @@ wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
 stuck_step = 0; stuck_bx = 0; stuck_by = 0; stuck_bounces = 0
 
-print(f"=== 萤火算法 Firefly v12 === gate WD + soft dot on no gate", flush=True)
+print(f"=== 萤火算法 Firefly v13 === gate WD + soft dot on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
