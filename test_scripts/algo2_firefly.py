@@ -306,11 +306,31 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if math.hypot(tx-bx, ty-by) < 1.0:
                 path_idx += 1
                 if path_idx >= len(path):
-                    print(f"  ✅ [{step}] at gate, scan...", flush=True)
+                    gate_reached = path[-1]  # 记住到达的gate
+                    print(f"  ✅ [{step}] at gate=({gate_reached[0]:.0f},{gate_reached[1]:.0f}), scan...", flush=True)
                     for _ in range(200):
                         if _ % LIDAR_TICK == 0: scan_voxels(d.qpos[0], d.qpos[1])
                         mujoco.mj_step(m, d); step += 1
                         if step % RENDER_SKIP == 0: v.sync()
+                    # 扫描完后立即检查: 同一个gate会被重复选吗?
+                    new_path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+                    if new_path:
+                        ng = new_path[-1]
+                        if math.hypot(ng[0]-gate_reached[0], ng[1]-gate_reached[1]) < 3.0:
+                            # 同一个gate! 标记周围FREE为VISITED强制报废
+                            gvx, gvy = int(ng[0]/VOXEL), int(ng[1]/VOXEL)
+                            for dy2 in range(-2, 3):
+                                for dx2 in range(-2, 3):
+                                    tx2, ty2 = gvx+dx2, gvy+dy2
+                                    if 0<=tx2<W and 0<=ty2<W and vox[ty2,tx2]==FREE:
+                                        vox[ty2,tx2] = VISITED
+                            stale = int(np.sum(vox==VISITED))
+                            print(f"  [sterile] gate still same, marked {stale}V", flush=True)
+                            path = None; path_idx = 0
+                        else:
+                            path = new_path; path_idx = 0
+                    else:
+                        path = None; path_idx = 0
             else:
                 mv.step(tx, ty, step)
         else:
