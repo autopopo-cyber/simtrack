@@ -11,13 +11,17 @@ cd "$SCRIPT_DIR"
 [ -f confirmed/track_clean.png ] || { echo "!!! confirmed/track_clean.png 缺失"; exit 1; }
 echo "赛道: confirmed/track_clean.png"
 
-# 确保 Xvfb 在跑
-if ! pgrep -x Xvfb >/dev/null; then
-    Xvfb :99 -screen 0 1280x720x24 -ac &
-    sleep 1
+# 确保 Xvfb 在跑 (无显示器时)
+if [ -z "$DISPLAY" ]; then
+    if ! pgrep -x Xvfb >/dev/null; then
+        Xvfb :99 -screen 0 1280x720x24 -ac &
+        sleep 1
+    fi
+    export DISPLAY=:99
 fi
+echo "DISPLAY=$DISPLAY"
 
 # 跑仿真
 echo "=== 启动仿真 ${DURATION}s ==="
-DISPLAY=:99 timeout "$DURATION" python3 test_scripts/bounce_obs.py 2>&1 || true
+timeout "$DURATION" python3 test_scripts/bounce_obs.py 2>&1 || true
 echo "=== 完毕 ==="
