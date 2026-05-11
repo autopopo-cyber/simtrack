@@ -38,7 +38,7 @@ for mx, my in centerline:
     balls_xml += f'<body mocap="true" pos="{wx:.1f} {wy:.1f} 1.5"><geom type="sphere" size="0.3" rgba="1 0.9 0 0.9"/></body>\n'
 
 # ── 分段随机障碍物 ──
-rng = random.Random(42)
+rng = random.Random()  # 每次不同
 obstacles = []  # (mx, my) 迷宫坐标
 idx = 0
 while idx < len(centerline):
