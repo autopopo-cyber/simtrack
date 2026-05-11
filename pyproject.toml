@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "simtrack"
+version = "1.0.0"
+description = "模块化赛道仿真系统：地图生成 + 激光雷达感知 + 可替换避障算法 + 可替换模型/策略"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+    "mujoco>=3.0",
+    "opencv-python-headless>=4.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["simtrack", "simtrack.algorithms", "simtrack.models", "simtrack.policies"]
