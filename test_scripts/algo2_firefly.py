@@ -52,7 +52,7 @@ is_wall = lambda wx, wy: sample_hf(wx, wy) != ROAD_PIX
 is_obs = lambda wx, wy: any(math.hypot(wx-ox, wy-oy) < OBS_CLEAR for ox, oy in obs_world)
 blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
 unexplored = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, UNKNOWN)
-walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] not in (WALL, VISITED)
+walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] != WALL
 
 def target_yaw_dir(wp_idx):
     if wp_idx >= len(nav_wps): return (1,0)
