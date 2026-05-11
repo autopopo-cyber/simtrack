@@ -101,7 +101,7 @@ def wall_distance(vx, vy):
                 if d < best: best = d
     return best
 
-def find_frontier(bx, by, wp_idx, prev_target=None):
+def find_frontier(bx, by, wp_idx, prev_target=None, verbose=True):
     """挑最佳体素: line_clear + 邻接已探索 + 离墙远 + 朝wp + hysteresis防晃"""
     cx, cy = int(bx), int(by)
     wp_yaw = target_yaw(bx, by, wp_idx)
