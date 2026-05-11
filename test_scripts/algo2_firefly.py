@@ -223,13 +223,18 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             d.qvel[:]=0; mv.yaw=random.uniform(0,2*math.pi)
         v.cam.lookat[:]=np.array([bx, by, 0.5], dtype=np.float64)
 
-        tx, ty = nav_wps[wp_idx]; dist_to_cp = math.hypot(tx-bx, ty-by)
-        if dist_to_cp < CP_RADIUS:
-            wp_idx+=1
+        # 保留全部路点: 检查所有CP, 走到哪个算哪个
+        new_wp = wp_idx
+        for i in range(len(nav_wps)):
+            tx, ty = nav_wps[i]
+            if math.hypot(tx-bx, ty-by) < CP_RADIUS:
+                new_wp = max(new_wp, i+1)
+        if new_wp > wp_idx:
+            wp_idx = new_wp
             vis = int(np.sum(vox==VISITED)); f = int(np.sum(vox==FREE))
-            print(f"✓ CP{wp_idx-1} step={step} V{vis}/F{f}/W{int(np.sum(vox==WALL))}", flush=True)
+            print(f"\u2713 CP{wp_idx-1} step={step} V{vis}/F{f}/W{int(np.sum(vox==WALL))}", flush=True)
             if wp_idx>=len(nav_wps):
-                print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
+                print(f"\U0001f3c1 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                 break
             continue
 
