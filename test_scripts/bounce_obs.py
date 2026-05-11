@@ -96,7 +96,7 @@ d = mujoco.MjData(m)
 d.qpos[0] = 6; d.qpos[1] = 6
 mujoco.mj_forward(m, d)
 
-SPEED = 1.5; yaw = 0.0; bounce = 0
+SPEED = 1.5; yaw = 0.0; bounce = 0; cooldown = 0
 step = 0; t0 = time.time()
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
@@ -111,11 +111,14 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         vx = np.cos(yaw) * SPEED; vy = np.sin(yaw) * SPEED
         nx = bx + vx * m.opt.timestep; ny = by + vy * m.opt.timestep
 
-        if detect_collision(nx, ny, 0.55) or detect_obs(nx, ny):
+        if cooldown > 0:
+            cooldown -= 1
+        elif detect_collision(nx, ny, 0.55) or detect_obs(nx, ny):
             deg = random.uniform(30, 90) * random.choice([-1, 1])
             yaw += math.radians(deg)
             d.qvel[:] = 0
             bounce += 1
+            cooldown = 50
             if bounce <= 10 or bounce % 20 == 0:
                 print(f"BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) Δ{deg:+.0f}°", flush=True)
         else:
