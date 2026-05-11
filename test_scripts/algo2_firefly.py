@@ -105,7 +105,7 @@ def find_gate_path(bx, by, wp_idx):
     best_gate = None; best_gate_score = -9999
     visited_a_star = set()
     
-    while open_set and len(came_from) < 5000:
+    while open_set and len(came_from) < 20000:
         _, cx, cy = heapq.heappop(open_set)
         if (cx, cy) in visited_a_star: continue
         visited_a_star.add((cx, cy))
