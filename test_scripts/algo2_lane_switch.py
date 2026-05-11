@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""algo2_lane_switch — 三车道切换 + 居中找出口
+"""algo2_lane_switch — 探索栅格 + 门穿越
 
-策略: 
-  直道: 5m路分左(-1.5m)/中(0)/右(+1.5m)三条车道, 默认中路, 15m见障换通畅车道。
-  弯道/死路: 前方<5m无路→减速→居中(推开所有障碍)→扫出口(朝wp方向找最通畅缝隙)→走。
+策略: 1m=一道门。3车道=3扇并列门。LIDAR看15m=前面15道门。
+      优先走未探索的门朝导航点方向。走过的门标记已探索，不再走。
 """
 import sys, os, math, time, random
 import numpy as np
@@ -15,12 +14,10 @@ hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
-CP_RADIUS = 3.0
-LIDAR_RANGE = 15.0; LIDAR_RAYS = 120; LIDAR_HZ = 10
-LOOKAHEAD = 12.0
+CP_RADIUS = 2.0  # 2m内就算到达
+LIDAR_RANGE = 15.0; DOOR_SIZE = 1.0   # 每米一道门
 LANES = {"左": -1.5, "中": 0.0, "右": 1.5}
-FWD_BLOCKED = 5.0   # 前方<此距离无路→触发"居中找出口"
-CENTER_RANGE = 5.0   # 推开障碍的最大距离
+LANE_ORDER = ["中", "右", "左"]  # 优先顺序
 
 # ── 中心线 & 障碍物 ──
 def gen_centerline():
@@ -44,19 +41,47 @@ OBS_R = 1.0; OBS_CLEAR = OBS_R+SAFE_R
 cps_maze = [(3,3),(47,5),(3,10),(47,15),(3,20),(47,25),(3,30),(47,35),(3,40),(47,45),(3,48)]
 nav_wps = [(x*SCALE, y*SCALE) for x,y in cps_maze]
 
-# ── 检测 ──
+# ── 探索栅格 (0=未知, 1=通畅, 2=墙/障碍, 3=已走过) ──
+GRID_W, GRID_H = 100, 100
+UNKNOWN, FREE, WALL, VISITED = 0, 1, 2, 3
+grid = np.zeros((GRID_H, GRID_W), dtype=np.int8)
+
 def sample_hf(wx, wy):
     mx, my = wx/SCALE, wy/SCALE
     px, py = int(mx*PIX_PER_M), HF_RES-1-int(my*PIX_PER_M)
     return int(hf[py,px]) if 0<=px<HF_RES and 0<=py<HF_RES else -1
 
-def is_wall(wx, wy): return sample_hf(wx, wy) != ROAD_PIX
-def is_obs(wx, wy):
+def is_wall_g(wx, wy): return sample_hf(wx, wy) != ROAD_PIX
+def is_obs_g(wx, wy):
     for ox, oy in obs_world:
         if math.hypot(wx-ox, wy-oy) < OBS_CLEAR: return True
     return False
+def blocked(wx, wy): return is_wall_g(wx, wy) or is_obs_g(wx, wy)
 
-def is_blocked(wx, wy): return is_wall(wx, wy) or is_obs(wx, wy)
+def mark_visible(bx, by, wp_idx):
+    """用LIDAR扫描标记栅格: 射线碰到墙/障碍前=通畅, 碰到的点=墙"""
+    rdx, rdy = road_direction(wp_idx)
+    for a in np.linspace(0, 2*math.pi, 120):
+        for d in np.arange(0.5, LIDAR_RANGE+0.1, 0.5):
+            wx = bx + math.cos(a)*d; wy = by + math.sin(a)*d
+            gx, gy = int(wx), int(wy)
+            if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
+                if blocked(wx, wy):
+                    grid[gy, gx] = max(grid[gy, gx], WALL)
+                    break
+                else:
+                    grid[gy, gx] = max(grid[gy, gx], FREE)
+
+def mark_visited_row(bx, by, wp_idx):
+    """标记当前位置+同行三道门为已探索"""
+    rdx, rdy = road_direction(wp_idx)
+    nx_dir, ny_dir = road_normal(wp_idx)
+    for lane_name, off in LANES.items():
+        wx = bx + nx_dir*off
+        wy = by + ny_dir*off
+        gx, gy = int(wx), int(wy)
+        if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
+            grid[gy, gx] = VISITED
 
 def road_direction(wp_idx):
     if wp_idx+1 >= len(nav_wps): return (1,0)
@@ -76,80 +101,80 @@ def target_yaw(bx, by, wp_idx):
         ang+=diff*t
     return ang
 
-# ── 车道评估 ──
-def lane_clearance(bx, by, wp_idx):
+# ── 门穿越决策 ──
+def doors_ahead(bx, by, wp_idx):
+    """扫描前方15道门×3车道, 返回最佳目标点 (tx, ty) 或 None"""
     rdx, rdy = road_direction(wp_idx)
     nx_dir, ny_dir = road_normal(wp_idx)
-    result = {}
-    for name, offset in LANES.items():
-        min_clear = LOOKAHEAD; min_width = 5.0
-        for d in np.arange(0.5, LOOKAHEAD+0.1, 0.5):
-            cx = bx + rdx*d + nx_dir*offset
-            cy = by + rdy*d + ny_dir*offset
-            if is_blocked(cx, cy): min_clear = min(min_clear, d)
-            w = 0
-            for side in [-1, 1]:
-                for ww in np.arange(0.1, 2.6, 0.2):
-                    wx = cx + nx_dir*side*ww; wy = cy + ny_dir*side*ww
-                    if is_blocked(wx, wy): break
-                    w += 0.2
-            min_width = min(min_width, w)
-        result[name] = (min_clear, min_width)
-    return result
+    
+    # 对每个距离(门)和车道, 检查是否通畅+未探索
+    best_dist = 999; best_lane = None; best_wx = best_wy = 0
+    
+    for dist_m in np.arange(DOOR_SIZE, LIDAR_RANGE+0.1, DOOR_SIZE):
+        for lane_name in LANE_ORDER:
+            off = LANES[lane_name]
+            wx = bx + rdx*dist_m + nx_dir*off
+            wy = by + rdy*dist_m + ny_dir*off
+            gx, gy = int(wx), int(wy)
+            
+            if not (0 <= gx < GRID_W and 0 <= gy < GRID_H):
+                continue
+            if blocked(wx, wy):
+                continue
+            # 这扇门是通的, 检查它是否未探索
+            cell = grid[gy, gx]
+            if cell == VISITED:
+                continue  # 走过的门不回头
+            
+            # 优先: 未探索 > 已看到通畅
+            score = 0 if cell == UNKNOWN else 1  # UNKNOWN优先
+            
+            # 中道优先
+            if lane_name == "中": score -= 0.5
+            elif lane_name == "右": score -= 0.2
+            
+            # 综合: 距离越近越好(但要够远)
+            if dist_m < best_dist or (dist_m == best_dist and score < 0):
+                # 但至少走1m以上
+                if dist_m >= 1.0:
+                    best_dist = dist_m
+                    best_lane = lane_name
+                    best_wx, best_wy = wx, wy
+    
+    if best_lane is None:
+        return None  # 前面无路
+    
+    return best_wx, best_wy
 
-# ── 居中找出口 (新策略核心) ──
-def find_centered_exit(bx, by, wp_idx):
-    """前方<5m无路时: 居中→扫出口→返回(target_yaw, speed) 或 None(不用特殊处理)"""
-    # 1. 检测前方是否通畅
-    tgt = target_yaw(bx, by, wp_idx)
-    fwd_clear = 0.0
-    for d in np.arange(0.5, 15.1, 0.5):
-        if is_blocked(bx+math.cos(tgt)*d, by+math.sin(tgt)*d): break
-        fwd_clear = d
-    if fwd_clear >= FWD_BLOCKED:
-        return None  # 通畅, 正常车道行驶
-
-    # 2. 居中: 推开周围所有障碍(墙+障碍物)
-    cdx, cdy = 0.0, 0.0
-    for a in np.linspace(0, 2*math.pi, 72):
-        for d in np.arange(0.5, CENTER_RANGE+0.1, 0.5):
-            if is_blocked(bx+math.cos(a)*d, by+math.sin(a)*d):
-                w = (CENTER_RANGE-d)/CENTER_RANGE
-                cdx -= math.cos(a)*w; cdy -= math.sin(a)*w
-                break
-    center_dist = math.hypot(cdx, cdy)
-    if center_dist < 0.01:
-        cdx, cdy = math.cos(tgt), math.sin(tgt)  # 周围全空→朝wp
-    center_yaw = math.atan2(cdy, cdx)
-
-    # 3. 扫出口: 朝wp+下个wp方向之间的扇区
-    wp_yaw = tgt
-    if wp_idx+1 < len(nav_wps):
-        nx, ny = nav_wps[wp_idx+1]
-        next_yaw = math.atan2(ny-by, nx-bx)
-        diff = (next_yaw-wp_yaw+math.pi)%(2*math.pi)-math.pi
-        search_center = wp_yaw + diff*0.5
-        search_half = max(abs(diff)*0.8, math.pi/3)
-    else:
-        search_center = wp_yaw; search_half = math.pi/2
-
-    best_clear = 0.0; best_angle = wp_yaw
-    for a in np.linspace(search_center-search_half, search_center+search_half, 120):
-        clear_d = 0.0
-        for d in np.arange(0.5, 15.1, 0.5):
-            if is_blocked(bx+math.cos(a)*d, by+math.sin(a)*d): break
-            clear_d = d
-        if clear_d > best_clear:
-            best_clear = clear_d; best_angle = a
-
-    # 4. 综合: 居中力(25%) + 出口方向(75%)
-    diff = (best_angle-center_yaw+math.pi)%(2*math.pi)-math.pi
-    exit_yaw = (center_yaw + diff*0.75 + math.pi)%(2*math.pi)-math.pi
-
-    # 速度: 通畅度决定, 最低1m/s
-    spd = max(1.0, best_clear/LIDAR_RANGE * SPEED)
-    return exit_yaw, spd
-
+def find_any_frontier(bx, by):
+    """无前路时: 找最近未探索边界"""
+    gx0, gy0 = int(bx), int(by)
+    best_dist = 999; best_x = best_y = 0
+    
+    for dy in range(-15, 16):
+        for dx in range(-15, 16):
+            gx, gy = gx0+dx, gy0+dy
+            if not (0 <= gx < GRID_W and 0 <= gy < GRID_H):
+                continue
+            if grid[gy, gx] == UNKNOWN and not blocked(gx+0.5, gy+0.5):
+                # 检查是否邻接已探索区域
+                has_explored = False
+                for ndy in range(-1, 2):
+                    for ndx in range(-1, 2):
+                        ngx, ngy = gx+ndx, gy+ndy
+                        if 0 <= ngx < GRID_W and 0 <= ngy < GRID_H:
+                            if grid[ngy, ngx] in (FREE, VISITED):
+                                has_explored = True
+                if has_explored:
+                    d = math.hypot(dx, dy)
+                    # 偏向wp方向
+                    if d < best_dist:
+                        best_dist = d
+                        best_x, best_y = gx+0.5, gy+0.5
+    
+    if best_dist < 999:
+        return best_x, best_y
+    return None
 
 # ── XML ──
 CP_XML = "".join(f'<body mocap="true" pos="{x} {y} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>' for x,y in nav_wps[1:])
@@ -166,7 +191,6 @@ xml = f"""<mujoco>
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <geom type="cylinder" size="0.5 0.5" rgba="1 0.3 0 1" friction="0 0 0"/>
-      <site name="lidar_top" pos="0 0 1.0" size="0.02"/>
     </body>
   </worldbody>
 </mujoco>"""
@@ -179,14 +203,13 @@ wp_idx=0; step=0; speed=SPEED; current_lane="中"; t0=time.time()
 lidar_interval = int(1.0/LIDAR_HZ/m.opt.timestep); lidar_tick=0
 RENDER_SKIP = 3
 stuck_step=0; stuck_x=0.0; stuck_y=0.0
-clr={"中":(999,5),"左":(999,5),"右":(999,5)}; exit_result=None
+explored_count = 0; last_explored = 0
 
-print(f"=== algo2_lane_switch v2 === 居中找出口 前方<{FWD_BLOCKED}m触发", flush=True)
+print(f"=== algo2 探索栅格 v3 === {DOOR_SIZE}m/门 LIDAR={LIDAR_RANGE}m", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
     v.cam.distance=25; v.cam.elevation=-35; v.cam.azimuth=180
-    print("viewer ready", flush=True)
 
     while v.is_running() and wp_idx<len(nav_wps):
         bx, by = d.qpos[0], d.qpos[1]
@@ -198,94 +221,95 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         tx, ty = nav_wps[wp_idx]; dist_to_cp = math.hypot(tx-bx, ty-by)
         if dist_to_cp < CP_RADIUS:
             wp_idx+=1
-            print(f"✓ CP{wp_idx-1} step={step} v={speed:.1f} lane={current_lane}", flush=True)
+            print(f"✓ CP{wp_idx-1} step={step} explored={explored_count}", flush=True)
             if wp_idx>=len(nav_wps):
                 print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounces={bounce}", flush=True)
                 break
             continue
 
-        # ── 感知 (10Hz) ──
+        # ── 感知+探索 (10Hz) ──
         lidar_tick += 1
         if lidar_tick % lidar_interval == 0:
-            clr = lane_clearance(bx, by, wp_idx)
+            mark_visible(bx, by, wp_idx)
+            explored_count = int(np.sum(grid == VISITED))
 
-            # ── 新策略: 前方<5m无路→居中找出口 ──
-            exit_result = find_centered_exit(bx, by, wp_idx)
+        # 标记当前位置+同行三道门已走过
+        mark_visited_row(bx, by, wp_idx)
 
-            if exit_result is None:
-                # 通畅: 正常车道逻辑
-                mid_clear, _ = clr["中"]
-                if mid_clear < 8.0:
-                    best_lane = max(clr, key=lambda n: clr[n][0]*0.7+clr[n][1]*0.3)
-                elif current_lane!="中" and clr["中"][0]>12.0:
-                    best_lane = "中"
+        # ── 门穿越决策 ──
+        target = doors_ahead(bx, by, wp_idx)
+        if target is None:
+            # 无前路: 找最近未探索边界
+            target = find_any_frontier(bx, by)
+            if target is None:
+                # 彻底无路: 弹开
+                if not escaping:
+                    bounce+=1
+                    deg=random.uniform(90,180)*random.choice([-1,1]); yaw+=math.radians(deg)
+                    d.qvel[:]=0; force_steps=int(0.3/(SPEED*m.opt.timestep))
+                    print(f"💥 无路 BOUNCE#{bounce} step={step} Δ{deg:+.0f}°", flush=True)
+                    escaping=True
                 else:
-                    best_lane = current_lane
-
-                if best_lane != current_lane:
-                    print(f"  🔄 变道 step={step} {current_lane}→{best_lane} 中={clr['中'][0]:.1f}m", flush=True)
-                    current_lane = best_lane
-
-                # 调速
-                cur_clear = clr[current_lane][0]
-                if cur_clear>12: speed=min(speed+0.3, SPEED_MAX)
-                elif cur_clear<4: speed=max(speed-0.5, SPEED)
-                else: speed=max(speed-0.1, SPEED)
-                exit_mode = False
-            else:
-                # 前方堵了: 居中找出口
-                exit_yaw, exit_speed = exit_result
-                speed = exit_speed
-                exit_mode = True
-
-                # 直接朝出口方向转
-                yaw_err = (exit_yaw-yaw+math.pi)%(2*math.pi)-math.pi
-                dyaw = max(-YAW_RATE*m.opt.timestep, min(YAW_RATE*m.opt.timestep, yaw_err))
-                yaw += dyaw
-                if step%50==0:
-                    print(f"  🚪 找出口 step={step} yaw={math.degrees(exit_yaw):.0f}° v={speed:.1f} clear={exit_speed/SPEED*LIDAR_RANGE:.1f}m", flush=True)
-
-        # ── 转向 (通畅模式) ──
-        if not exit_result or exit_result is None:
-            tgt_yaw = target_yaw(bx, by, wp_idx)
+                    deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
+                d.qvel[:]=0; force_steps=int(0.3/(SPEED*m.opt.timestep))
+                mujoco.mj_step(m,d); step+=1
+                if step%RENDER_SKIP==0: v.sync()
+                continue
+        
+        # ── 朝目标转向 ──
+        if not escaping:
+            # 目标在车道系中的偏移
             rdx, rdy = road_direction(wp_idx)
             nx_dir, ny_dir = road_normal(wp_idx)
-            off = LANES[current_lane]
-            lx = bx+rdx*5.0+nx_dir*off; ly = by+rdy*5.0+ny_dir*off
-            lane_yaw = math.atan2(ly-by, lx-bx)
-            diff = (lane_yaw-tgt_yaw+math.pi)%(2*math.pi)-math.pi
-            steer_yaw = tgt_yaw+diff*0.4
-            yaw_err = (steer_yaw-yaw+math.pi)%(2*math.pi)-math.pi
+            # 计算目标相对于道路中线的偏移
+            tx_rel = (target[0]-bx)*nx_dir + (target[1]-by)*ny_dir
+            # 选最近的车道
+            best = min(LANES, key=lambda n: abs(LANES[n]-tx_rel))
+            if best != current_lane:
+                current_lane = best
+            
+            # 转向
+            tgt_yaw = math.atan2(target[1]-by, target[0]-bx)
+            yaw_err = (tgt_yaw-yaw+math.pi)%(2*math.pi)-math.pi
             dyaw = max(-YAW_RATE*m.opt.timestep, min(YAW_RATE*m.opt.timestep, yaw_err))
             yaw += dyaw
+            
+            # 调速: 远处通畅加速, 近处或有墙减速
+            clear_dist = math.hypot(target[0]-bx, target[1]-by)
+            if clear_dist > 10: speed = min(speed+0.3, SPEED_MAX)
+            elif clear_dist < 3: speed = max(speed-0.5, 1.5)
+            else: speed = max(speed-0.1, SPEED)
 
-        # ── 碰撞 + 卡死检测 ──
+        # ── 碰撞检测 ──
         vx=math.cos(yaw)*speed; vy=math.sin(yaw)*speed
         nx=bx+vx*m.opt.timestep; ny=by+vy*m.opt.timestep
-        blocked = is_blocked(nx, ny)
-
+        
         if step-stuck_step>300:
-            if math.hypot(bx-stuck_x, by-stuck_y)<1.0:
-                blocked=True
-                print(f"  ⚠ 卡死 step={step} Δ={math.hypot(bx-stuck_x,by-stuck_y):.1f}m", flush=True)
+            if math.hypot(bx-stuck_x, by-stuck_y)<0.5:
+                if not escaping:
+                    bounce+=1; escaping=True
+                    deg=random.uniform(90,180)*random.choice([-1,1]); yaw+=math.radians(deg)
+                    d.qvel[:]=0; force_steps=int(0.3/(SPEED*m.opt.timestep))
+                    print(f"💥 卡死 step={step}", flush=True)
             stuck_step=step; stuck_x=bx; stuck_y=by
+        
         if force_steps>0:
             force_steps-=1; d.qvel[0]=vx; d.qvel[1]=vy
-        elif blocked:
+        elif blocked(nx, ny):
             if not escaping:
-                bounce+=1; escaping=True; speed=SPEED
+                bounce+=1; escaping=True
                 deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
-                print(f"💥 BOUNCE#{bounce} step={step} ({bx:.1f},{by:.1f}) lane={current_lane} Δ{deg:+.0f}°", flush=True)
+                d.qvel[:]=0; force_steps=int(0.4/(SPEED*m.opt.timestep))
             else:
                 deg=random.uniform(45,120)*random.choice([-1,1]); yaw+=math.radians(deg)
-            d.qvel[:]=0; force_steps=int(0.4/(SPEED*m.opt.timestep))
         else:
             escaping=False; d.qvel[0]=vx; d.qvel[1]=vy
 
         mujoco.mj_step(m,d); step+=1
         if step%RENDER_SKIP==0: v.sync()
         if step%200==0:
-            mode="🚪" if exit_result else "→"
-            print(f"  [{step}] ({bx:.1f},{by:.1f}) CP{wp_idx} v={speed:.1f} {current_lane} d={dist_to_cp:.1f} {mode}", flush=True)
+            mode = "🚪" if target else "🔍"
+            exp_pct = explored_count/(GRID_W*GRID_H)*100
+            print(f"  [{step}] ({bx:.0f},{by:.0f}) CP{wp_idx} v={speed:.1f} {current_lane} doors={explored_count}({exp_pct:.0f}%) d={dist_to_cp:.0f} {mode}", flush=True)
 
-    print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s bounces={bounce}", flush=True)
+    print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s bounces={bounce} explored={explored_count}", flush=True)
