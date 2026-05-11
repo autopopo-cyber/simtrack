@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v6 — OLD只标实际走过的, FREE都是门
+"""萤火算法 Firefly v7 — OLD只标实际走过的, FREE都是门, no FREE时wall following
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -220,7 +220,7 @@ mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 path = None; path_idx = 0
 
-print(f"=== 萤火算法 Firefly v6 === FREE=gate | only VISIT actual positions", flush=True)
+print(f"=== 萤火算法 Firefly v7 === FREE=gate | wall following on no FREE", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
