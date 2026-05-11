@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""萤火算法 (Firefly) — 正式版 v1.0
+"""萤火算法 (Firefly) v2 — 细体素 0.5m, No大扫描
 
-LIDAR 10Hz 画体素, Move 1Hz 挑直线可达体素冲过去。
-唯一切入点: scan_voxels 后清理离墙<1.5m的FREE体素 —— 从源头杜绝碰撞。
+键改动:
+- 体素 0.5m, W=200 — 精度不卡死在粗格子上
+- 不要 clean_free_voxels 全图/局部大扫描
+- find_frontier 里 wall_distance(8格) 快速硬过滤 <1.0m
+- 候选体素 line_clear 后通常只剩几十个, 每个搜 289 邻居=万级操作
 """
 import sys, os, math, time, random
 import numpy as np
@@ -14,11 +17,11 @@ hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
-CP_RADIUS = 2.0; LIDAR_RANGE = 15.0; VOXEL = 1.0
-WALL_SAFE = 0.5  # 体素离墙至少1.5m才算FREE
+CP_RADIUS = 2.0; LIDAR_RANGE = 15.0
+VOXEL = 0.5; W = 200
 
 UNKNOWN, FREE, WALL, VISITED = 0, 1, 2, 3
-W = 100; vox = np.zeros((W, W), dtype=np.int8)
+vox = np.zeros((W, W), dtype=np.int8)
 
 def gen_centerline():
     pts = []; y0 = 2.5
@@ -61,56 +64,34 @@ def target_yaw(bx, by, wp_idx):
         ang += diff*t
     return ang
 
-# ── 体素扫描 + 安全清理 ──
 def scan_voxels(bx, by):
-    """LIDAR射线扫描标记 FREE 和 WALL"""
     for a in np.linspace(0, 2*np.pi, 120):
         cos_a, sin_a = math.cos(a), math.sin(a)
-        for d in np.arange(0.5, LIDAR_RANGE+0.1, 0.25):
+        for d in np.arange(0.5, LIDAR_RANGE+0.1, 0.5):
             wx, wy = bx+cos_a*d, by+sin_a*d
-            vx, vy = int(wx), int(wy)
+            vx, vy = int(wx/VOXEL), int(wy/VOXEL)
             if not (0 <= vx < W and 0 <= vy < W): break
             if vox[vy, vx] == WALL: break
             if blocked(wx, wy):
                 vox[vy, vx] = WALL; break
             vox[vy, vx] = max(vox[vy, vx], FREE)
 
-def clean_free_voxels(bx, by):
-    """只清理机器人周围30x30: 离WALL<1.5m的FREE撤标"""
-    brx, bry = int(bx), int(by)
-    for vy in range(max(0,bry-8), min(W,bry+9)):
-        for vx in range(max(0,brx-8), min(W,brx+9)):
-            if vox[vy, vx] != FREE: continue
-            min_d = 999.0
-            cx, cy = vx+0.5, vy+0.5
-            for ndy in range(-8, 9):
-                for ndx in range(-8, 9):
-                    nx, ny = vx+ndx, vy+ndy
-                    if 0 <= nx < W and 0 <= ny < W and vox[ny, nx] == WALL:
-                        d = math.hypot(cx-(nx+0.5), cy-(ny+0.5))
-                        if d < min_d: min_d = d
-            if min_d < WALL_SAFE:
-                vox[vy, vx] = UNKNOWN
-
-# ── 决策 ──
-
 def wall_distance(vx, vy):
-    """体素中心到最近WALL的距离, 搜索半径8"""
+    """体素中心到最近WALL的距离, 搜索半径8格"""
     best = 999.0
-    cx, cy = vx+0.5, vy+0.5
+    cx, cy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
     for ndy in range(-8, 9):
         for ndx in range(-8, 9):
             nx, ny = vx+ndx, vy+ndy
             if 0 <= nx < W and 0 <= ny < W and vox[ny, nx] == WALL:
-                d = math.hypot(cx-(nx+0.5), cy-(ny+0.5))
-                if d < best:
-                    best = d
+                d = math.hypot(cx-(nx+0.5)*VOXEL, cy-(ny+0.5)*VOXEL)
+                if d < best: best = d
     return best
 
 def line_clear(bx, by, wx, wy):
     dx, dy = wx-bx, wy-by
     dist = math.hypot(dx, dy)
-    if dist < 0.1: return True
+    if dist < 0.01: return True
     steps = int(dist / 0.3)
     for i in range(1, steps):
         t = i / steps
@@ -118,38 +99,39 @@ def line_clear(bx, by, wx, wy):
     return True
 
 def find_frontier(bx, by, wp_idx):
-    """挑最佳体素: line_clear + 邻接已探索 + 朝wp"""
-    cx, cy = int(bx), int(by)
+    cx, cy = int(bx/VOXEL), int(by/VOXEL)
     wp_yaw = target_yaw(bx, by, wp_idx)
     best_score = -9999; best = None
     
-    for dy in range(-20, 21):
-        for dx in range(-20, 21):
+    for dy in range(-40, 41):
+        for dx in range(-40, 41):
             vx, vy = cx+dx, cy+dy
             if not (0 <= vx < W and 0 <= vy < W): continue
             if vox[vy, vx] != FREE: continue
-            if not line_clear(bx, by, vx+0.5, vy+0.5): continue
+            wx, wy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
+            if not line_clear(bx, by, wx, wy): continue
             
             adjacent = any(vox[vy+ndy, vx+ndx] in (VISITED, FREE)
                           for ndy in (-1,0,1) for ndx in (-1,0,1)
                           if 0<=vx+ndx<W and 0<=vy+ndy<W)
             if not adjacent: continue
             
-            if wall_distance(vx, vy) < 1.0: continue
+            # 安全: 体素中心离墙至少0.8m
+            if wall_distance(vx, vy) < 0.8: continue
             
             score = 0
-            ang = math.atan2(vy+0.5-by, vx+0.5-bx)
+            ang = math.atan2(wy-by, wx-bx)
             diff = abs((ang-wp_yaw+math.pi)%(2*math.pi)-math.pi)
             score -= diff * 30
-            score -= math.hypot(dx, dy) * 5
+            score -= math.hypot(dx, dy) * 0.5
             
             unknown_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
                            if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx]==UNKNOWN)
-            score += unknown_nb * 20
+            score += unknown_nb * 10
             
             if score > best_score:
                 best_score = score
-                best = (vx+0.5, vy+0.5)
+                best = (wx, wy)
     
     return best
 
@@ -172,7 +154,6 @@ xml = f"""<mujoco>
   </worldbody>
 </mujoco>"""
 
-# ── Mover ──
 class Mover:
     def __init__(self, m, d):
         self.m, self.d = m, d
@@ -220,14 +201,13 @@ class Mover:
         self.d.qvel[:] = 0
         self.force = int(0.3/(SPEED*self.m.opt.timestep))
 
-# ── 主循环 ──
 m = mujoco.MjModel.from_xml_string(xml); d = mujoco.MjData(m)
 d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 
-print(f"=== 萤火算法 Firefly v1.0 === {VOXEL}m³ Mover | clean_free={WALL_SAFE}m", flush=True)
+print(f"=== 萤火算法 Firefly v2 === {VOXEL}m voxel W={W}", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -253,11 +233,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 break
             continue
 
-        vx, vy = int(bx), int(by)
+        vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
         if step % LIDAR_TICK == 0:
             scan_voxels(bx, by)
-            clean_free_voxels(bx, by)  # ← 唯一的安全防线
 
         if step % DECIDE_TICK == 0 or target is None:
             target = find_frontier(bx, by, wp_idx)
