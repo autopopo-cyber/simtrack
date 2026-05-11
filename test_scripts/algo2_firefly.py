@@ -107,11 +107,11 @@ def find_frontier(bx, by, wp_idx):
         for dx in range(-40, 41):
             vx, vy = cx+dx, cy+dy
             if not (0 <= vx < W and 0 <= vy < W): continue
-            if vox[vy, vx] != FREE: continue
+            if vox[vy, vx] not in (FREE, UNKNOWN): continue
             wx, wy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
             if not line_clear(bx, by, wx, wy): continue
             
-            adjacent = any(vox[vy+ndy, vx+ndx] in (VISITED, FREE)
+            adjacent = any(vox[vy+ndy, vx+ndx] in (VISITED, FREE, UNKNOWN)
                           for ndy in (-1,0,1) for ndx in (-1,0,1)
                           if 0<=vx+ndx<W and 0<=vy+ndy<W)
             if not adjacent: continue
@@ -126,7 +126,7 @@ def find_frontier(bx, by, wp_idx):
             score -= math.hypot(dx, dy) * 0.5
             
             unknown_nb = sum(1 for ndy in (-1,0,1) for ndx in (-1,0,1)
-                           if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx]==UNKNOWN)
+                           if 0<=vx+ndx<W and 0<=vy+ndy<W and vox[vy+ndy, vx+ndx] not in (WALL, VISITED))
             score += unknown_nb * 10
             
             if score > best_score:
