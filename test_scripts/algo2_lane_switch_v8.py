@@ -131,7 +131,7 @@ def find_frontier(bx, by, wp_idx, prev_target=None):
             if not adjacent: continue
             
             # v9: 离墙太近的体素直接禁掉 (1.5m安全距离)
-            if wall_distance(vx, vy) < 1.5: continue
+            if wall_distance(vx, vy) < 2.0: continue
             
             score = 0
             ang = math.atan2(vy+0.5-by, vx+0.5-bx)
@@ -155,6 +155,9 @@ def find_frontier(bx, by, wp_idx, prev_target=None):
                 best_score = score
                 best = (vx+0.5, vy+0.5)
     
+    if best and wp_idx < 3:
+        bx2, by2 = best
+        print(f'  [DEBUG] best=({bx2:.1f},{by2:.1f}) wd={wall_distance(int(bx2),int(by2)):.1f} score={best_score:.0f}', flush=True)
     return best
 
 # ── XML ──
@@ -229,7 +232,7 @@ d.qpos[0]=10; d.qpos[1]=5; mujoco.mj_forward(m,d)
 mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 
-print(f"=== 萤火算法 v9 (hard safety distance) === {VOXEL}m³ Mover", flush=True)
+print(f"=== 萤火算法 v10 (safe radius 15) === {VOXEL}m³ Mover", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
