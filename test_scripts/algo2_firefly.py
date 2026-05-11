@@ -276,29 +276,27 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 gate = path[-1]
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
-                print(f"  ⚡ [{step}] no FREE, seek farthest VISITED toward WP", flush=True)
-                # A*在VISITED里搜最远端朝WP的体素
+                src_free = int(np.sum(vox==FREE))
+                # ── wall following: 沿最近墙绕行, LIDAR边扫边开新区 ──
                 sx, sy = int(bx/VOXEL), int(by/VOXEL)
-                wp_dx, wp_dy = target_yaw_dir(wp_idx)
-                best_v = None; best_score = -9999
-                open_set2 = [(0, sx, sy)]; came2 = {}; vis2 = set()
-                while open_set2 and len(came2) < 10000:
-                    _, cx, cy = heapq.heappop(open_set2)
-                    if (cx,cy) in vis2: continue
-                    vis2.add((cx,cy))
-                    if vox[cy,cx] == VISITED:
-                        dot = ((cx-sx)*wp_dx + (cy-sy)*wp_dy) / max(1, math.hypot(cx-sx, cy-sy))
-                        score = math.hypot(cx-sx, cy-sy) * 0.5 + dot * 50
-                        if score > best_score:
-                            best_score = score; best_v = (cx, cy)
-                    for ndx, ndy in [(0,-1),(0,1),(-1,0),(1,0)]:
-                        nx, ny = cx+ndx, cy+ndy
-                        if 0<=nx<W and 0<=ny<W and vox[ny,nx] in (VISITED, FREE) and (nx,ny) not in vis2:
-                            came2[(nx,ny)] = (cx,cy); heapq.heappush(open_set2, (0, nx, ny))
-                if best_v:
-                    gate2 = ((best_v[0]+0.5)*VOXEL, (best_v[1]+0.5)*VOXEL)
-                    print(f"  🧭 [{step}] seek VISITED gate=({gate2[0]:.0f},{gate2[1]:.0f})", flush=True)
-                    path = [gate2]; path_idx = 0
+                best_wd = 999; wx = wy = 0
+                for ndy in range(-15, 16):
+                    for ndx in range(-15, 16):
+                        nx, ny = sx+ndx, sy+ndy
+                        if 0<=nx<W and 0<=ny<W and vox[ny,nx]==WALL:
+                            d = math.hypot(ndx, ndy)
+                            if d < best_wd: best_wd = d; wx, wy = nx, ny
+                if best_wd < 999:
+                    dx_r = bx-(wx+0.5)*VOXEL; dy_r = by-(wy+0.5)*VOXEL
+                    d_r = math.hypot(dx_r, dy_r) or 0.01
+                    # 逆时针转90° = 右手法则沿墙走
+                    wf_tx = bx + (-dy_r/d_r) * 3.0
+                    wf_ty = by + (dx_r/d_r) * 3.0
+                    if blocked(wf_tx, wf_ty):
+                        wf_tx = bx + (dy_r/d_r) * 3.0
+                        wf_ty = by + (-dx_r/d_r) * 3.0
+                    path = [(wf_tx, wf_ty)]; path_idx = 0
+                    print(f"  🧱 [{step}] wall follow F{src_free} → ({wf_tx:.0f},{wf_ty:.0f})", flush=True)
                 else:
                     mv._bounce(90, 180)
         
