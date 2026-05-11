@@ -108,7 +108,14 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
     while v.is_running():
         bx, by = d.qpos[0], d.qpos[1]
-        v.cam.lookat[:] = np.array([bx, by, 0.5], dtype=np.float64)
+        # 边界兜底: 出图拽回
+        if bx < 1 or bx > 99 or by < 1 or by > 99:
+            d.qpos[0] = max(1, min(99, bx))
+            d.qpos[1] = max(1, min(99, by))
+            d.qvel[:] = 0
+            yaw = random.uniform(0, 2*math.pi)
+            print(f"⚠ OOB step={step} 拽回({d.qpos[0]:.1f},{d.qpos[1]:.1f})", flush=True)
+        v.cam.lookat[:] = np.array([d.qpos[0], d.qpos[1], 0.5], dtype=np.float64)
 
         vx = np.cos(yaw) * SPEED; vy = np.sin(yaw) * SPEED
         nx = bx + vx * m.opt.timestep; ny = by + vy * m.opt.timestep
@@ -118,7 +125,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         colliding = wall or obs_idx >= 0
 
         if force_steps > 0:
-            # 强制前进期: 不检测, 冲0.2秒
+            # 强制前进: 冲0.2秒不检测
             force_steps -= 1
             d.qvel[0] = vx; d.qvel[1] = vy
         elif colliding:
