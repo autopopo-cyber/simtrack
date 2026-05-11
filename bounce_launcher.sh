@@ -7,31 +7,9 @@ DURATION=${1:-30}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 生成赛道 (4px围墙 + 路面)
-echo "=== 生成赛道 ==="
-python3 -c "
-import numpy as np, cv2, os, math
-PPM=40; RR=int(2.5*PPM)
-hf=np.full((2000,2000),191,dtype=np.uint8)
-pts=[]
-y0=2.5
-for s in range(10):
-    y=y0+s*5.0; l2r=(s%2==0)
-    xs=np.arange(5,45.01,0.25) if l2r else np.arange(45,4.99,-0.25)
-    for x in xs: pts.append((x,y))
-    if s<9:
-        ny=y0+(s+1)*5.0; cx=45 if l2r else 5; cy=(y+ny)/2
-        sa,ea=(math.pi/2,3*math.pi/2) if l2r else (3*math.pi/2,5*math.pi/2)
-        for j in range(1,17):
-            a=sa+(ea-sa)*j/17; pts.append((cx+5*math.cos(a),cy+5*math.sin(a)))
-for cx,cy in pts:
-    px,py=int(cx*PPM),1999-int(cy*PPM)
-    cv2.circle(hf,(px,py),RR,128,-1)
-hf[0:4,:]=191; hf[-4:,:]=191; hf[:,0:4]=191; hf[:,-4:]=191
-os.makedirs('confirmed',exist_ok=True)
-cv2.imwrite('confirmed/track_clean.png',hf)
-print(f'赛道生成完毕 Road:{np.sum(hf==128)} Wall:{np.sum(hf==191)}')
-"
+# 确认赛道文件存在
+[ -f confirmed/track_clean.png ] || { echo "!!! confirmed/track_clean.png 缺失"; exit 1; }
+echo "赛道: confirmed/track_clean.png"
 
 # 确保 Xvfb 在跑
 if ! pgrep -x Xvfb >/dev/null; then
