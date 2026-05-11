@@ -16,7 +16,7 @@ MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 hf = np.array(Image.open(MAP))
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-SAFE_R = 1.0; SPEED = 8.0; SPEED_MAX = 10.0; YAW_RATE = 6.0
+SAFE_R = 1.0; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 CP_RADIUS = 1.5; LIDAR_RANGE = 15.0
 VOXEL = 0.5; W = 200
 
@@ -117,7 +117,7 @@ def find_frontier(bx, by, wp_idx):
             if not adjacent: continue
             
             # 安全: 体素中心离墙至少0.8m
-            if wall_distance(vx, vy) < 0.5: continue
+            if wall_distance(vx, vy) < 0.8: continue
             
             score = 0
             ang = math.atan2(wy-by, wx-bx)
