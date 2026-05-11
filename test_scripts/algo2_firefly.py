@@ -196,9 +196,8 @@ class Mover:
     def _bounce(self, lo, hi):
         if not self.escaping:
             self.bounce += 1; self.escaping = True
-            if self.bounce % 5 == 0:
-                bx, by = self.d.qpos[0], self.d.qpos[1]
-                print(f"  💥 bounce#{self.bounce} pos=({bx:.0f},{by:.0f})", flush=True)
+            bx, by = self.d.qpos[0], self.d.qpos[1]
+            print(f"  💥 bounce#{self.bounce} @({bx:.1f},{by:.1f}) yaw={math.degrees(self.yaw):.0f}deg", flush=True)
         deg = random.uniform(lo, hi)*random.choice([-1,1])
         self.yaw += math.radians(deg)
         self.d.qvel[:] = 0
@@ -236,7 +235,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if new_wp > wp_idx:
             wp_idx = new_wp
             vis = int(np.sum(vox==VISITED)); f = int(np.sum(vox==FREE))
-            print(f"\u2713 CP{wp_idx-1} step={step} V{vis}/F{f}/W{int(np.sum(vox==WALL))} pos=({bx:.0f},{by:.0f})", flush=True)
+            print(f"  🏁 CP{wp_idx-1} @({bx:.1f},{by:.1f}) | step={step} V{vis}", flush=True)
             if wp_idx>=len(nav_wps):
                 print(f"\U0001f3c1 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                 break
