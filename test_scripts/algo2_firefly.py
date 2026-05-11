@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v8 — OLD/FREE gate + wall following + gate重复检测报废
+"""萤火算法 Firefly v9 — OLD/FREE gate + 无门时找最近UNKNOWN邻居
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -221,7 +221,7 @@ mv = Mover(m, d)
 wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=3
 path = None; path_idx = 0
 
-print(f"=== 萤火算法 Firefly v8 === FREE=gate | wall follow | sterile detect", flush=True)
+print(f"=== 萤火算法 Firefly v9 === FREE=gate | seek nearest UNK on no gate", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -278,26 +278,22 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
                 src_free = int(np.sum(vox==FREE))
-                # ── wall following: 沿最近墙绕行, LIDAR边扫边开新区 ──
                 sx, sy = int(bx/VOXEL), int(by/VOXEL)
-                best_wd = 999; wx = wy = 0
-                for ndy in range(-15, 16):
-                    for ndx in range(-15, 16):
-                        nx, ny = sx+ndx, sy+ndy
-                        if 0<=nx<W and 0<=ny<W and vox[ny,nx]==WALL:
-                            dd = math.hypot(ndx, ndy)
-                            if dd < best_wd: best_wd = dd; wx, wy = nx, ny
-                if best_wd < 999:
-                    dx_r = bx-(wx+0.5)*VOXEL; dy_r = by-(wy+0.5)*VOXEL
-                    d_r = math.hypot(dx_r, dy_r) or 0.01
-                    # 逆时针转90° = 右手法则沿墙走
-                    wf_tx = bx + (-dy_r/d_r) * 3.0
-                    wf_ty = by + (dx_r/d_r) * 3.0
-                    if blocked(wf_tx, wf_ty):
-                        wf_tx = bx + (dy_r/d_r) * 3.0
-                        wf_ty = by + (-dx_r/d_r) * 3.0
-                    path = [(wf_tx, wf_ty)]; path_idx = 0
-                    print(f"  🧱 [{step}] wall follow F{src_free} → ({wf_tx:.0f},{wf_ty:.0f})", flush=True)
+                # 找最近的毗邻UNKNOWN的VISITED或FREE体素
+                best_v = None; best_dist = 9999
+                for vy2 in range(max(0,sy-30), min(W,sy+31)):
+                    for vx2 in range(max(0,sx-30), min(W,sx+31)):
+                        if vox[vy2,vx2] not in (VISITED, FREE): continue
+                        has_unk = any(vox[vy2+ndy,vx2+ndx]==UNKNOWN
+                                    for ndy in (-1,0,1) for ndx in (-1,0,1)
+                                    if 0<=vx2+ndx<W and 0<=vy2+ndy<W)
+                        if not has_unk: continue
+                        dd = math.hypot(vx2-sx, vy2-sy)
+                        if dd < best_dist: best_dist = dd; best_v = (vx2, vy2)
+                if best_v:
+                    gx, gy = (best_v[0]+0.5)*VOXEL, (best_v[1]+0.5)*VOXEL
+                    path = [(gx, gy)]; path_idx = 0
+                    print(f"  🔍 [{step}] no gate, seek nearest UNK@({gx:.0f},{gy:.0f}) F{src_free}", flush=True)
                 else:
                     mv._bounce(90, 180)
         
