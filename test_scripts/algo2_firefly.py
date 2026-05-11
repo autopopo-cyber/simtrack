@@ -15,7 +15,7 @@ hf = np.array(Image.open(MAP))
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 1.0; SPEED = 4.0; SPEED_MAX = 6.0; YAW_RATE = 6.0
 CP_RADIUS = 2.0; LIDAR_RANGE = 15.0; VOXEL = 0.5
-WALL_SAFE = 0.8  # 体素离墙至少1.5m才算FREE
+WALL_SAFE = 0.5  # 体素离墙至少1.5m才算FREE
 
 UNKNOWN, FREE, WALL, VISITED = 0, 1, 2, 3
 W = 200; vox = np.zeros((W, W), dtype=np.int8)
