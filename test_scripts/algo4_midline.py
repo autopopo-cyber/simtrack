@@ -170,7 +170,14 @@ def wall_dist(vx, vy):
     return best
 
 def walkable(vx, vy):
-    return gget(vx, vy) == FREE and wall_dist(vx, vy) > ROBOT_R
+    # WALL=blocked, FREE=passable, UNKNOWN=passable (havent seen a wall there)
+    state = gget(vx, vy)
+    if state == WALL:
+        return False
+    # For FREE cells: also check clearance
+    if state == FREE and wall_dist(vx, vy) <= ROBOT_R:
+        return False
+    return True
 
 def jump_steps(vx, vy, dx, dy):
     wd = wall_dist(vx, vy)
@@ -193,7 +200,11 @@ def line_clear(vx1, vy1, vx2, vy2):
 
 def astar_to(fvx, fvy, tfx, tfy):
     """跳步A*到点, 返回世界坐标路径"""
-    if not (walkable(fvx, fvy) and walkable(tfx, tfy)):
+    # 起点: 机器人已在那就证明可通行, 但WALL不行
+    if gget(fvx, fvy) == WALL:
+        return None
+    # 终点: 必须walkable(有安全间隙)
+    if not walkable(tfx, tfy):
         return None
     open_set = [(math.hypot(tfx-fvx, tfy-fvy), fvx, fvy)]
     came_from = {}; g_score = {(fvx, fvy): 0}
@@ -225,6 +236,13 @@ def astar_to(fvx, fvy, tfx, tfy):
 # ★ v4 核心: 最大体素优先规划器 ★
 # ═══════════════════════════════════════════
 
+def is_frontier(vx, vy):
+    # check if FREE cell has UNKNOWN neighbor (frontier)
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]:
+        if gget(vx+dx, vy+dy) == UNKNOWN:
+            return True
+    return False
+
 def pick_max_voxel_target(bx, by, heading):
     """在机器人前方扇形区域采样，选wall_dist最大的FREE格作为目标。
     
@@ -254,9 +272,16 @@ def pick_max_voxel_target(bx, by, heading):
             ang = heading + math.radians(ang_deg)
             wx = bx + math.cos(ang) * dist_m
             wy = by + math.sin(ang) * dist_m
+            # clip to map bounds (0,100) world
+            if not (0 < wx < 100 and 0 < wy < 100):
+                continue
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
 
             if not walkable(vx, vy):
+                continue
+
+            # frontier constraint: must neighbor UNKNOWN
+            if not is_frontier(vx, vy):
                 continue
 
             wd = wall_dist(vx, vy)
@@ -420,7 +445,7 @@ else:
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
-d.qpos[0]=6; d.qpos[1]=6; mujoco.mj_forward(m,d)
+d.qpos[0]=10; d.qpos[1]=10; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 balls = BallManager(m, d)
@@ -504,6 +529,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                     no_path_count += 1
             else:
                 no_path_count += 1
+                if no_path_count == 1:
+                    twd = wall_dist(gvx, gvy)
+                    tfree = gget(gvx, gvy)
+                    print(f"  [NOPATH] [{step}] pick=({gvx},{gvy}) wd_pick={gwd} wd_tgt={twd} free_tgt={tfree} start=({vx},{vy}) wd_start={wall_dist(vx,vy)} free_start={gget(vx,vy)}", flush=True)
 
             # A*失败或无候选 → 恢复
             if no_path_count > MAX_NO_PATH:
