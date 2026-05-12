@@ -233,7 +233,9 @@ def path_to_unk(bx, by):
     return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
 
 # ── XML & Mover (不变) ──
-CP_XML = f'<body mocap="true" pos="{FINISH[0]} {FINISH[1]} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'  # 只有终点绿球
+# 导航点可视化: 127个小蓝点, 端点大球
+NAV_DOTS = "".join(f'<body mocap="true" pos="{x:.1f} {y:.1f} 1.5"><geom type="sphere" size="0.25" rgba="0.3 0.6 1.0 0.6"/></body>' for x,y in nav_wps)
+CP_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
 OBS_XML = "".join(f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0"><geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>' for i,(x,y) in enumerate(obs_world))
 
 xml = f"""<mujoco>
@@ -241,7 +243,7 @@ xml = f"""<mujoco>
   <visual><global offwidth="1280" offheight="720"/></visual>
   <asset><hfield name="track" size="50.0 50.0 4.0 2.0" file="{MAP}"/></asset>
   <worldbody>
-    <light pos="50 50 80" dir="0 0 -1"/>{CP_XML}{OBS_XML}
+    <light pos="50 50 80" dir="0 0 -1"/>{NAV_DOTS}{CP_XML}{OBS_XML}
     <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
     <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
