@@ -164,6 +164,17 @@ def walkable(vx, vy):
     # 离墙至少ROBOT_R格
     return wall_dist(vx, vy) > ROBOT_R
 
+def line_clear(vx1, vy1, vx2, vy2):
+    """两点间直线是否无障碍。Bresenham采样, 每步查 obstacles"""
+    steps = max(abs(vx2-vx1), abs(vy2-vy1))
+    if steps == 0: return True
+    for i in range(steps+1):
+        x = int(vx1 + (vx2-vx1)*i/steps)
+        y = int(vy1 + (vy2-vy1)*i/steps)
+        if 0<=x<W3 and 0<=y<W3 and obstacles[y, x]:
+            return False
+    return True
+
 # ═══════════════════════════════════════════
 # 门查找 (最近UNKNOWN相邻的FREE格)
 # ═══════════════════════════════════════════
@@ -434,6 +445,7 @@ step=0; t0=time.time()
 last_mx = last_my = 0
 path = None; path_idx = 0
 no_gate_count = 0
+wander = 0; last_dist = 999
 current_target_type = ""
 
 if milestones:
@@ -499,7 +511,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 gp = gate_path(vx, vy, gx, gy, came_from)
                 no_gate_count = 0
                 path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp]
-                path_idx = 0
+                path_idx = 0; wander = 0; last_dist = 999
                 gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
                 current_target_type = "gate"
                 balls.clear_gates()
@@ -512,7 +524,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                     back_path = astar_to(vx, vy, mx, my)
                     if back_path:
                         path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
-                        path_idx = 0
+                        path_idx = 0; wander = 0; last_dist = 999
                         current_target_type = "milestone"
                         balls.clear_gates()
                         mwx, mwy = (mx+0.5)*VOXEL, (my+0.5)*VOXEL
@@ -523,7 +535,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                         back_path = astar_to(vx, vy, mx, my)
                         if back_path:
                             path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
-                            path_idx = 0
+                            path_idx = 0; wander = 0; last_dist = 999
                             print(f"  [BACK] [{step}] →起点({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
                             no_gate_count = 0
                         else:
@@ -533,9 +545,29 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         if path is not None and path_idx < len(path):
             tx, ty = path[path_idx]
-            if math.hypot(tx-bx, ty-by) < 1.0:
+            d = math.hypot(tx-bx, ty-by)
+            if d < 1.0:
                 path_idx += 1
+                last_dist = 999; wander = 0
+            elif d > last_dist * 1.05:
+                wander += 1
+                if wander > 600:
+                    vx, vy = int(bx/VOXEL), int(by/VOXEL)
+                    for mx, my in reversed(milestones[-5:]):
+                        if line_clear(vx, vy, mx, my):
+                            path = [((mx+0.5)*VOXEL, (my+0.5)*VOXEL)]
+                            path_idx = 0; wander = 0; last_dist = 999
+                            print(f"  [LOST] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                            break
+                    else:
+                        path = None; path_idx = 0; wander = 0; last_dist = 999
+                        print(f"  [LOST] [{step}] 重新规划", flush=True)
+                else:
+                    last_dist = d
+                    mv.step(tx, ty, step)
             else:
+                wander = max(0, wander - 1)
+                last_dist = d
                 mv.step(tx, ty, step)
         else:
             mv._bounce(90, 180)
