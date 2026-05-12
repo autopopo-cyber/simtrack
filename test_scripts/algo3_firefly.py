@@ -182,11 +182,13 @@ def wall_dist(vx, vy):
                 d = abs(dx) + abs(dy)
                 if d < best: best = d
     return best
-
 def walkable(vx, vy):
+    """A*可达: 在界内+非障碍+已探索+离墙>机器人半径"""
     if not (0 <= vx < W3 and 0 <= vy < W3):
         return False
     if obstacles[vy, vx]:
+        return False
+    if not explored[vy, vx]:   # 不走未探索区域
         return False
     return wall_dist(vx, vy) > ROBOT_R
 
