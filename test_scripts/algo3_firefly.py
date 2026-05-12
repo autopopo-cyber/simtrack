@@ -476,7 +476,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
     # ── 主循环 ──
     while v.is_running():
-        bx, by = d.qpos[0], d.qpos[1]
+        try:
+            bx, by = d.qpos[0], d.qpos[1]
+        except AttributeError:
+            print("  [!] viewer线程崩溃, 尝试恢复...", flush=True)
+            d = mujoco.MjData(m); mv.d = d
+            bx, by = d.qpos[0], d.qpos[1]
         # 边界保护
         if bx<1 or bx>99 or by<1 or by>99:
             d.qpos[0]=max(1,min(99,bx)); d.qpos[1]=max(1,min(99,by))
