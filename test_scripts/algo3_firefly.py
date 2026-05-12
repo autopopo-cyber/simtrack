@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v3 — 字典SLAM地图 + 距离门限制 + far探索
+"""萤火算法 Firefly v3 SLAM — 字典地图 + 可变体素A* + far探索
 
-地图: dict[(vx,vy)] → UNKNOWN/FREE/WALL, 真正无限大
-  - 无预分配, 无地图边界, 从起点向外生长
-  - 地面真值实时查 hfield + 障碍物列表 (无预计算)
-门查找: A*距离上限 MAX_GATE_DIST, 不盲目扩散到全图
-探索模式: far(就远铺前线) / near(就近扫全图) / mix(自动切换)
+可变体素:
+  细格 0.1m — LIDAR精度, 边缘/门检测
+  粗格 0.5m — A*寻路, 5×5细格聚合
+  粗格状态: 全FREE→FREE, 有WALL→WALL, 否则UNKNOWN
+  A*节点减少~25×, 配合缓存→O(1)查粗格
 """
 
 import sys, os, math, time, random, heapq, json
@@ -26,32 +26,32 @@ SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.5; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 LIDAR_RANGE = 15.0
 
-VOXEL = 0.1
-ROBOT_R = max(1, int(SAFE_R / VOXEL))
+VOXEL = 0.1                                   # 细格精度
+COARSE_FACTOR = 5                              # 粗格=5细格=0.5m
+ROBOT_R = max(1, int(SAFE_R / VOXEL))         # 5
 CLEARANCE = ROBOT_R
-MILESTONE_STEP = int(3.0 / VOXEL)
-LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)
+MILESTONE_STEP = int(3.0 / VOXEL)              # 30
+LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)         # 150
 LIDAR_RAYS = 120
 
-MAX_GATES = 20
-WALL_SCAN_RADIUS = 10                          # 0.1m时6格太小, 扩到1m
-WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
+MAX_GATES = 200                                # 细格门候选多, 200个
+WALL_SCAN_RADIUS = 10
+WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)  # 20
 WALL_PENALTY = 3
-MAX_GATE_DIST = 300                            # 30m @0.1m
-ASTAR_MAX_EXPAND_GATE = 50000
-ASTAR_MAX_EXPAND_PATH = 30000
+MAX_GATE_DIST_COARSE = 60                      # 粗格门搜索上限(格=30m)
+ASTAR_MAX_EXPAND = 20000
 
 MIN_SPEED = 1.5; SPEED_FACTOR = 0.5
 BOUNCE_FORCE_DURATION = 0.3
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
 
-EXPLORE_MODE = "far"                          # "far"|"near"|"mix"
-MIX_THRESHOLD = 10                            # mix模式: >N个门时切far
+EXPLORE_MODE = "far"
+MIX_THRESHOLD = 50
 INIT_SCAN_STEPS = 200
 LIDAR_TICK = 20; RENDER_SKIP = 20
 ARRIVE_THRESH = 1.0
 WANDER_TIMEOUT = 600; WANDER_DRIFT_RATIO = 1.05
-MAX_NO_GATE = 5                               # 放宽: 允许更多次无门才回溯
+MAX_NO_GATE = 5
 RESCUE_MS_COUNT = 5
 
 FIXED_SEED = 42
@@ -59,25 +59,47 @@ MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
 FINISH = (7.0, 82.5)
 
 # ═══════════════════════════════════════════
-# SLAM字典地图 (真正无限大)
+# SLAM字典地图
 # ═══════════════════════════════════════════
 UNKNOWN, FREE, WALL = 0, 1, 2
-grid = {}  # {(vx,vy): state}
-_wd = {}   # wall_dist缓存: (vx,vy)→距离
+grid = {}          # {(vx,vy): state}  细格
+_wd = {}           # wall_dist缓存
+_coarse = {}       # 粗格状态缓存: (cvx,cvy)→state
+
+# 增量计数器 (避免gcount()扫全字典)
+_cnt = {FREE: 0, WALL: 0}
 
 def gget(vx, vy):
     return grid.get((vx, vy), UNKNOWN)
 
 def gset(vx, vy, val):
+    old = gget(vx, vy)
+    if old == val: return
+    if old != UNKNOWN: _cnt[old] -= 1
     grid[(vx, vy)] = val
+    _cnt[val] += 1
     if val == WALL:
-        _wd.clear()  # 新障碍→清缓存(简单粗暴, 效率够)
+        _wd.clear()
+        _coarse.pop((vx//COARSE_FACTOR, vy//COARSE_FACTOR), None)
 
-def gcount(state):
-    return sum(1 for v in grid.values() if v == state)
+def cget(cvx, cvy):
+    """粗格状态 (缓存)"""
+    key = (cvx, cvy)
+    if key in _coarse: return _coarse[key]
+    for dy in range(COARSE_FACTOR):
+        for dx in range(COARSE_FACTOR):
+            s = gget(cvx*COARSE_FACTOR+dx, cvy*COARSE_FACTOR+dy)
+            if s == WALL:
+                _coarse[key] = WALL; return WALL
+    # 无WALL → 检查是否全FREE
+    for dy in range(COARSE_FACTOR):
+        for dx in range(COARSE_FACTOR):
+            if gget(cvx*COARSE_FACTOR+dx, cvy*COARSE_FACTOR+dy) != FREE:
+                _coarse[key] = UNKNOWN; return UNKNOWN
+    _coarse[key] = FREE; return FREE
 
 # ═══════════════════════════════════════════
-# 地图加载 + 障碍物生成
+# 地图加载 + 障碍物
 # ═══════════════════════════════════════════
 
 hf = np.array(Image.open(MAP))
@@ -112,16 +134,13 @@ def sample_hf(wx, wy):
     return int(hf[py,px]) if 0<=px<HF_RES and 0<=py<HF_RES else -1
 
 def is_obstacle_world(wx, wy):
-    """实时查地面真值 (无预计算)"""
-    if sample_hf(wx, wy) != ROAD_PIX:
-        return True
+    if sample_hf(wx, wy) != ROAD_PIX: return True
     for ox, oy in obs_world:
-        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR:
-            return True
+        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR: return True
     return False
 
 # ═══════════════════════════════════════════
-# 扫描 (LIDAR 10Hz) — 填充字典地图
+# 扫描
 # ═══════════════════════════════════════════
 
 def scan(bx, by):
@@ -129,40 +148,35 @@ def scan(bx, by):
         cos_a, sin_a = math.cos(a), math.sin(a)
         prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
         for step_i in range(1, LIDAR_STEPS+1):
-            d = step_i * VOXEL
-            wx, wy = bx + cos_a*d, by + sin_a*d
+            wx, wy = bx + cos_a*step_i*VOXEL, by + sin_a*step_i*VOXEL
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
             if is_obstacle_world(wx, wy):
                 gset(vx, vy, WALL)
-                gset(prev_vx, prev_vy, WALL)   # 膨胀1格
+                gset(prev_vx, prev_vy, WALL)
                 break
             if gget(vx, vy) == UNKNOWN:
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
 
-# ── 碰撞检测 ──
 def blocked(wx, wy):
     vx, vy = int(wx/VOXEL), int(wy/VOXEL)
     for dy in range(-ROBOT_R, ROBOT_R+1):
         for dx in range(-ROBOT_R, ROBOT_R+1):
-            if dx*dx + dy*dy <= ROBOT_R*ROBOT_R:
+            if dx*dx+dy*dy <= ROBOT_R*ROBOT_R:
                 nx, ny = vx+dx, vy+dy
-                wx2, wy2 = (nx+0.5)*VOXEL, (ny+0.5)*VOXEL
-                if is_obstacle_world(wx2, wy2):
+                if is_obstacle_world((nx+0.5)*VOXEL, (ny+0.5)*VOXEL):
                     return True
     return False
 
 # ── A* 辅助 ──
 def wall_dist(vx, vy):
-    """到最近WALL的Manhattan距离 (缓存加速)"""
     key = (vx, vy)
     if key in _wd: return _wd[key]
     best = 999
-    r = WALL_SCAN_RADIUS
-    for dy in range(-r, r+1):
-        for dx in range(-r, r+1):
+    for dy in range(-WALL_SCAN_RADIUS, WALL_SCAN_RADIUS+1):
+        for dx in range(-WALL_SCAN_RADIUS, WALL_SCAN_RADIUS+1):
             if gget(vx+dx, vy+dy) == WALL:
-                d = abs(dx) + abs(dy)
+                d = abs(dx)+abs(dy)
                 if d < best: best = d
     _wd[key] = best
     return best
@@ -174,47 +188,70 @@ def line_clear(vx1, vy1, vx2, vy2):
     steps = max(abs(vx2-vx1), abs(vy2-vy1))
     if steps == 0: return True
     for i in range(steps+1):
-        x = int(vx1 + (vx2-vx1)*i/steps)
-        y = int(vy1 + (vy2-vy1)*i/steps)
-        if gget(x, y) == WALL:
+        if gget(int(vx1+(vx2-vx1)*i/steps), int(vy1+(vy2-vy1)*i/steps)) == WALL:
             return False
     return True
 
+# ── 粗格A*辅助 ──
+ROBOT_R_COARSE = max(1, ROBOT_R // COARSE_FACTOR)  # 1
+WALL_SCAN_COARSE = max(3, WALL_SCAN_RADIUS // COARSE_FACTOR)  # 2
+CLEARANCE_COARSE = max(1, CLEARANCE // COARSE_FACTOR)  # 1
+
+def coarse_wall_dist(cvx, cvy):
+    best = 999
+    for dy in range(-WALL_SCAN_COARSE, WALL_SCAN_COARSE+1):
+        for dx in range(-WALL_SCAN_COARSE, WALL_SCAN_COARSE+1):
+            if cget(cvx+dx, cvy+dy) == WALL:
+                d = abs(dx)+abs(dy)
+                if d < best: best = d
+    return best
+
+def coarse_walkable(cvx, cvy):
+    return cget(cvx, cvy) == FREE and coarse_wall_dist(cvx, cvy) > ROBOT_R_COARSE
+
 # ═══════════════════════════════════════════
-# 门查找 (距离限制, 不盲目扩散)
+# 门查找 (粗格A* + 细格门)
 # ═══════════════════════════════════════════
 
-def find_gates(sx, sy, max_gates=MAX_GATES):
-    if not walkable(sx, sy):
+def find_gates(fvx, fvy):
+    """粗格A*找门, 返回细格门列表"""
+    cvx, cvy = fvx//COARSE_FACTOR, fvy//COARSE_FACTOR
+    if not coarse_walkable(cvx, cvy):
         return [], {}
-    open_set = [(0, sx, sy)]
-    came_from = {}; g_score = {(sx,sy): 0}
+
+    open_set = [(0, cvx, cvy)]
+    came_from = {}; g_score = {(cvx, cvy): 0}
     visited = set()
     gates = []
 
-    while open_set and len(came_from) < ASTAR_MAX_EXPAND_GATE and len(gates) < max_gates:
+    while open_set and len(came_from) < ASTAR_MAX_EXPAND and len(gates) < MAX_GATES:
         _, cx, cy = heapq.heappop(open_set)
         if (cx,cy) in visited: continue
         visited.add((cx,cy))
         cg = g_score.get((cx,cy), 9999)
 
-        # 距离上限: 已经找到门了, 超出MAX_GATE_DIST就停
-        if gates and cg > MAX_GATE_DIST:
+        if gates and cg > MAX_GATE_DIST_COARSE:
             break
 
-        if gget(cx, cy) == FREE:
-            has_unk = any(
-                gget(cx+dx, cy+dy) == UNKNOWN
-                for dy in (-1,0,1) for dx in (-1,0,1)
-            )
-            if has_unk and wall_dist(cx, cy) > CLEARANCE:
-                gates.append((cg, cx, cy))
+        # 检查粗格内的细格门
+        if cget(cx, cy) == FREE:
+            for dy in range(COARSE_FACTOR):
+                for dx in range(COARSE_FACTOR):
+                    gx, gy = cx*COARSE_FACTOR+dx, cy*COARSE_FACTOR+dy
+                    if gget(gx, gy) != FREE: continue
+                    if wall_dist(gx, gy) <= CLEARANCE: continue
+                    has_unk = any(
+                        gget(gx+ddx, gy+ddy) == UNKNOWN
+                        for ddy in (-1,0,1) for ddx in (-1,0,1)
+                    )
+                    if has_unk:
+                        gates.append((cg*COARSE_FACTOR, gx, gy))
 
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx+dx, cy+dy
-            if not walkable(nx, ny): continue
-            wd = wall_dist(nx, ny)
-            penalty = max(0, WALL_BUFFER_CELLS - wd) * WALL_PENALTY
+            if not coarse_walkable(nx, ny): continue
+            wd = coarse_wall_dist(nx, ny)
+            penalty = max(0, WALL_BUFFER_CELLS//COARSE_FACTOR - wd) * WALL_PENALTY
             ng = cg + 1 + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
@@ -223,55 +260,77 @@ def find_gates(sx, sy, max_gates=MAX_GATES):
 
     return gates, came_from
 
-def pick_gate(gates, mode="far", stuck=False, no_gate=0):
+def pick_gate(gates, mode="far", stuck=False):
     if not gates: return None
     if stuck: return gates[0]
     if mode == "far": return gates[-1]
     if mode == "near": return gates[0]
-    # mix: 门少→就近扫, 门多→就远铺
     if mode == "mix":
         return gates[-1] if len(gates) >= MIX_THRESHOLD else gates[0]
     return gates[0]
 
-def gate_path(sx, sy, gx, gy, came_from):
-    path = []; cur = (gx, gy)
-    while cur != (sx, sy):
-        path.append(cur)
+def coarse_path_to_fine(cvx1, cvy1, gx, gy, came_from):
+    """粗格路径→细格世界坐标路径"""
+    # 从目标粗格回溯
+    coarse_path = []
+    cur = (gx//COARSE_FACTOR, gy//COARSE_FACTOR)
+    start = (cvx1, cvy1)
+    while cur != start:
+        coarse_path.append(cur)
         if cur not in came_from: break
         cur = came_from[cur]
-    path.reverse()
+    coarse_path.reverse()
+
+    # 粗格→世界坐标
+    path = []
+    for cvx, cvy in coarse_path:
+        wx = (cvx*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
+        wy = (cvy*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
+        path.append((wx, wy))
     return path
 
-def astar_to(sx, sy, tx, ty):
-    if not (walkable(sx, sy) and walkable(tx, ty)):
+def astar_to(fvx, fvy, tfx, tfy):
+    """粗格A*到点, 返回细格世界坐标路径"""
+    scx, scy = fvx//COARSE_FACTOR, fvy//COARSE_FACTOR
+    tcx, tcy = tfx//COARSE_FACTOR, tfy//COARSE_FACTOR
+    if not (coarse_walkable(scx, scy) and coarse_walkable(tcx, tcy)):
         return None
-    open_set = [(math.hypot(tx-sx, ty-sy), sx, sy)]
-    came_from = {}; g_score = {(sx,sy): 0}
+
+    open_set = [(math.hypot(tcx-scx, tcy-scy), scx, scy)]
+    came_from = {}; g_score = {(scx, scy): 0}
     visited_set = set()
-    while open_set and len(came_from) < ASTAR_MAX_EXPAND_PATH:
+    while open_set and len(came_from) < ASTAR_MAX_EXPAND:
         _, cx, cy = heapq.heappop(open_set)
         if (cx,cy) in visited_set: continue
         visited_set.add((cx,cy))
-        if (cx,cy) == (tx,ty): break
+        if (cx,cy) == (tcx,tcy): break
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx+dx, cy+dy
-            if not walkable(nx, ny): continue
+            if not coarse_walkable(nx, ny): continue
             ng = g_score.get((cx,cy), 999) + 1
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
                 came_from[(nx,ny)] = (cx,cy)
-                heapq.heappush(open_set, (ng+math.hypot(tx-nx, ty-ny), nx, ny))
-    if (tx,ty) not in came_from and (tx,ty) != (sx,sy): return None
-    path = []; cur = (tx,ty)
-    while cur != (sx,sy):
-        path.append(cur)
+                heapq.heappush(open_set, (ng+math.hypot(tcx-nx, tcy-ny), nx, ny))
+
+    if (tcx,tcy) not in came_from and (tcx,tcy) != (scx,scy): return None
+
+    coarse_path = []; cur = (tcx,tcy)
+    while cur != (scx,scy):
+        coarse_path.append(cur)
         if cur not in came_from: break
         cur = came_from[cur]
-    path.reverse()
+    coarse_path.reverse()
+
+    path = []
+    for cvx, cvy in coarse_path:
+        wx = (cvx*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
+        wy = (cvy*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
+        path.append((wx, wy))
     return path
 
 # ═══════════════════════════════════════════
-# 可视化球管理
+# 可视化
 # ═══════════════════════════════════════════
 
 class BallManager:
@@ -297,10 +356,6 @@ class BallManager:
         for name in self.gate_bodies:
             self.d.mocap_pos[self.m.body(name).mocapid] = [0, 0, -10]
         self.gate_count = 0
-
-# ═══════════════════════════════════════════
-# XML
-# ═══════════════════════════════════════════
 
 def build_xml():
     ms_xml = "".join(
@@ -333,10 +388,6 @@ def build_xml():
   </worldbody>
 </mujoco>"""
 
-# ═══════════════════════════════════════════
-# Mover
-# ═══════════════════════════════════════════
-
 class Mover:
     def __init__(self, m, d):
         self.m, self.d = m, d
@@ -351,17 +402,15 @@ class Mover:
             err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
             dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
             self.yaw += dyaw
-            self.speed = max(MIN_SPEED, min(SPEED_MAX, math.hypot(tx-bx, ty-by) * SPEED_FACTOR))
-        vx = math.cos(self.yaw)*self.speed
-        vy = math.sin(self.yaw)*self.speed
+            self.speed = max(MIN_SPEED, min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR))
+        vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
         nx, ny = bx+vx*dt, by+vy*dt
-        if step - self.stuck_t > STUCK_TIMEOUT:
-            if math.hypot(bx - self.stuck_x, by - self.stuck_y) < STUCK_DIST_THRESH:
+        if step-self.stuck_t > STUCK_TIMEOUT:
+            if math.hypot(bx-self.stuck_x, by-self.stuck_y) < STUCK_DIST_THRESH:
                 self._bounce(90, 180)
             self.stuck_t = step; self.stuck_x = bx; self.stuck_y = by
         if self.force > 0:
-            self.force -= 1
-            self.d.qvel[0] = vx; self.d.qvel[1] = vy
+            self.force -= 1; self.d.qvel[0] = vx; self.d.qvel[1] = vy
         elif blocked(nx, ny):
             self._bounce(45, 120)
         else:
@@ -379,13 +428,13 @@ class Mover:
         self.force = int(BOUNCE_FORCE_DURATION/(SPEED*self.m.opt.timestep))
 
 # ═══════════════════════════════════════════
-# 文件读写 (字典→npz)
+# 文件读写
 # ═══════════════════════════════════════════
 
 def save_state():
     if not grid: return
-    xs = [k[0] for k in grid]; ys = [k[1] for k in grid]
-    minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+    xs = sorted(set(k[0] for k in grid)); ys = sorted(set(k[1] for k in grid))
+    minx, maxx = xs[0], xs[-1]; miny, maxy = ys[0], ys[-1]
     w, h = maxx-minx+1, maxy-miny+1
     arr = np.full((h, w), UNKNOWN, dtype=np.int8)
     for (vx, vy), val in grid.items():
@@ -408,15 +457,14 @@ def load_state():
 # 主入口
 # ═══════════════════════════════════════════
 
-print(f"━━━ 萤火算法 Firefly v3 SLAM ━━━ {VOXEL}m dict-grid 模式={EXPLORE_MODE} ━━━", flush=True)
+print(f"━━━ 萤火 Firefly v3 SLAM ━━━ {VOXEL}m细格/{VOXEL*COARSE_FACTOR}m粗格 模式={EXPLORE_MODE} ━━━", flush=True)
 
 existing = load_state()
 if existing is not None:
     loaded_grid, loaded_mode = existing
     print(f"[LOAD] 加载扫图: {len(loaded_grid)} cells mode={loaded_mode}")
-    grid.update(loaded_grid)
-    if loaded_mode != EXPLORE_MODE:
-        print(f"  [!] 模式不匹配: 文件{loaded_mode} vs 当前{EXPLORE_MODE}")
+    for k, v in loaded_grid.items():
+        gset(*k, v)
     milestones = []
 else:
     print(f"[NEW] 新扫图: mode={EXPLORE_MODE}")
@@ -445,7 +493,7 @@ wander = 0; last_dist = 999
 if milestones:
     last_mx, last_my = milestones[-1]
 
-print(f"=== Firefly v3 SLAM start: VOXEL={VOXEL}m mode={EXPLORE_MODE} 路标{len(milestones)} ===", flush=True)
+print(f"=== Firefly v3 start: fine={VOXEL}m coarse={VOXEL*COARSE_FACTOR}m gates={MAX_GATES} ===", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -454,10 +502,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     print("  [SCAN] initial scan...", flush=True)
     for _ in range(INIT_SCAN_STEPS):
         bx, by = d.qpos[0], d.qpos[1]
-        if _ % LIDAR_TICK == 0:
-            scan(bx, by)
+        if _ % LIDAR_TICK == 0: scan(bx, by)
         mujoco.mj_step(m, d)
-    print(f"  [OK] FREE={gcount(FREE)} WALL={gcount(WALL)} cells={len(grid)}", flush=True)
+    print(f"  [OK] FREE={_cnt[FREE]} WALL={_cnt[WALL]}", flush=True)
 
     if not milestones:
         sx, sy = int(d.qpos[0]/VOXEL), int(d.qpos[1]/VOXEL)
@@ -469,7 +516,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         try:
             bx, by = d.qpos[0], d.qpos[1]
         except AttributeError:
-            print("  [!] viewer线程崩溃, 尝试恢复...", flush=True)
+            print("  [!] viewer线程崩溃", flush=True)
             d = mujoco.MjData(m); mv.d = d
             bx, by = d.qpos[0], d.qpos[1]
 
@@ -478,14 +525,14 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if gget(vx, vy) == UNKNOWN:
             gset(vx, vy, FREE)
-        if abs(vx-last_mx) + abs(vy-last_my) >= MILESTONE_STEP:
+        if abs(vx-last_mx)+abs(vy-last_my) >= MILESTONE_STEP:
             if wall_dist(vx, vy) > CLEARANCE:
                 milestones.append((vx, vy))
                 last_mx, last_my = vx, vy
                 balls.add_milestone(bx, by)
                 save_state()
                 if len(milestones) % 20 == 0:
-                    print(f"  [WAYPOINT] milestones={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
+                    print(f"  [WAYPOINT] ms={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
 
         if step % LIDAR_TICK == 0:
             scan(bx, by)
@@ -496,31 +543,29 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
             if gate is not None:
                 cg, gx, gy = gate
-                gp = gate_path(vx, vy, gx, gy, came_from)
-                no_gate_count = 0
-                path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp]
+                cvx, cvy = vx//COARSE_FACTOR, vy//COARSE_FACTOR
+                path = coarse_path_to_fine(cvx, cvy, gx, gy, came_from)
                 path_idx = 0; wander = 0; last_dist = 999
+                no_gate_count = 0
                 gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
                 balls.clear_gates()
                 balls.add_gate(gate_wx, gate_wy)
-                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) len={len(path)} gates={len(gates)} FREE={gcount(FREE)} WALL={gcount(WALL)}", flush=True)
+                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) path={len(path)} gates={len(gates)} F={_cnt[FREE]} W={_cnt[WALL]}", flush=True)
             else:
                 no_gate_count += 1
                 if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
                     mx, my = milestones[-2]
-                    back_path = astar_to(vx, vy, mx, my)
-                    if back_path:
-                        path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
-                        path_idx = 0; wander = 0; last_dist = 999
+                    bp = astar_to(vx, vy, mx, my)
+                    if bp:
+                        path = bp; path_idx = 0; wander = 0; last_dist = 999
                         balls.clear_gates()
-                        print(f"  [BACK] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f}) len={len(path)}", flush=True)
+                        print(f"  [BACK] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
                         no_gate_count = 0
                     else:
                         mx, my = milestones[0]
-                        back_path = astar_to(vx, vy, mx, my)
-                        if back_path:
-                            path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
-                            path_idx = 0; wander = 0; last_dist = 999
+                        bp = astar_to(vx, vy, mx, my)
+                        if bp:
+                            path = bp; path_idx = 0; wander = 0; last_dist = 999
                             print(f"  [BACK] [{step}] →起点({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
                             no_gate_count = 0
                         else:
@@ -537,9 +582,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             elif ddist > last_dist * WANDER_DRIFT_RATIO:
                 wander += 1
                 if wander > WANDER_TIMEOUT:
-                    vx2, vy2 = int(bx/VOXEL), int(by/VOXEL)
                     for mx, my in reversed(milestones[-RESCUE_MS_COUNT:]):
-                        if line_clear(vx2, vy2, mx, my):
+                        if line_clear(vx, vy, mx, my):
                             path = [((mx+0.5)*VOXEL, (my+0.5)*VOXEL)]
                             path_idx = 0; wander = 0; last_dist = 999
                             print(f"  [LOST] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
@@ -548,20 +592,18 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                         path = None; path_idx = 0; wander = 0; last_dist = 999
                         print(f"  [LOST] [{step}] 重新规划", flush=True)
                 else:
-                    last_dist = ddist
-                    mv.step(tx, ty, step)
+                    last_dist = ddist; mv.step(tx, ty, step)
             else:
-                wander = max(0, wander - 1)
-                last_dist = ddist
+                wander = max(0, wander-1); last_dist = ddist
                 mv.step(tx, ty, step)
         else:
             mv._bounce(90, 180)
 
         step += 1
         if step % 2000 == 0:
-            print(f"  ... step={step} FREE={gcount(FREE)} WALL={gcount(WALL)} ms={len(milestones)}", flush=True)
+            print(f"  ... step={step} F={_cnt[FREE]} W={_cnt[WALL]} ms={len(milestones)}", flush=True)
         if step % RENDER_SKIP == 0:
             v.sync()
 
     save_state()
-    print(f"done: milestones={len(milestones)} step={step} time={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
+    print(f"done: ms={len(milestones)} step={step} t={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
