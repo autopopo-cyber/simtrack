@@ -23,8 +23,6 @@ v2 → v3 核心变化:
 import sys, os, math, time, random, heapq, json
 import numpy as np
 from PIL import Image
-# 软件渲染 — 避免 viewer 线程 GL segfault
-os.environ.setdefault('MUJOCO_GL', 'egl')
 import mujoco, mujoco.viewer
 
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
@@ -40,12 +38,12 @@ SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.5; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 LIDAR_RANGE = 15.0
 
-# ── 0.1m精度 ──
-VOXEL = 0.1; W3 = 500                     # 50m/0.1m
-ROBOT_R = 5                                # 0.5m = 5格
-CLEARANCE = 5                              # 路标离墙最少5格(0.5m)
-MILESTONE_STEP = 30                        # 3m = 30格
-LIDAR_STEPS = int(LIDAR_RANGE / 0.1)      # 150步
+# ── 0.5m精度 (和v2同网格, 先验证逻辑) ──
+VOXEL = 0.5; W3 = 100                      # 50m/0.5m
+ROBOT_R = 1                                 # 0.5m = 1格
+CLEARANCE = 1                               # 路标离墙最少1格(0.5m)
+MILESTONE_STEP = 6                          # 3m = 6格
+LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)     # 30步
 LIDAR_RAYS = 120
 
 # ── 探索模式: near(就近) / far(就远) ──
@@ -117,7 +115,7 @@ def scan(bx, by):
         cos_a, sin_a = math.cos(a), math.sin(a)
         prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
         for step_i in range(1, LIDAR_STEPS+1):
-            d = step_i * 0.1
+            d = step_i * VOXEL
             wx, wy = bx + cos_a*d, by + sin_a*d
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
             if not (0 <= vx < W3 and 0 <= vy < W3):
@@ -209,7 +207,7 @@ def find_gates(sx, sy, max_gates=20):
             nx, ny = cx+dx, cy+dy
             if not walkable(nx, ny): continue
             wd = wall_dist(nx, ny)
-            penalty = max(0, 20-wd)*3
+            penalty = max(0, 4-wd)*3  # 2m = 4格 (0.5m精度)
             ng = cg + 1 + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
