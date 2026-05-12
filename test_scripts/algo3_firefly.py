@@ -241,10 +241,11 @@ def find_gates(sx, sy, max_gates=MAX_GATES):
     return gates, came_from
 
 def pick_gate(gates, mode="near", stuck=False):
+    """从门列表选一个。卡住→最近 / far→最远 / near→最近(扫全图)"""
     if not gates: return None
     if stuck: return gates[0]
     if mode == "far": return gates[-1]
-    return gates[len(gates)//2]
+    return gates[0]  # near → 最近门, 逐个扫干净
 
 def gate_path(sx, sy, gx, gy, came_from):
     path = []; cur = (gx, gy)
