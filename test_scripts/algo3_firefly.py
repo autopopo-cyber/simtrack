@@ -40,7 +40,7 @@ WALL_PENALTY = 3
 MAX_GATE_DIST = 3000                           # 细格门搜索上限(格=300m)
 ASTAR_MAX_EXPAND = 30000
 
-MIN_SPEED = 1.5; SPEED_FACTOR = 0.5
+MIN_SPEED = 3.0; SPEED_FACTOR = 2.0
 BOUNCE_FORCE_DURATION = 0.3
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
 
@@ -55,7 +55,7 @@ RESCUE_MS_COUNT = 5
 
 FIXED_SEED = random.randint(0, 999999)
 MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
-FINISH = (7.0, 82.5)
+FINISH = (3.0, 95.0)
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -512,24 +512,21 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             else:
                 no_gate_count += 1
                 if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
-                    mx, my = milestones[-2]
-                    bp = astar_to(vx, vy, mx, my)
-                    if bp:
-                        path = bp; path_idx = 0; wander = 0; last_dist = 999
-                        balls.clear_gates()
-                        print(f"  [BACK] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
-                        no_gate_count = 0
-                    else:
-                        mx, my = milestones[0]
+                    # 遍历路标从近到远, 第一个可达的就跳
+                    saved = False
+                    for i in range(len(milestones)-2, -1, -1):
+                        mx, my = milestones[i]
                         bp = astar_to(vx, vy, mx, my)
                         if bp:
                             path = bp; path_idx = 0; wander = 0; last_dist = 999
-                            print(f"  [BACK] [{step}] →起点({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                            balls.clear_gates()
+                            print(f"  [BACK] [{step}] →路标#{i}({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
                             no_gate_count = 0
-                        else:
-                            mv._bounce(90, 180)
-                else:
-                    mv._bounce(90, 180)
+                            saved = True
+                            break
+                    if not saved:
+                        if no_gate_count < 10: mv._bounce(90, 180)
+                        else: mv._bounce(150, 210)  # 死胡同加大转角
 
         if path is not None and path_idx < len(path):
             tx, ty = path[path_idx]
