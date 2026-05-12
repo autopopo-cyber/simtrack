@@ -277,6 +277,10 @@ def pick_max_voxel_target(bx, by, heading):
                 continue
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
 
+            # yellow ball must be line-of-sight reachable (no walls between robot and target)
+            if not line_clear(int(bx/VOXEL), int(by/VOXEL), vx, vy):
+                continue
+
             if not walkable(vx, vy):
                 continue
 
@@ -445,7 +449,7 @@ else:
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
-d.qpos[0]=10; d.qpos[1]=10; mujoco.mj_forward(m,d)
+d.qpos[0]=3; d.qpos[1]=3; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 balls = BallManager(m, d)

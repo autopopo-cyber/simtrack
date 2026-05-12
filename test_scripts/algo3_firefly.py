@@ -432,7 +432,7 @@ else:
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
-d.qpos[0]=6; d.qpos[1]=6; mujoco.mj_forward(m,d)
+d.qpos[0]=3; d.qpos[1]=3; mujoco.mj_forward(m,d)
 
 mv = Mover(m, d)
 balls = BallManager(m, d)
