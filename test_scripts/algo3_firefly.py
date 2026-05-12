@@ -193,23 +193,6 @@ def line_clear(vx1, vy1, vx2, vy2):
             return False
     return True
 
-# ── 粗格A*辅助 ──
-ROBOT_R_COARSE = max(1, ROBOT_R // COARSE_FACTOR)  # 1
-WALL_SCAN_COARSE = max(3, WALL_SCAN_RADIUS // COARSE_FACTOR)  # 2
-CLEARANCE_COARSE = max(1, CLEARANCE // COARSE_FACTOR)  # 1
-
-def coarse_wall_dist(cvx, cvy):
-    best = 999
-    for dy in range(-WALL_SCAN_COARSE, WALL_SCAN_COARSE+1):
-        for dx in range(-WALL_SCAN_COARSE, WALL_SCAN_COARSE+1):
-            if cget(cvx+dx, cvy+dy) == WALL:
-                d = abs(dx)+abs(dy)
-                if d < best: best = d
-    return best
-
-def coarse_walkable(cvx, cvy):
-    return cget(cvx, cvy) == FREE and coarse_wall_dist(cvx, cvy) > ROBOT_R_COARSE
-
 # ═══════════════════════════════════════════
 # 跳步门查找 (细格A* + 三级跳)
 # ═══════════════════════════════════════════
