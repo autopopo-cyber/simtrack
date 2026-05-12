@@ -128,11 +128,12 @@ def is_obstacle_world(wx, wy):
 # 每条边: (x1,y1,x2,y2,type, 门中心x,门中心y)
 # type='WALL' 或 'GATE'。相邻GATE边自动合并为一个门。
 polygon = []
+gate_cells = set()       # 格级门: FREE且邻接UNKNOWN的细格坐标
 GATE_GAP = 3.0  # 相邻激光命中点间距>3m→门
 
 def scan(bx, by):
-    global polygon
-    hits = []  # (angle, x, y, hit_wall)
+    global polygon, gate_cells
+    hits = []
     for a in np.linspace(0, 2*math.pi, LIDAR_RAYS):
         cos_a, sin_a = math.cos(a), math.sin(a)
         prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
@@ -144,9 +145,18 @@ def scan(bx, by):
                 gset(vx, vy, WALL)
                 gset(prev_vx, prev_vy, WALL)
                 hit_wall = True; lx, ly = wx, wy
+                gate_cells.discard((vx, vy))
                 break
-            if gget(vx, vy) == UNKNOWN:
+            was_unk = gget(vx, vy) == UNKNOWN
+            if was_unk:
                 gset(vx, vy, FREE)
+                # 检查邻居→格级门: FREE且邻接UNKNOWN
+                for dy in (-1,0,1):
+                    for dx in (-1,0,1):
+                        if dx==0 and dy==0: continue
+                        if gget(vx+dx, vy+dy) == UNKNOWN:
+                            gate_cells.add((vx, vy))
+                            break
             prev_vx, prev_vy = vx, vy
             lx, ly = wx, wy
         hits.append((a, lx, ly, hit_wall))
@@ -367,6 +377,31 @@ def polygon_gates(bx, by):
     gates.sort(key=lambda g: g[0])
     return gates
 
+# ── A*路径→黄色路点: line_clear直线可达的最远点 ──
+
+def simplify_waypoints(raw_path, fvx, fvy):
+    """A*细密路点→黄色路点: 每个点是从当前位置直线能到的最远点"""
+    if not raw_path: return []
+    waypoints = []
+    cvx, cvy = fvx, fvy
+    i = 0
+    while i < len(raw_path):
+        furthest = i
+        for j in range(i, len(raw_path)):
+            wx, wy = raw_path[j]
+            gvx, gvy = int(wx/VOXEL), int(wy/VOXEL)
+            if line_clear(cvx, cvy, gvx, gvy):
+                furthest = j
+            else:
+                break
+        waypoints.append(raw_path[furthest])
+        if furthest >= len(raw_path) - 1:
+            break
+        wx, wy = raw_path[furthest]
+        cvx, cvy = int(wx/VOXEL), int(wy/VOXEL)
+        i = furthest + 1
+    return waypoints
+
 
 def pick_gate(gates, mode="far", stuck=False):
     """门: (cg, wd, cx, cy). far模式取A*最远的门"""
@@ -576,9 +611,10 @@ for wx, wy in milestones:
 
 step = 0; t0 = time.time()
 last_mx = last_my = 0
-path = None; path_idx = 0
+yellow_wps = []     # 黄色路点: [(wx,wy), ...] 从最近到最远
+target_wp = None     # 当前移动目标
 no_gate_count = 0
-wander = 0; last_dist = 999
+PLAN_INTERVAL = 200  # 1Hz @ 0.005s timestep
 
 if milestones:
     last_mx, last_my = milestones[-1]
@@ -611,87 +647,78 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             bx, by = d.qpos[0], d.qpos[1]
 
         v.cam.lookat[:] = np.array([bx, by, 0.5], dtype=np.float64)
-
         vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if gget(vx, vy) == UNKNOWN:
             gset(vx, vy, FREE)
-        if abs(vx-last_mx)+abs(vy-last_my) >= MILESTONE_STEP:
+
+        # ── 激光扫描 ──
+        if step % LIDAR_TICK == 0:
+            scan(bx, by)
+
+        # ── 1Hz: 规划 ──
+        if step % PLAN_INTERVAL == 0:
+            gates = polygon_gates(bx, by)
+            gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
+            if gate is not None:
+                _, _, gx, gy = gate
+                raw = astar_to(vx, vy, gx, gy)
+                if raw:
+                    yellow_wps = simplify_waypoints(raw, vx, vy)
+                    target_wp = None
+                    no_gate_count = 0
+                    gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
+                    balls.clear_gates()
+                    balls.add_gate(gate_wx, gate_wy)
+                    print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) yellow={len(yellow_wps)} poly={len(gates)}", flush=True)
+                else:
+                    no_gate_count += 1
+            else:
+                no_gate_count += 1
+
+        # ── 1Hz: move — 找直线可达的最近黄色路点 ──
+        if step % PLAN_INTERVAL == 0:
+            target_wp = None
+            for wp in yellow_wps:
+                wx, wy = wp
+                wvx, wvy = int(wx/VOXEL), int(wy/VOXEL)
+                if line_clear(vx, vy, wvx, wvy):
+                    target_wp = wp
+                    break
+            # 撒蓝色轨迹点 (每秒一个)
             if wall_dist(vx, vy) > CLEARANCE:
                 milestones.append((vx, vy))
                 last_mx, last_my = vx, vy
                 balls.add_milestone(bx, by)
                 save_state()
-                if len(milestones) % 20 == 0:
-                    print(f"  [WAYPOINT] ms={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
+                if len(milestones) % 10 == 0:
+                    print(f"  [MS] {len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
 
-        if step % LIDAR_TICK == 0:
-            scan(bx, by)
-
-        if path is None or path_idx >= len(path):
-            gates = polygon_gates(bx, by)
-            gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
-
-            if gate is not None:
-                cg, cwd, gx, gy = gate
-                path = astar_to(vx, vy, gx, gy)
-                if path is None:
-                    no_gate_count += 1  # A*到不了这个门, 下次换
-                    continue
-                path_idx = 0; wander = 0; last_dist = 999
-                no_gate_count = 0
-                gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
-                balls.clear_gates()
-                balls.add_gate(gate_wx, gate_wy)
-                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) path={len(path)} poly={len(gates)} F={_cnt[FREE]} W={_cnt[WALL]}", flush=True)
+        # ── 每步移动 ──
+        if target_wp is not None:
+            tx, ty = target_wp
+            dist = math.hypot(tx-bx, ty-by)
+            if dist < ARRIVE_THRESH:
+                target_wp = None  # 到达,下个1Hz会找下一个路点
             else:
-                no_gate_count += 1
-                if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
-                    # 遍历路标从近到远, 第一个可达的就跳
-                    saved = False
-                    for i in range(len(milestones)-2, -1, -1):
-                        mx, my = milestones[i]
-                        bp = astar_to(vx, vy, mx, my)
-                        if bp:
-                            path = bp; path_idx = 0; wander = 0; last_dist = 999
-                            balls.clear_gates()
-                            print(f"  [BACK] [{step}] →路标#{i}({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
-                            no_gate_count = 0
-                            saved = True
-                            break
-                    if not saved:
-                        if no_gate_count < 10: mv._bounce(90, 180)
-                        else: mv._bounce(150, 210)  # 死胡同加大转角
-
-        if path is not None and path_idx < len(path):
-            tx, ty = path[path_idx]
-            ddist = math.hypot(tx-bx, ty-by)
-            if ddist < ARRIVE_THRESH:
-                path_idx += 1
-                last_dist = 999; wander = 0
-            elif ddist > last_dist * WANDER_DRIFT_RATIO:
-                wander += 1
-                if wander > WANDER_TIMEOUT:
-                    for mx, my in reversed(milestones[-RESCUE_MS_COUNT:]):
-                        if line_clear(vx, vy, mx, my):
-                            path = [((mx+0.5)*VOXEL, (my+0.5)*VOXEL)]
-                            path_idx = 0; wander = 0; last_dist = 999
-                            print(f"  [LOST] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
-                            break
-                    else:
-                        path = None; path_idx = 0; wander = 0; last_dist = 999
-                        print(f"  [LOST] [{step}] 重新规划", flush=True)
-                else:
-                    last_dist = ddist; mv.step(tx, ty, step)
-            else:
-                wander = max(0, wander-1); last_dist = ddist
                 mv.step(tx, ty, step)
+        elif no_gate_count > MAX_NO_GATE and len(milestones) > 1:
+            # 无门→回退路标
+            saved = False
+            for i in range(len(milestones)-2, -1, -1):
+                mx, my = milestones[i]
+                bp = astar_to(vx, vy, mx, my)
+                if bp:
+                    yellow_wps = [(p[0], p[1]) for p in bp[-1:]]  # 只用终点
+                    target_wp = yellow_wps[0] if yellow_wps else None
+                    print(f"  [BACK] [{step}] →路标#{i}({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                    no_gate_count = 0
+                    saved = True
+                    break
+            if not saved:
+                if no_gate_count < 10: mv._bounce(90, 180)
+                else: mv._bounce(150, 210)
         else:
-            mv._bounce(90, 180)
-
-        # ── 提前重规划: 路径走到70%就找下一个门 ──
-        if path is not None and len(path) > 0 and path_idx > len(path) * 0.7:
-            path = None
-            print(f"  [REPLAN] [{step}] 路径{path_idx}/{len(path)}({path_idx*100//len(path)}%) 提前找新门", flush=True)
+            mv.step(bx + math.cos(mv.yaw)*1.0, by + math.sin(mv.yaw)*1.0, step)
 
         step += 1
         # ── 终点检测 ──
