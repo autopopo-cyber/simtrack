@@ -198,7 +198,7 @@ def line_clear(vx1, vy1, vx2, vy2):
 # ═══════════════════════════════════════════
 
 def find_gates(fvx, fvy):
-    """细格A*找门, 用跳步展开。返回细格门列表 [(dist,vx,vy),...]"""
+    """细格A*找门+连通域合并, 返回簇中心门 [(dist,wd,vx,vy),...]"""
     if not walkable(fvx, fvy):
         return [], {}
 
@@ -236,7 +236,71 @@ def find_gates(fvx, fvy):
                 came_from[(nx,ny)] = (cx,cy)
                 heapq.heappush(open_set, (ng, nx, ny))
 
+    gates = merge_gates(gates, came_from)
     return gates, came_from
+
+# ── 门合并: 连通域聚类 → 簇中心自然在路中间 ──
+
+def merge_gates(raw_gates, came_from):
+    """将相邻门体素合并为连通簇, 每簇返回最靠近中心的那个门"""
+    if not raw_gates: return []
+    
+    # 门体素集合 + A*距离映射
+    gate_set = set()
+    gate_info = {}  # (vx,vy) → (cg, wd)
+    for cg, wd, cx, cy in raw_gates:
+        gate_set.add((cx, cy))
+        gate_info[(cx, cy)] = (cg, wd)
+    
+    visited = set()
+    clusters = []
+    
+    for sx, sy in gate_set:
+        if (sx, sy) in visited:
+            continue
+        # BFS找连通域 (4邻域)
+        cluster = []
+        stack = [(sx, sy)]
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in visited:
+                continue
+            if (cx, cy) not in gate_set:
+                continue
+            visited.add((cx, cy))
+            cluster.append((cx, cy))
+            for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+                nx, ny = cx+dx, cy+dy
+                if (nx, ny) in gate_set and (nx, ny) not in visited:
+                    stack.append((nx, ny))
+        
+        if not cluster:
+            continue
+        
+        # 簇的几何中心
+        n = len(cluster)
+        ctr_x = sum(x for x,y in cluster) / n
+        ctr_y = sum(y for x,y in cluster) / n
+        
+        # 选簇中离几何中心最近的门体素 (必须在came_from里)
+        best = None
+        best_dist = 999999
+        for cx, cy in cluster:
+            if (cx, cy) not in came_from:
+                continue
+            d = (cx-ctr_x)**2 + (cy-ctr_y)**2
+            if d < best_dist:
+                best_dist = d
+                cg, wd = gate_info[(cx, cy)]
+                best = (cg, wd, cx, cy)
+        
+        if best:
+            clusters.append(best)
+    
+    # 按A*距离排序 (近→远), 兼容pick_gate
+    clusters.sort(key=lambda g: g[0])
+    return clusters
+
 
 def pick_gate(gates, mode="far", stuck=False):
     """门: (cg, wd, cx, cy). far模式取A*最远的门"""
