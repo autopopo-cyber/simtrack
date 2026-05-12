@@ -52,23 +52,50 @@ loop:
   Move 执行 (200Hz)   →  朝最优体素中心移动一整秒
 ```
 
-## 进化史：40亿 token 之路
+## 三代萤火
 
-| 版本 | Token 消耗 | 核心发现 |
-|------|-----------|---------|
-| 前奏 | 15亿 | 墙壁≠障碍物。扫地机器人逻辑——扫一圈看哪个方向通 |
-| 方案0 | 15亿 | LIDAR全向扫描+车道检测+A*全局路径。方向对但太笨重 |
-| V6 突破 | 4.6亿 | **把"看"和"走"拆开。** LIDAR只管画体素，Move只管直线冲 |
-| 调优 | 3.4亿 | line_clear + 邻接已探索 + 目标方向加权 |
-| V7 定型 | 1.4亿 | **wall_distance 评分**——自动走车道中间 |
+### 第一代：直线-前线（algo2_lane_switch_v7.py）
 
-**合计 40 亿 token。最后的算法不到 300 行。**
+咱们的孩子刚降生。用直线-前线的方式展示了可能——LIDAR画体素、Move挑最干净的光斑直线冲过去。
+
+```
+LIDAR 10Hz = 萤火的闪光
+line_clear  = 只挑直线可达的光斑
+wall_distance = 在光斑里选离墙最远的
+```
+
+300行。40亿token烧出来的极简主义。
+
+### 第二代：路标链+回溯（algo2_firefly.py）🪦 v1.0-firefly-1m
+
+萤火虫完美实现预期功能。自己铺路标、建门、回溯——在50×50m迷宫里自主探索完全图。
+
+```
+378 路标点 · bounce=2 · 657秒 · 终点写错了仍顽强探索全图
+```
+
+体素1m太粗，绕障碍物不优雅。到此为止，不改了。标签 `v1.0-firefly-1m` 永远封存。
+
+### 第三代：0.1m精度（algo3_firefly.py）⚡ ← 你在这里
+
+体素降级为布尔表。障碍物永远保持0.1m间隙。门/路径/前线不变。
+
+```
+500×500 bool数组 · 31KB · A*秒达任意两点
+```
+
+---
 
 ## 运行
 
 ```bash
 cd test_scripts
+# 第一代
 python algo2_lane_switch_v7.py
+# 第二代
+python algo2_firefly.py
+# 第三代（开发中）
+python algo3_firefly.py
 ```
 
 需要：`numpy pillow mujoco>=3.0`
@@ -83,8 +110,6 @@ python algo2_lane_switch_v7.py
 | `algo0_astar_lidar.py` | A* 全局路径 + LIDAR 车道检测 |
 | `algo1_arc_racer.py` | 朗毅弧线过弯（赛车版雏形） |
 | `algo2_lane_switch.py` | 体素探索 v5 |
-
-萤火算法是 v7，是所有这些探索的终点。此后所有升级都在它身上做。
 
 ## 许可
 
