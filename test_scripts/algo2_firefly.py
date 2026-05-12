@@ -67,10 +67,18 @@ def get_closest_wp(bx, by):
     return best_i
 
 def target_yaw_dir(bx, by):
-    """方向: 从当前位置指向终点"""
-    dx, dy = FINISH[0]-bx, FINISH[1]-by
+    """方向: 沿中心线前方10步"""
+    ci = get_closest_wp(bx, by)
+    ahead = min(ci+10, len(nav_wps)-1)
+    dx, dy = nav_wps[ahead][0]-nav_wps[ci][0], nav_wps[ahead][1]-nav_wps[ci][1]
     d = math.hypot(dx, dy)
     return (dx/d, dy/d) if d > 0.01 else (1,0)
+
+def get_ahead_target(bx, by, steps=10):
+    """A*目标: 中心线上前方steps步的点"""
+    ci = get_closest_wp(bx, by)
+    ahead = min(ci+steps, len(nav_wps)-1)
+    return nav_wps[ahead]
 
 def scan_voxels(bx, by):
     for a in np.linspace(0, 2*np.pi, 120):
@@ -90,7 +98,7 @@ def find_gate_path(bx, by):
     if sx<0 or sx>=W or sy<0 or sy>=W or vox[sy,sx]==WALL: return None
     
     wp_dx, wp_dy = target_yaw_dir(bx, by)
-    tx, ty = FINISH
+    tx, ty = get_ahead_target(bx, by)
     
     open_set = []
     heapq.heappush(open_set, (0, sx, sy))
