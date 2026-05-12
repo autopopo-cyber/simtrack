@@ -239,17 +239,13 @@ def find_gates(fvx, fvy):
     return gates, came_from
 
 def pick_gate(gates, mode="far", stuck=False):
-    """门: (cg, wd, cx, cy). far模式在远门中选最中心(wd最大)的"""
+    """门: (cg, wd, cx, cy). far模式取A*最远的门"""
     if not gates: return None
-    if stuck: return min(gates, key=lambda g: g[0])  # nearest by cg
-    if mode == "far":
-        # 取A*距离最远的30%中wall_dist最大的 → 远且路中间
-        gates_by_dist = sorted(gates, key=lambda g: g[0], reverse=True)
-        top_n = max(3, len(gates_by_dist) // 3)
-        return max(gates_by_dist[:top_n], key=lambda g: g[1])
+    if stuck: return min(gates, key=lambda g: g[0])
+    if mode == "far": return gates[-1]
     if mode == "near": return min(gates, key=lambda g: g[0])
     if mode == "mix":
-        return pick_gate(gates, "far") if len(gates) >= MIX_THRESHOLD else pick_gate(gates, "near")
+        return gates[-1] if len(gates) >= MIX_THRESHOLD else min(gates, key=lambda g: g[0])
     return min(gates, key=lambda g: g[0])
 
 def fine_path(sx, sy, gx, gy, came_from, to_world=True):
@@ -558,6 +554,11 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 mv.step(tx, ty, step)
         else:
             mv._bounce(90, 180)
+
+        # ── 提前重规划: 路径走到70%就找下一个门 ──
+        if path is not None and len(path) > 0 and path_idx > len(path) * 0.7:
+            path = None
+            print(f"  [REPLAN] [{step}] 路径{path_idx}/{len(path)}({path_idx*100//len(path)}%) 提前找新门", flush=True)
 
         step += 1
         # ── 终点检测 ──
