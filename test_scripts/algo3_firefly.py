@@ -419,8 +419,8 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
 
 def astar_to(fvx, fvy, tfx, tfy):
     """跳步A*到点, 返回世界坐标路径"""
-    if not (walkable(fvx, fvy) and walkable(tfx, tfy)):
-        return None
+    if not walkable(fvx, fvy): return None
+    if gget(tfx, tfy) == WALL: return None
 
     open_set = [(math.hypot(tfx-fvx, tfy-fvy), fvx, fvy)]
     came_from = {}; g_score = {(fvx, fvy): 0}
