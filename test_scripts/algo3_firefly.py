@@ -54,7 +54,7 @@ MAX_NO_GATE = 5
 RESCUE_MS_COUNT = 5
 
 FIXED_SEED = random.randint(0, 999999)
-MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
+MAX_MILESTONE_BALLS = 1000; MAX_GATE_BALLS = 50
 FINISH = (3.0, 95.0)
 
 # ═══════════════════════════════════════════
