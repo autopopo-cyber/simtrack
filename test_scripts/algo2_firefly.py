@@ -6,8 +6,8 @@
   scan_meta.json    — {seed, milestones, finished_flag}
   
 可视化:
-  🔵 蓝色小球 = 路标 (每3m)
-  🟡 黄色小球 = 当前门 (A*目标)
+  [BLUE] 蓝色小球 = 路标 (每3m)
+  [YELLOW] 黄色小球 = 当前门 (A*目标)
 
 Log: 只有两个move动作: 导航到门(x,y) / 导航到路标(x,y)
 """
@@ -141,8 +141,20 @@ def find_nearest_gate(sx, sy):
                 for dy in (-1,0,1) for dx in (-1,0,1)
                 if 0<=cx+dx<W and 0<=cy+dy<W
             )
-            if has_unk and cg < best_dist:
-                best_dist = cg; best_gate = (cx, cy)
+            if not has_unk: pass  # 没UNKNOWN邻居不算门
+            else:
+                # 过滤: 门本身离墙<3体素(1.5m)? 跳过
+                too_near_wall = False
+                for dy2 in range(-3, 4):
+                    for dx2 in range(-3, 4):
+                        tnx, tny = cx+dx2, cy+dy2
+                        if 0<=tnx<W and 0<=tny<W and vox[tny,tnx]==WALL:
+                            if abs(dx2)<=1 or abs(dy2)<=1:  # 邻接或紧贴
+                                too_near_wall = True
+                                break
+                    if too_near_wall: break
+                if not too_near_wall and cg < best_dist:
+                    best_dist = cg; best_gate = (cx, cy)
         
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx+dx, cy+dy
@@ -204,7 +216,7 @@ MAX_MILESTONE_BALLS = 300
 MAX_GATE_BALLS = 50
 
 class BallManager:
-    """管理mocap小球: 🔵路标球 🟡门球"""
+    """管理mocap小球: [BLUE]路标球 [YELLOW]门球"""
     def __init__(self, m, d):
         self.m = m; self.d = d
         self.mstone_bodies = []  # body names
@@ -308,7 +320,7 @@ class Mover:
         if not self.escaping:
             self.bounce += 1; self.escaping = True
             if self.bounce % 5 == 0:
-                print(f"  💥 bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
+                print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
         deg = random.uniform(lo, hi)*random.choice([-1,1])
         self.yaw += math.radians(deg)
         self.d.qvel[:] = 0
@@ -322,13 +334,13 @@ class Mover:
 existing = load_state()
 if existing is not None:
     loaded_vox, loaded_milestones, loaded_finished = existing
-    print(f"📂 加载扫图: seed={FIXED_SEED} milestones={len(loaded_milestones)} finished={loaded_finished}")
+    print(f"[LOAD] 加载扫图: seed={FIXED_SEED} milestones={len(loaded_milestones)} finished={loaded_finished}")
     np.copyto(vox, loaded_vox)
     milestones = loaded_milestones
     if loaded_finished:
-        print("  ✅ 扫图已标注'路径已到达终点', 直接沿路标走")
+        print("  [OK] 扫图已标注'路径已到达终点', 直接沿路标走")
 else:
-    print(f"🆕 新扫图: seed={FIXED_SEED}")
+    print(f"[NEW] 新扫图: seed={FIXED_SEED}")
     milestones = []
 
 # 2. 构建场景
@@ -367,14 +379,14 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     LIDAR_TICK = 20
 
     # 初始扫描
-    print("  🔍 initial scan...", flush=True)
+    print("  [SCAN] initial scan...", flush=True)
     for _ in range(200):
         bx, by = d.qpos[0], d.qpos[1]
         vx, vy = int(bx/VOXEL), int(by/VOXEL)
         if 0 <= vx < W and 0 <= vy < W: vox[vy, vx] = VISITED
         if _ % LIDAR_TICK == 0: scan_voxels(bx, by)
         mujoco.mj_step(m, d)
-    print(f"  ✅ F{int(np.sum(vox==FREE))} W{int(np.sum(vox==WALL))}", flush=True)
+    print(f"  [OK] F{int(np.sum(vox==FREE))} W{int(np.sum(vox==WALL))}", flush=True)
 
     # 第一个路标
     if not milestones:
@@ -400,7 +412,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 balls.add_milestone(bx, by)
                 save_state(milestones, False)
                 if len(milestones) % 20 == 0:
-                    print(f"  📍 milestones={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
+                    print(f"  [WAYPOINT] milestones={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
         
         if step % LIDAR_TICK == 0:
             scan_voxels(bx, by)
@@ -412,7 +424,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 if math.hypot(FINISH[0]-bx, FINISH[1]-by) < 5.0:
                     finish_found = True
                     save_state(milestones, True)
-                    print(f"  🏁 FINISH! step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
+                    print(f"  [FINISH] FINISH! step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                     break
 
         # 路径规划/执行
@@ -436,34 +448,32 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 current_target_type = "gate"
                 balls.clear_gates()
                 balls.add_gate(gate_wx, gate_wy)
-                print(f"  🚪 [{step}] 导航到门({gate_wx:.0f},{gate_wy:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
+                print(f"  [GATE] [{step}] 导航到门({gate_wx:.0f},{gate_wy:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
                 no_gate_count += 1
                 if no_gate_count > 3 and len(milestones) > 1:
-                    # 回溯到最近路标
-                    best_mi = -1; best_md = 99999
-                    for i in range(len(milestones)-1):
-                        mx, my = milestones[i]
-                        if vox[my,mx] != VISITED: continue
-                        d = abs(mx-vx) + abs(my-vy)
-                        if d < best_md and d > 5:
-                            best_md, best_mi = d, i
-                    
-                    if best_mi >= 0:
-                        mx, my = milestones[best_mi]
+                    # 回退一个路标 (路标链保证可直达)
+                    mx, my = milestones[-2]  # 上一个路标
+                    back_path = astar_to(vx, vy, mx, my)
+                    if back_path:
+                        path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
+                        path_idx = 0
+                        current_target_type = "milestone"
+                        balls.clear_gates()
+                        mwx, mwy = (mx+0.5)*VOXEL, (my+0.5)*VOXEL
+                        print(f"  [BACK] [{step}] 导航到路标({mwx:.0f},{mwy:.0f}) len={len(path)}", flush=True)
+                        no_gate_count = 0
+                    else:
+                        # 上一个路标也到不了? 退起点
+                        mx, my = milestones[0]
                         back_path = astar_to(vx, vy, mx, my)
                         if back_path:
                             path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in back_path]
                             path_idx = 0
-                            current_target_type = "milestone"
-                            balls.clear_gates()
-                            mwx, mwy = (mx+0.5)*VOXEL, (my+0.5)*VOXEL
-                            print(f"  🔙 [{step}] 导航到路标({mwx:.0f},{mwy:.0f}) len={len(path)}", flush=True)
+                            print(f"  [BACK] [{step}] 导航到起点({(mx+0.5)*VOXEL:.0f},{(my+0.5)*VOXEL:.0f})", flush=True)
                             no_gate_count = 0
                         else:
                             mv._bounce(90, 180)
-                    else:
-                        mv._bounce(90, 180)
                 else:
                     mv._bounce(90, 180)
         
