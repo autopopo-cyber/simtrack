@@ -124,20 +124,64 @@ def is_obstacle_world(wx, wy):
 # 扫描 + 碰撞检测
 # ═══════════════════════════════════════════
 
+# ── 多边形边界 (激光扫出的闭合空间) ──
+# 每条边: (x1,y1,x2,y2,type, 门中心x,门中心y)
+# type='WALL' 或 'GATE'。相邻GATE边自动合并为一个门。
+polygon = []
+GATE_GAP = 3.0  # 相邻激光命中点间距>3m→门
+
 def scan(bx, by):
+    global polygon
+    hits = []  # (angle, x, y, hit_wall)
     for a in np.linspace(0, 2*math.pi, LIDAR_RAYS):
         cos_a, sin_a = math.cos(a), math.sin(a)
         prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
+        hit_wall = False; lx, ly = bx, by
         for step_i in range(1, LIDAR_STEPS+1):
             wx, wy = bx + cos_a*step_i*VOXEL, by + sin_a*step_i*VOXEL
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
             if is_obstacle_world(wx, wy):
                 gset(vx, vy, WALL)
                 gset(prev_vx, prev_vy, WALL)
+                hit_wall = True; lx, ly = wx, wy
                 break
             if gget(vx, vy) == UNKNOWN:
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
+            lx, ly = wx, wy
+        hits.append((a, lx, ly, hit_wall))
+    
+    # ── 建多边形: 相邻命中点→WALL边, 大间隙→GATE边 ──
+    hits.sort(key=lambda h: h[0])
+    edges = []
+    for i in range(len(hits)):
+        j = (i+1) % len(hits)
+        a1, x1, y1, hw1 = hits[i]
+        a2, x2, y2, hw2 = hits[j]
+        gap = math.hypot(x2-x1, y2-y1)
+        if gap > GATE_GAP or (not hw1 and not hw2):
+            edges.append((x1, y1, x2, y2, 'GATE', a1, a2))
+        else:
+            edges.append((x1, y1, x2, y2, 'WALL', a1, a2))
+    
+    # ── 合并相邻GATE边 ──
+    merged = []; i = 0
+    while i < len(edges):
+        if edges[i][4] == 'WALL':
+            merged.append(edges[i]); i += 1
+        else:
+            start_i = i
+            while i < len(edges) and edges[i][4] == 'GATE':
+                i += 1
+            gate_edges = edges[start_i:i]
+            first = gate_edges[0]; last = gate_edges[-1]
+            # 门中心: 弧中点, 距离取LIDAR_RANGE的80%
+            mid_a = (first[5] + last[6]) / 2
+            mid_d = LIDAR_RANGE * 0.8
+            gate_mx = bx + math.cos(mid_a) * mid_d
+            gate_my = by + math.sin(mid_a) * mid_d
+            merged.append((first[0], first[1], last[2], last[3], 'GATE', gate_mx, gate_my))
+    polygon = merged
 
 def blocked(wx, wy):
     vx, vy = int(wx/VOXEL), int(wy/VOXEL)
@@ -300,6 +344,28 @@ def merge_gates(raw_gates, came_from):
     # 按A*距离排序 (近→远), 兼容pick_gate
     clusters.sort(key=lambda g: g[0])
     return clusters
+
+# ── 从多边形提取门中心 ──
+
+def polygon_gates(bx, by):
+    """多边形→门列表: 只返回通往未探索区域的GATE边中心"""
+    gates = []
+    vx0, vy0 = int(bx/VOXEL), int(by/VOXEL)
+    for edge in polygon:
+        if edge[4] != 'GATE':
+            continue
+        gate_mx, gate_my = edge[5], edge[6]
+        gvx, gvy = int(gate_mx/VOXEL), int(gate_my/VOXEL)
+        # 假门过滤: 已探索的FREE空间或墙内
+        s = gget(gvx, gvy)
+        if s == FREE: continue       # 已扫过, 非前端
+        if s == WALL: continue       # 墙内
+        wd = wall_dist(gvx, gvy)
+        if wd <= CLEARANCE: continue # 贴墙
+        cg = abs(gvx-vx0) + abs(gvy-vy0)  # 曼哈顿距离
+        gates.append((cg, wd, gvx, gvy))
+    gates.sort(key=lambda g: g[0])
+    return gates
 
 
 def pick_gate(gates, mode="far", stuck=False):
@@ -562,18 +628,21 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             scan(bx, by)
 
         if path is None or path_idx >= len(path):
-            gates, came_from = find_gates(vx, vy)
+            gates = polygon_gates(bx, by)
             gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
 
             if gate is not None:
                 cg, cwd, gx, gy = gate
-                path = fine_path(vx, vy, gx, gy, came_from)
+                path = astar_to(vx, vy, gx, gy)
+                if path is None:
+                    no_gate_count += 1  # A*到不了这个门, 下次换
+                    continue
                 path_idx = 0; wander = 0; last_dist = 999
                 no_gate_count = 0
                 gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
                 balls.clear_gates()
                 balls.add_gate(gate_wx, gate_wy)
-                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) path={len(path)} gates={len(gates)} F={_cnt[FREE]} W={_cnt[WALL]}", flush=True)
+                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) path={len(path)} poly={len(gates)} F={_cnt[FREE]} W={_cnt[WALL]}", flush=True)
             else:
                 no_gate_count += 1
                 if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
