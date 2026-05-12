@@ -168,40 +168,34 @@ def walkable(vx, vy):
 # 门查找 (最近UNKNOWN相邻的FREE格)
 # ═══════════════════════════════════════════
 
-def find_gate(sx, sy, mode="near"):
-    """A*找门。mode=near→最近门, far→最远门"""
+def find_gates(sx, sy, max_gates=20):
+    """A*找前N个门。返回 [(距离, x, y), ...] 按距离排序"""
     if not (0<=sx<W3 and 0<=sy<W3 and not obstacles[sy,sx]):
-        return None
+        return [], {}
     open_set = [(0, sx, sy)]
     came_from = {}; g_score = {(sx,sy): 0}
     visited = set()
-    best_gate = None; best_score = 0 if mode=="far" else 99999
+    gates = []
 
-    while open_set and len(came_from) < 50000:
+    while open_set and len(came_from) < 50000 and len(gates) < max_gates:
         _, cx, cy = heapq.heappop(open_set)
         if (cx,cy) in visited: continue
         visited.add((cx,cy))
         cg = g_score.get((cx,cy), 9999)
 
-        # 是门? explored且非障碍且有未探索邻居
         if explored[cy, cx] and not obstacles[cy, cx]:
             has_unk = any(
                 not explored[cy+dy, cx+dx]
                 for dy in (-1,0,1) for dx in (-1,0,1)
                 if 0<=cx+dx<W3 and 0<=cy+dy<W3
             )
-            if has_unk:
-                # 过滤: 门本身不能贴墙
-                if wall_dist(cx, cy) > CLEARANCE:
-                    better = (cg < best_score) if mode=="near" else (cg > best_score)
-                    if better:
-                        best_score = cg; best_gate = (cx, cy)
+            if has_unk and wall_dist(cx, cy) > CLEARANCE:
+                gates.append((cg, cx, cy))
 
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx+dx, cy+dy
             if not walkable(nx, ny): continue
             wd = wall_dist(nx, ny)
-            # 离墙<2m(20格)? 罚分x3  (2m内罚分)
             penalty = max(0, 20-wd)*3
             ng = cg + 1 + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
@@ -209,10 +203,19 @@ def find_gate(sx, sy, mode="near"):
                 came_from[(nx,ny)] = (cx,cy)
                 heapq.heappush(open_set, (ng, nx, ny))
 
-    if best_gate is None: return None
-    # 回溯路径
-    path = []; cur = best_gate
-    while cur != (sx,sy):
+    return gates, came_from
+
+def pick_gate(gates, mode="near", stuck=False):
+    """从门列表选一个。卡住→最近 / far→最远 / near→中位"""
+    if not gates: return None
+    if stuck: return gates[0]           # 卡死→最近, 逃命
+    if mode == "far": return gates[-1]  # 就远→最远, 铺前线
+    return gates[len(gates)//2]         # 就近→中位, 不远不近均匀覆盖
+
+def gate_path(sx, sy, gx, gy, came_from):
+    """从came_from回溯出到指定门的路径"""
+    path = []; cur = (gx, gy)
+    while cur != (sx, sy):
         path.append(cur)
         if cur not in came_from: break
         cur = came_from[cur]
@@ -488,18 +491,20 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # 路径规划/执行
         if path is None or path_idx >= len(path):
-            gate_path = find_gate(vx, vy, EXPLORE_MODE)
+            gates, came_from = find_gates(vx, vy)
+            gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
 
-            if gate_path:
+            if gate is not None:
+                cg, gx, gy = gate
+                gp = gate_path(vx, vy, gx, gy, came_from)
                 no_gate_count = 0
-                path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gate_path]
+                path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp]
                 path_idx = 0
-                gate = gate_path[-1]
-                gate_wx, gate_wy = (gate[0]+0.5)*VOXEL, (gate[1]+0.5)*VOXEL
+                gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
                 current_target_type = "gate"
                 balls.clear_gates()
                 balls.add_gate(gate_wx, gate_wy)
-                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) len={len(path)} obs={int(np.sum(obstacles))} exp={int(np.sum(explored))}", flush=True)
+                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) len={len(path)} gates={len(gates)} stuck={no_gate_count>0} obs={int(np.sum(obstacles))} exp={int(np.sum(explored))}", flush=True)
             else:
                 no_gate_count += 1
                 if no_gate_count > 3 and len(milestones) > 1:
