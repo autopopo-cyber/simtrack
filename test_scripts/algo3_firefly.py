@@ -38,7 +38,7 @@ LIDAR_RANGE = 15.0
 
 # ── 精度 (改 VOXEL 其它自动算) ──
 VOXEL = 0.5                              # 格边长 (m)
-W3 = int(50.0 / VOXEL)                   # 网格宽 (50m/VOXEL)
+W3 = int(MAP_SIZE_M / VOXEL)               # 网格宽 (MAP_SIZE_M/VOXEL)
 ROBOT_R = max(1, int(SAFE_R / VOXEL))   # 机器人半径 (格)
 CLEARANCE = ROBOT_R                      # 路标/门安全距离 (格)
 MILESTONE_STEP = int(3.0 / VOXEL)        # 路标间隔 (3m)
@@ -66,7 +66,7 @@ INIT_SCAN_STEPS = 200                    # 初始扫描步数
 LIDAR_TICK = 20                          # 扫描频率 (200Hz/20=10Hz)
 RENDER_SKIP = 20                         # 渲染跳帧
 ARRIVE_THRESH = 1.0                      # 到达路径点阈值 (m)
-MAP_BOUNDARY = 49.0                      # 地图边界 (m, 留1m边距)
+MAP_SIZE_M = 100.0                         # 地图world坐标大小 (SCALE=2 → 50m图像=100m world)
 WANDER_TIMEOUT = 600                     # 迷失超时 (步, 3s)
 WANDER_DRIFT_RATIO = 1.05               # 偏离判定比率
 MAX_NO_GATE = 3                          # 无门触发回溯次数
@@ -503,9 +503,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             bx, by = d.qpos[0], d.qpos[1]
 
         # 边界保护
-        if bx < 1 or bx > MAP_BOUNDARY*2 - 1 or by < 1 or by > MAP_BOUNDARY*2 - 1:
-            d.qpos[0] = max(1, min(MAP_BOUNDARY*2 - 1, bx))
-            d.qpos[1] = max(1, min(MAP_BOUNDARY*2 - 1, by))
+        if bx < 1 or bx > MAP_SIZE_M - 1 or by < 1 or by > MAP_SIZE_M - 1:
+            d.qpos[0] = max(1, min(MAP_SIZE_M - 1, bx))
+            d.qpos[1] = max(1, min(MAP_SIZE_M - 1, by))
             d.qvel[:] = 0; mv.yaw = random.uniform(0, 2*math.pi)
         v.cam.lookat[:] = np.array([bx, by, 0.5], dtype=np.float64)
 
