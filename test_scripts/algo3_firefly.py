@@ -35,6 +35,7 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.5; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 LIDAR_RANGE = 15.0
+MAP_SIZE_M = 100.0                        # 地图world坐标大小 (SCALE=2 → 50m图像=100m world)
 
 # ── 精度 (改 VOXEL 其它自动算) ──
 VOXEL = 0.5                              # 格边长 (m)
@@ -66,7 +67,6 @@ INIT_SCAN_STEPS = 200                    # 初始扫描步数
 LIDAR_TICK = 20                          # 扫描频率 (200Hz/20=10Hz)
 RENDER_SKIP = 20                         # 渲染跳帧
 ARRIVE_THRESH = 1.0                      # 到达路径点阈值 (m)
-MAP_SIZE_M = 100.0                         # 地图world坐标大小 (SCALE=2 → 50m图像=100m world)
 WANDER_TIMEOUT = 600                     # 迷失超时 (步, 3s)
 WANDER_DRIFT_RATIO = 1.05               # 偏离判定比率
 MAX_NO_GATE = 3                          # 无门触发回溯次数
