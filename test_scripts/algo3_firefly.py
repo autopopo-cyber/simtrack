@@ -54,7 +54,7 @@ MAX_NO_GATE = 5
 RESCUE_MS_COUNT = 5
 
 FIXED_SEED = random.randint(0, 999999)
-MAX_MILESTONE_BALLS = 1000; MAX_GATE_BALLS = 50
+MAX_MILESTONE_BALLS = 1000; MAX_GATE_BALLS = 50; MAX_WAYPOINT_BALLS = 200
 FINISH = (3.0, 95.0)
 
 # ═══════════════════════════════════════════
@@ -450,8 +450,8 @@ def astar_to(fvx, fvy, tfx, tfy):
 class BallManager:
     def __init__(self, m, d):
         self.m = m; self.d = d
-        self.mstone_bodies = []; self.gate_bodies = []
-        self.mstone_count = 0; self.gate_count = 0
+        self.mstone_bodies = []; self.gate_bodies = []; self.waypoint_bodies = []
+        self.mstone_count = 0; self.gate_count = 0; self.waypoint_count = 0
     def add_milestone(self, wx, wy):
         i = self.mstone_count
         if i < MAX_MILESTONE_BALLS:
@@ -466,10 +466,21 @@ class BallManager:
             if body_name in self.gate_bodies:
                 self.d.mocap_pos[self.m.body(body_name).mocapid] = [wx, wy, 2.0]
             self.gate_count += 1
+    def add_waypoint(self, wx, wy):
+        i = self.waypoint_count
+        if i < MAX_WAYPOINT_BALLS:
+            body_name = f"wp_{i}"
+            if body_name in self.waypoint_bodies:
+                self.d.mocap_pos[self.m.body(body_name).mocapid] = [wx, wy, 0.8]
+            self.waypoint_count += 1
     def clear_gates(self):
         for name in self.gate_bodies:
             self.d.mocap_pos[self.m.body(name).mocapid] = [0, 0, -10]
         self.gate_count = 0
+    def clear_waypoints(self):
+        for name in self.waypoint_bodies:
+            self.d.mocap_pos[self.m.body(name).mocapid] = [0, 0, -10]
+        self.waypoint_count = 0
 
 def build_xml():
     ms_xml = "".join(
@@ -480,6 +491,10 @@ def build_xml():
         f'<body name="gate_{i}" mocap="true" pos="0 0 -10">'
         f'<geom type="sphere" size="0.25" rgba="1.0 0.8 0.2 0.9"/></body>\n'
         for i in range(MAX_GATE_BALLS))
+    wp_xml = "".join(
+        f'<body name="wp_{i}" mocap="true" pos="0 0 -10">'
+        f'<geom type="sphere" size="0.15" rgba="1.0 1.0 0.0 0.9"/></body>\n'
+        for i in range(MAX_WAYPOINT_BALLS))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
     OBS_XML = "".join(
         f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
@@ -492,7 +507,7 @@ def build_xml():
   <worldbody>
     <light pos="50 50 80" dir="0 0 -1"/>
     {FINISH_XML}{OBS_XML}
-    {ms_xml}{gt_xml}
+    {ms_xml}{gt_xml}{wp_xml}
     <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
     <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
@@ -598,6 +613,8 @@ for name in [f"mstone_{i}" for i in range(MAX_MILESTONE_BALLS)]:
     balls.mstone_bodies.append(name)
 for name in [f"gate_{i}" for i in range(MAX_GATE_BALLS)]:
     balls.gate_bodies.append(name)
+for name in [f"wp_{i}" for i in range(MAX_WAYPOINT_BALLS)]:
+    balls.waypoint_bodies.append(name)
 for wx, wy in milestones:
     balls.add_milestone(wx, wy)
 
@@ -630,6 +647,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         last_mx, last_my = sx, sy
         balls.add_milestone(d.qpos[0], d.qpos[1])
 
+    yellow_wps = []; target_wp = None
     while v.is_running():
         try:
             bx, by = d.qpos[0], d.qpos[1]
@@ -656,20 +674,20 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 raw = astar_to(vx, vy, gx, gy)
                 if raw:
                     yellow_wps = gen_yellow_waypoints(raw)
-                    target_wp = None
+                    target_wp = yellow_wps[0] if yellow_wps else None
                     no_gate_count = 0
                     gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
                     balls.clear_gates()
                     balls.add_gate(gate_wx, gate_wy)
+                    balls.clear_waypoints()
+                    for wwx, wwy in yellow_wps:
+                        balls.add_waypoint(wwx, wwy)
                     print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) yellow={len(yellow_wps)} poly={len(gates)}", flush=True)
                 else:
                     no_gate_count += 1
             else:
                 no_gate_count += 1
 
-        # ── 1Hz: move — 直接冲 yellow_wps[0], 到了就pop下一个 ──
-        if step % PLAN_INTERVAL == 0:
-            target_wp = yellow_wps[0] if yellow_wps else None
             # 撒蓝色轨迹点
             if wall_dist(vx, vy) > CLEARANCE:
                 milestones.append((vx, vy))
