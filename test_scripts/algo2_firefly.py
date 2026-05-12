@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v16 — 恢复v6初始扫描+gate_wd放宽+v6前向fallback
+"""萤火算法 Firefly v17 — 127中心线导航点 + 动态选点 + 跳过不可达
 
 体素:
   UNKNOWN=0 — 未扫描(目标背后的新区)
@@ -7,8 +7,7 @@
   WALL=2    — 墙/障碍
   VISITED=3 — 实际到达过(OLD, 只当通路)
 
-A*: 在FREE+VISITED里搜, 目标是FREE(离WP方向好+有UNKNOWN邻居优先)
-走到FREE→LIDAR扫描→新FREE出现→继续
+导航: 127个中心线点全做路标。机器人找最近可达点, 朝终点走。堵了跳过。
 """
 import sys, os, math, time, random, heapq
 from collections import deque
@@ -45,8 +44,9 @@ while idx < len(cl):
 obs_world = [(x,y) for x,y in obs_world if math.hypot(x-10,y-5)>5.0]
 OBS_R = 1.0; OBS_CLEAR = OBS_R+SAFE_R
 
-cps_maze = [(5,2.5),(48,5),(2,10),(48,15),(2,20),(48,25),(2,30),(48,35),(2,40),(48,45),(2,48)]
-nav_wps = [(x*SCALE, y*SCALE) for x,y in cps_maze]
+# 127个中心线点 = 全部导航点 (世界坐标)
+nav_wps = [(x*SCALE, y*SCALE) for x,y in cl]
+FINISH = nav_wps[-1]  # 终点
 
 def sample_hf(wx, wy):
     mx, my = wx/SCALE, wy/SCALE
@@ -58,16 +58,17 @@ is_obs = lambda wx, wy: any(math.hypot(wx-ox, wy-oy) < OBS_CLEAR for ox, oy in o
 blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
 walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, VISITED)
 
-def target_yaw_dir(wp_idx):
-    """返回当前应走路段的方向 (prev_cp → wp_idx)"""
-    if wp_idx >= len(nav_wps): return (1,0)
-    if wp_idx == 0:
-        tx, ty = nav_wps[0]
-        dx, dy = tx-10, ty-5  # 从起点到CP0
-    else:
-        px, py = nav_wps[wp_idx-1]
-        tx, ty = nav_wps[wp_idx]
-        dx, dy = tx-px, ty-py
+def get_closest_wp(bx, by):
+    """返回离机器人最近的导航点索引"""
+    best_i, best_d = 0, 99999
+    for i, (wx, wy) in enumerate(nav_wps):
+        d = math.hypot(wx-bx, wy-by)
+        if d < best_d: best_d, best_i = d, i
+    return best_i
+
+def target_yaw_dir(bx, by):
+    """方向: 从当前位置指向终点"""
+    dx, dy = FINISH[0]-bx, FINISH[1]-by
     d = math.hypot(dx, dy)
     return (dx/d, dy/d) if d > 0.01 else (1,0)
 
@@ -83,13 +84,13 @@ def scan_voxels(bx, by):
                 vox[vy, vx] = WALL; break
             vox[vy, vx] = max(vox[vy, vx], FREE)
 
-def find_gate_path(bx, by, wp_idx):
-    """A*在FREE+VISITED里搜, 目标是FREE体素(优先有UNKNOWN邻居的)"""
+def find_gate_path(bx, by):
+    """A*在FREE+VISITED里搜, 目标是FREE体素(朝终点方向+有UNKNOWN邻居优先)"""
     sx, sy = int(bx/VOXEL), int(by/VOXEL)
     if sx<0 or sx>=W or sy<0 or sy>=W or vox[sy,sx]==WALL: return None
     
-    wp_dx, wp_dy = target_yaw_dir(wp_idx)
-    tx, ty = nav_wps[min(wp_idx, len(nav_wps)-1)]
+    wp_dx, wp_dy = target_yaw_dir(bx, by)
+    tx, ty = FINISH
     
     open_set = []
     heapq.heappush(open_set, (0, sx, sy))
@@ -161,11 +162,11 @@ def find_gate_path(bx, by, wp_idx):
     world_path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return world_path
 
-def seek_farthest_visited(bx, by, wp_idx):
-    """v6风格fallback: A*在VISITED空间搜朝WP方向最远的体素, 不回溯"""
+def seek_farthest_visited(bx, by):
+    """v6风格fallback: A*在VISITED空间搜朝终点方向最远的体素, 不回溯"""
     sx, sy = int(bx/VOXEL), int(by/VOXEL)
     if not (0<=sx<W and 0<=sy<W and vox[sy,sx]==VISITED): return None
-    wp_dx, wp_dy = target_yaw_dir(wp_idx)
+    wp_dx, wp_dy = target_yaw_dir(bx, by)
     best_v = None; best_score = -9999
     open_set = [(0, sx, sy)]; came = {}; vin = set()
     while open_set and len(came) < 10000:
@@ -224,7 +225,7 @@ def path_to_unk(bx, by):
     return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
 
 # ── XML & Mover (不变) ──
-CP_XML = "".join(f'<body mocap="true" pos="{x} {y} 2"><geom type="sphere" size="1.5" rgba="0.2 0.5 1 0.8"/></body>' for x,y in nav_wps[1:])
+CP_XML = f'<body mocap="true" pos="{FINISH[0]} {FINISH[1]} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'  # 只有终点绿球
 OBS_XML = "".join(f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0"><geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>' for i,(x,y) in enumerate(obs_world))
 
 xml = f"""<mujoco>
@@ -296,7 +297,7 @@ wp_idx=0; step=0; t0=time.time(); RENDER_SKIP=20
 path = None; path_idx = 0
 last_progress_step = 0; last_progress_wp = 0
 
-print(f"=== 萤火算法 Firefly v16 === init scan 200 + gate_wd 1.5 + v6 fallback", flush=True)
+print(f"=== 萤火算法 Firefly v17 === 127中心线点 + 动态选点 + 跳过不可达", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -314,27 +315,35 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         mujoco.mj_step(m, d)
     print(f"  ✅ F{int(np.sum(vox==FREE))} W{int(np.sum(vox==WALL))}", flush=True)
     
-    path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+    path = find_gate_path(d.qpos[0], d.qpos[1])
     if path:
         gate = path[-1]
         print(f"  🚪 first gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)}", flush=True)
 
-    while v.is_running() and wp_idx<len(nav_wps):
+    while v.is_running() and wp_idx < len(nav_wps)-1:
         bx, by = d.qpos[0], d.qpos[1]
         if bx<1 or bx>99 or by<1 or by>99:
             d.qpos[0]=max(1,min(99,bx)); d.qpos[1]=max(1,min(99,by))
             d.qvel[:]=0; mv.yaw=random.uniform(0,2*math.pi)
         v.cam.lookat[:]=np.array([bx, by, 0.5], dtype=np.float64)
 
+        # 动态选点: 找最近的导航点, 沿中心线往终点跳
+        closest = get_closest_wp(bx, by)
+        # 看看能跳到多远: 从closest往后找第一个可达的
         new_wp = wp_idx
-        for i in range(len(nav_wps)):
-            if math.hypot(nav_wps[i][0]-bx, nav_wps[i][1]-by) < CP_RADIUS:
-                new_wp = max(new_wp, i+1)
+        for i in range(closest, len(nav_wps)):
+            wx, wy = nav_wps[i]
+            # 检查这个点是否被墙/障碍挡住
+            vx, vy = int(wx/VOXEL), int(wy/VOXEL)
+            if blocked(wx, wy): continue  # 不可达, 跳过
+            new_wp = max(new_wp, i)
+            if i >= closest + 3: break  # 跳太多步不放心, 先跳到近的
         if new_wp > wp_idx:
             wp_idx = new_wp
             last_progress_step = step; last_progress_wp = wp_idx
-            print(f"  🏁 CP{wp_idx-1} @({bx:.1f},{by:.1f}) step={step} V{int(np.sum(vox==VISITED))}", flush=True)
-            if wp_idx>=len(nav_wps):
+            progress_pct = wp_idx*100.0/len(nav_wps)
+            print(f"  🏁 wp={wp_idx}/{len(nav_wps)}({progress_pct:.0f}%) @({bx:.1f},{by:.1f}) step={step} V{int(np.sum(vox==VISITED))}", flush=True)
+            if wp_idx >= len(nav_wps)-1:
                 print(f"🏁 FINISH step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                 break
             continue
@@ -345,25 +354,24 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % LIDAR_TICK == 0:
             scan_voxels(bx, by)
 
-        # 路径规划/执行
+        # 路径规划/执行 — 目标始终是终点方向
         if path is None or path_idx >= len(path):
-            # 卡死检测: 2000步未过新CP→强制path_to_unk
+            # 卡死检测: 2000步未进→强制path_to_unk
             if step - last_progress_step > 2000 and wp_idx == last_progress_wp:
                 print(f"  ⚠️  [{step}] stuck {step-last_progress_step} steps! force path_to_unk", flush=True)
                 path = path_to_unk(bx, by)
                 if not path:
-                    path = find_gate_path(bx, by, wp_idx)
+                    path = find_gate_path(bx, by)
                 path_idx = 0
-                last_progress_step = step  # 给path_to_unk一次机会再卡再说
+                last_progress_step = step
             else:
-                path = find_gate_path(bx, by, wp_idx)
+                path = find_gate_path(bx, by)
                 path_idx = 0
             if path:
                 gate = path[-1]
                 print(f"  🚪 [{step}] gate=({gate[0]:.0f},{gate[1]:.0f}) len={len(path)} F{int(np.sum(vox==FREE))}", flush=True)
             else:
-                # v6优先: 朝WP方向找最远VISITED(不回溯)
-                fwd_path = seek_farthest_visited(bx, by, wp_idx)
+                fwd_path = seek_farthest_visited(bx, by)
                 if fwd_path:
                     path = fwd_path; path_idx = 0
                     gate = path[-1]
@@ -382,18 +390,16 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if math.hypot(tx-bx, ty-by) < 1.0:
                 path_idx += 1
                 if path_idx >= len(path):
-                    gate_reached = path[-1]  # 记住到达的gate
+                    gate_reached = path[-1]
                     print(f"  ✅ [{step}] at gate=({gate_reached[0]:.0f},{gate_reached[1]:.0f}), scan...", flush=True)
                     for _ in range(200):
                         if _ % LIDAR_TICK == 0: scan_voxels(d.qpos[0], d.qpos[1])
                         mujoco.mj_step(m, d); step += 1
                         if step % RENDER_SKIP == 0: v.sync()
-                    # 扫描完后立即检查: 同一个gate会被重复选吗?
-                    new_path = find_gate_path(d.qpos[0], d.qpos[1], wp_idx)
+                    new_path = find_gate_path(d.qpos[0], d.qpos[1])
                     if new_path:
                         ng = new_path[-1]
                         if math.hypot(ng[0]-gate_reached[0], ng[1]-gate_reached[1]) < 3.0:
-                            # 同一个gate! 标记周围FREE为VISITED强制报废
                             gvx, gvy = int(ng[0]/VOXEL), int(ng[1]/VOXEL)
                             for dy2 in range(-2, 3):
                                 for dx2 in range(-2, 3):
@@ -414,7 +420,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         
         step += 1
         if step % 1000 == 0:
-            print(f"  ... step={step} V{int(np.sum(vox==VISITED))} F{int(np.sum(vox==FREE))} wp={wp_idx}", flush=True)
+            pct = wp_idx*100.0/len(nav_wps)
+            print(f"  ... step={step} V{int(np.sum(vox==VISITED))} F{int(np.sum(vox==FREE))} wp={wp_idx}({pct:.0f}%)", flush=True)
         if step % RENDER_SKIP == 0: v.sync()
 
-    print(f"done: {wp_idx}/{len(nav_wps)} step={step} time={time.time()-t0:.1f}s", flush=True)
+    print(f"done: {wp_idx}/{len(nav_wps)-1} step={step} time={time.time()-t0:.1f}s", flush=True)
