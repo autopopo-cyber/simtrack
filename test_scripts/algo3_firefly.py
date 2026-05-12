@@ -675,16 +675,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             else:
                 no_gate_count += 1
 
-        # ── 1Hz: move — 找直线可达的最近黄色路点 ──
+        # ── 1Hz: move — 直接冲 yellow_wps[0], 到了就pop下一个 ──
         if step % PLAN_INTERVAL == 0:
-            target_wp = None
-            for wp in yellow_wps:
-                wx, wy = wp
-                wvx, wvy = int(wx/VOXEL), int(wy/VOXEL)
-                if line_clear(vx, vy, wvx, wvy):
-                    target_wp = wp
-                    break
-            # 撒蓝色轨迹点 (每秒一个)
+            target_wp = yellow_wps[0] if yellow_wps else None
+            # 撒蓝色轨迹点
             if wall_dist(vx, vy) > CLEARANCE:
                 milestones.append((vx, vy))
                 last_mx, last_my = vx, vy
@@ -693,12 +687,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 if len(milestones) % 10 == 0:
                     print(f"  [MS] {len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
 
-        # ── 每步移动 ──
+        # ── 每帧移动: 朝 target_wp 走到哪算哪 ──
         if target_wp is not None:
             tx, ty = target_wp
-            dist = math.hypot(tx-bx, ty-by)
-            if dist < ARRIVE_THRESH:
-                target_wp = None  # 到达,下个1Hz会找下一个路点
+            if math.hypot(tx-bx, ty-by) < ARRIVE_THRESH:
+                yellow_wps.pop(0)
+                target_wp = yellow_wps[0] if yellow_wps else None
             else:
                 mv.step(tx, ty, step)
         elif no_gate_count > MAX_NO_GATE and len(milestones) > 1:
