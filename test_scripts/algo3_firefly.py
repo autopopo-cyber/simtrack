@@ -63,12 +63,15 @@ FINISH = (7.0, 82.5)
 # ═══════════════════════════════════════════
 UNKNOWN, FREE, WALL = 0, 1, 2
 grid = {}  # {(vx,vy): state}
+_wd = {}   # wall_dist缓存: (vx,vy)→距离
 
 def gget(vx, vy):
     return grid.get((vx, vy), UNKNOWN)
 
 def gset(vx, vy, val):
     grid[(vx, vy)] = val
+    if val == WALL:
+        _wd.clear()  # 新障碍→清缓存(简单粗暴, 效率够)
 
 def gcount(state):
     return sum(1 for v in grid.values() if v == state)
@@ -151,6 +154,9 @@ def blocked(wx, wy):
 
 # ── A* 辅助 ──
 def wall_dist(vx, vy):
+    """到最近WALL的Manhattan距离 (缓存加速)"""
+    key = (vx, vy)
+    if key in _wd: return _wd[key]
     best = 999
     r = WALL_SCAN_RADIUS
     for dy in range(-r, r+1):
@@ -158,6 +164,7 @@ def wall_dist(vx, vy):
             if gget(vx+dx, vy+dy) == WALL:
                 d = abs(dx) + abs(dy)
                 if d < best: best = d
+    _wd[key] = best
     return best
 
 def walkable(vx, vy):
