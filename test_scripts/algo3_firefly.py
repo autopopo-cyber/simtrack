@@ -221,7 +221,7 @@ def find_gates(fvx, fvy):
             has_unk = any(gget(cx+dx, cy+dy) == UNKNOWN
                           for dy in (-1,0,1) for dx in (-1,0,1))
             if has_unk and wall_dist(cx, cy) > CLEARANCE:
-                gates.append((cg, cx, cy))
+                gates.append((cg, wall_dist(cx, cy), cx, cy))
 
         # 跳步展开: 根据离墙距离决定跳几步
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
@@ -239,13 +239,18 @@ def find_gates(fvx, fvy):
     return gates, came_from
 
 def pick_gate(gates, mode="far", stuck=False):
+    """门: (cg, wd, cx, cy). far模式在远门中选最中心(wd最大)的"""
     if not gates: return None
-    if stuck: return gates[0]
-    if mode == "far": return gates[-1]
-    if mode == "near": return gates[0]
+    if stuck: return min(gates, key=lambda g: g[0])  # nearest by cg
+    if mode == "far":
+        # 取A*距离最远的30%中wall_dist最大的 → 远且路中间
+        gates_by_dist = sorted(gates, key=lambda g: g[0], reverse=True)
+        top_n = max(3, len(gates_by_dist) // 3)
+        return max(gates_by_dist[:top_n], key=lambda g: g[1])
+    if mode == "near": return min(gates, key=lambda g: g[0])
     if mode == "mix":
-        return gates[-1] if len(gates) >= MIX_THRESHOLD else gates[0]
-    return gates[0]
+        return pick_gate(gates, "far") if len(gates) >= MIX_THRESHOLD else pick_gate(gates, "near")
+    return min(gates, key=lambda g: g[0])
 
 def fine_path(sx, sy, gx, gy, came_from, to_world=True):
     """从came_from回溯细格路径→世界坐标"""
@@ -501,7 +506,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
 
             if gate is not None:
-                cg, gx, gy = gate
+                cg, cwd, gx, gy = gate
                 path = fine_path(vx, vy, gx, gy, came_from)
                 path_idx = 0; wander = 0; last_dist = 999
                 no_gate_count = 0
