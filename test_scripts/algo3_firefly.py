@@ -27,19 +27,18 @@ SAFE_R = 0.5; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 LIDAR_RANGE = 15.0
 
 VOXEL = 0.1                                   # 细格精度
-COARSE_FACTOR = 5                              # 粗格=5细格=0.5m
 ROBOT_R = max(1, int(SAFE_R / VOXEL))         # 5
 CLEARANCE = ROBOT_R
 MILESTONE_STEP = int(3.0 / VOXEL)              # 30
 LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)         # 150
 LIDAR_RAYS = 120
 
-MAX_GATES = 200                                # 细格门候选多, 200个
+MAX_GATES = 200
 WALL_SCAN_RADIUS = 10
 WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)  # 20
 WALL_PENALTY = 3
-MAX_GATE_DIST_COARSE = 60                      # 粗格门搜索上限(格=30m)
-ASTAR_MAX_EXPAND = 20000
+MAX_GATE_DIST = 3000                           # 细格门搜索上限(格=300m)
+ASTAR_MAX_EXPAND = 30000
 
 MIN_SPEED = 1.5; SPEED_FACTOR = 0.5
 BOUNCE_FORCE_DURATION = 0.3
@@ -62,9 +61,8 @@ FINISH = (7.0, 82.5)
 # SLAM字典地图
 # ═══════════════════════════════════════════
 UNKNOWN, FREE, WALL = 0, 1, 2
-grid = {}          # {(vx,vy): state}  细格
-_wd = {}           # wall_dist缓存
-_coarse = {}       # 粗格状态缓存: (cvx,cvy)→state
+grid = {}          # {(vx,vy): state}  细格字典
+_wd = {}           # wall_dist缓存: (vx,vy)→距离
 
 # 增量计数器 (避免gcount()扫全字典)
 _cnt = {FREE: 0, WALL: 0}
@@ -80,23 +78,6 @@ def gset(vx, vy, val):
     _cnt[val] += 1
     if val == WALL:
         _wd.clear()
-        _coarse.pop((vx//COARSE_FACTOR, vy//COARSE_FACTOR), None)
-
-def cget(cvx, cvy):
-    """粗格状态 (缓存)"""
-    key = (cvx, cvy)
-    if key in _coarse: return _coarse[key]
-    for dy in range(COARSE_FACTOR):
-        for dx in range(COARSE_FACTOR):
-            s = gget(cvx*COARSE_FACTOR+dx, cvy*COARSE_FACTOR+dy)
-            if s == WALL:
-                _coarse[key] = WALL; return WALL
-    # 无WALL → 检查是否全FREE
-    for dy in range(COARSE_FACTOR):
-        for dx in range(COARSE_FACTOR):
-            if gget(cvx*COARSE_FACTOR+dx, cvy*COARSE_FACTOR+dy) != FREE:
-                _coarse[key] = UNKNOWN; return UNKNOWN
-    _coarse[key] = FREE; return FREE
 
 # ═══════════════════════════════════════════
 # 地图加载 + 障碍物
@@ -140,7 +121,7 @@ def is_obstacle_world(wx, wy):
     return False
 
 # ═══════════════════════════════════════════
-# 扫描
+# 扫描 + 碰撞检测
 # ═══════════════════════════════════════════
 
 def scan(bx, by):
@@ -168,7 +149,27 @@ def blocked(wx, wy):
                     return True
     return False
 
-# ── A* 辅助 ──
+# ── 三级跳A* ──
+
+# 跳步规则: wall_dist→跳格数
+JUMP_1M = 10    # ≥1m空旷→10格一跳
+JUMP_03 = 3     # ≥0.3m→3格一跳
+JUMP_NEAR = 1   # <0.3m贴墙→1格
+
+def jump_steps(vx, vy, dx, dy):
+    """从(vx,vy)向(dx,dy)方向能跳多少格"""
+    wd = wall_dist(vx, vy)
+    if wd >= JUMP_1M:   max_jump = JUMP_1M
+    elif wd >= JUMP_03: max_jump = JUMP_03
+    else:               max_jump = JUMP_NEAR
+
+    for step in range(1, max_jump + 1):
+        nx, ny = vx + dx*step, vy + dy*step
+        if not walkable(nx, ny):
+            return step - 1
+    return max_jump
+
+# ── A* 辅助 (细格) ──
 def wall_dist(vx, vy):
     key = (vx, vy)
     if key in _wd: return _wd[key]
@@ -210,17 +211,16 @@ def coarse_walkable(cvx, cvy):
     return cget(cvx, cvy) == FREE and coarse_wall_dist(cvx, cvy) > ROBOT_R_COARSE
 
 # ═══════════════════════════════════════════
-# 门查找 (粗格A* + 细格门)
+# 跳步门查找 (细格A* + 三级跳)
 # ═══════════════════════════════════════════
 
 def find_gates(fvx, fvy):
-    """粗格A*找门, 返回细格门列表"""
-    cvx, cvy = fvx//COARSE_FACTOR, fvy//COARSE_FACTOR
-    if not coarse_walkable(cvx, cvy):
+    """细格A*找门, 用跳步展开。返回细格门列表 [(dist,vx,vy),...]"""
+    if not walkable(fvx, fvy):
         return [], {}
 
-    open_set = [(0, cvx, cvy)]
-    came_from = {}; g_score = {(cvx, cvy): 0}
+    open_set = [(0, fvx, fvy)]
+    came_from = {}; g_score = {(fvx, fvy): 0}
     visited = set()
     gates = []
 
@@ -230,29 +230,24 @@ def find_gates(fvx, fvy):
         visited.add((cx,cy))
         cg = g_score.get((cx,cy), 9999)
 
-        if gates and cg > MAX_GATE_DIST_COARSE:
+        if gates and cg > MAX_GATE_DIST:
             break
 
-        # 检查粗格内的细格门
-        if cget(cx, cy) == FREE:
-            for dy in range(COARSE_FACTOR):
-                for dx in range(COARSE_FACTOR):
-                    gx, gy = cx*COARSE_FACTOR+dx, cy*COARSE_FACTOR+dy
-                    if gget(gx, gy) != FREE: continue
-                    if wall_dist(gx, gy) <= CLEARANCE: continue
-                    has_unk = any(
-                        gget(gx+ddx, gy+ddy) == UNKNOWN
-                        for ddy in (-1,0,1) for ddx in (-1,0,1)
-                    )
-                    if has_unk:
-                        gates.append((cg*COARSE_FACTOR, gx, gy))
+        # 是门? FREE + UNKNOWN邻居 + 离墙安全
+        if gget(cx, cy) == FREE:
+            has_unk = any(gget(cx+dx, cy+dy) == UNKNOWN
+                          for dy in (-1,0,1) for dx in (-1,0,1))
+            if has_unk and wall_dist(cx, cy) > CLEARANCE:
+                gates.append((cg, cx, cy))
 
+        # 跳步展开: 根据离墙距离决定跳几步
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
-            nx, ny = cx+dx, cy+dy
-            if not coarse_walkable(nx, ny): continue
-            wd = coarse_wall_dist(nx, ny)
-            penalty = max(0, WALL_BUFFER_CELLS//COARSE_FACTOR - wd) * WALL_PENALTY
-            ng = cg + 1 + penalty
+            js = jump_steps(cx, cy, dx, dy)
+            if js < 1: continue
+            nx, ny = cx + dx*js, cy + dy*js
+            wd = wall_dist(nx, ny)
+            penalty = max(0, WALL_BUFFER_CELLS - wd) * WALL_PENALTY
+            ng = cg + js + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
                 came_from[(nx,ny)] = (cx,cy)
@@ -269,65 +264,43 @@ def pick_gate(gates, mode="far", stuck=False):
         return gates[-1] if len(gates) >= MIX_THRESHOLD else gates[0]
     return gates[0]
 
-def coarse_path_to_fine(cvx1, cvy1, gx, gy, came_from):
-    """粗格路径→细格世界坐标路径"""
-    # 从目标粗格回溯
-    coarse_path = []
-    cur = (gx//COARSE_FACTOR, gy//COARSE_FACTOR)
-    start = (cvx1, cvy1)
-    while cur != start:
-        coarse_path.append(cur)
+def fine_path(sx, sy, gx, gy, came_from, to_world=True):
+    """从came_from回溯细格路径→世界坐标"""
+    path = []; cur = (gx, gy)
+    while cur != (sx, sy):
+        path.append(cur)
         if cur not in came_from: break
         cur = came_from[cur]
-    coarse_path.reverse()
-
-    # 粗格→世界坐标
-    path = []
-    for cvx, cvy in coarse_path:
-        wx = (cvx*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
-        wy = (cvy*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
-        path.append((wx, wy))
+    path.reverse()
+    if to_world:
+        return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return path
 
 def astar_to(fvx, fvy, tfx, tfy):
-    """粗格A*到点, 返回细格世界坐标路径"""
-    scx, scy = fvx//COARSE_FACTOR, fvy//COARSE_FACTOR
-    tcx, tcy = tfx//COARSE_FACTOR, tfy//COARSE_FACTOR
-    if not (coarse_walkable(scx, scy) and coarse_walkable(tcx, tcy)):
+    """跳步A*到点, 返回世界坐标路径"""
+    if not (walkable(fvx, fvy) and walkable(tfx, tfy)):
         return None
 
-    open_set = [(math.hypot(tcx-scx, tcy-scy), scx, scy)]
-    came_from = {}; g_score = {(scx, scy): 0}
+    open_set = [(math.hypot(tfx-fvx, tfy-fvy), fvx, fvy)]
+    came_from = {}; g_score = {(fvx, fvy): 0}
     visited_set = set()
     while open_set and len(came_from) < ASTAR_MAX_EXPAND:
         _, cx, cy = heapq.heappop(open_set)
         if (cx,cy) in visited_set: continue
         visited_set.add((cx,cy))
-        if (cx,cy) == (tcx,tcy): break
+        if (cx,cy) == (tfx,tfy): break
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
-            nx, ny = cx+dx, cy+dy
-            if not coarse_walkable(nx, ny): continue
-            ng = g_score.get((cx,cy), 999) + 1
+            js = jump_steps(cx, cy, dx, dy)
+            if js < 1: continue
+            nx, ny = cx + dx*js, cy + dy*js
+            ng = g_score.get((cx,cy), 999) + js
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
                 came_from[(nx,ny)] = (cx,cy)
-                heapq.heappush(open_set, (ng+math.hypot(tcx-nx, tcy-ny), nx, ny))
+                heapq.heappush(open_set, (ng+math.hypot(tfx-nx, tfy-ny), nx, ny))
 
-    if (tcx,tcy) not in came_from and (tcx,tcy) != (scx,scy): return None
-
-    coarse_path = []; cur = (tcx,tcy)
-    while cur != (scx,scy):
-        coarse_path.append(cur)
-        if cur not in came_from: break
-        cur = came_from[cur]
-    coarse_path.reverse()
-
-    path = []
-    for cvx, cvy in coarse_path:
-        wx = (cvx*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
-        wy = (cvy*COARSE_FACTOR + COARSE_FACTOR//2 + 0.5) * VOXEL
-        path.append((wx, wy))
-    return path
+    if (tfx,tfy) not in came_from and (tfx,tfy) != (fvx,fvy): return None
+    return fine_path(fvx, fvy, tfx, tfy, came_from)
 
 # ═══════════════════════════════════════════
 # 可视化
@@ -457,7 +430,7 @@ def load_state():
 # 主入口
 # ═══════════════════════════════════════════
 
-print(f"━━━ 萤火 Firefly v3 SLAM ━━━ {VOXEL}m细格/{VOXEL*COARSE_FACTOR}m粗格 模式={EXPLORE_MODE} ━━━", flush=True)
+print(f"━━━ 萤火 Firefly v3 SLAM ━━━ {VOXEL}m 三级跳A* 模式={EXPLORE_MODE} ━━━", flush=True)
 
 existing = load_state()
 if existing is not None:
@@ -493,7 +466,7 @@ wander = 0; last_dist = 999
 if milestones:
     last_mx, last_my = milestones[-1]
 
-print(f"=== Firefly v3 start: fine={VOXEL}m coarse={VOXEL*COARSE_FACTOR}m gates={MAX_GATES} ===", flush=True)
+print(f"=== Firefly v3 start: fine={VOXEL}m jumps=1m/0.3m/0.1m gates={MAX_GATES} ===", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
     v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -543,8 +516,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
             if gate is not None:
                 cg, gx, gy = gate
-                cvx, cvy = vx//COARSE_FACTOR, vy//COARSE_FACTOR
-                path = coarse_path_to_fine(cvx, cvy, gx, gy, came_from)
+                path = fine_path(vx, vy, gx, gy, came_from)
                 path_idx = 0; wander = 0; last_dist = 999
                 no_gate_count = 0
                 gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
