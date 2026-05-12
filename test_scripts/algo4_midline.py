@@ -57,7 +57,7 @@ MAX_NO_PATH = 5
 
 INIT_SCAN_STEPS = 200
 LIDAR_TICK = 20; RENDER_SKIP = 20
-FIXED_SEED = 42
+FIXED_SEED = random.randint(0, 999999)
 MAX_MILESTONE_BALLS = 300; MAX_TARGET_BALLS = 10
 FINISH = (7.0, 82.5)
 
@@ -68,6 +68,7 @@ UNKNOWN, FREE, WALL = 0, 1, 2
 grid = {}
 _wd = {}
 _cnt = {FREE: 0, WALL: 0}
+_bad_targets = set()  # targets that A* failed to reach; cleared when grid expands
 
 def gget(vx, vy):
     return grid.get((vx, vy), UNKNOWN)
@@ -80,6 +81,7 @@ def gset(vx, vy, val):
     _cnt[val] += 1
     if val == WALL:
         _wd.clear()
+        _bad_targets.clear()  # new walls may open new paths
 
 # ═══════════════════════════════════════════
 # 地图 + 障碍物
@@ -244,64 +246,61 @@ def is_frontier(vx, vy):
     return False
 
 def pick_max_voxel_target(bx, by, heading):
-    """在机器人前方扇形区域采样，选wall_dist最大的FREE格作为目标。
-    
-    原理:
-      wall_dist = 该格到最近墙的格数
-      道路中间 → wall_dist大 (宽阔, "大体素")
-      贴墙/窄路 → wall_dist小
-      机器人优先走wall_dist最大的地方 = 自然在道路中间
-    
-    渐进放置:
-      不选扇形最远端的格, 选中间距离(MAX_TARGET_DIST以内)
-      下一步走到那里后再算 → 轨迹自然前推
-      障碍物出现 → wall_dist地图更新 → 宽处偏移 → 轨迹自动扭过去
-    """
-    best_vx = best_vy = None
-    best_wd = MIN_TARGET_WD - 1
-    best_dist = 999
+    """扇形采样→选前缘+直线可达+wall_dist最大。无结果→360°FAN_FAR兜底"""
+    candidates = []  # [(wd, dist, vx, vy), ...]
 
     cos_h = math.cos(heading)
     sin_h = math.sin(heading)
 
+    # Phase 1: fan search
     for dist_m in np.arange(FAN_NEAR, FAN_FAR + VOXEL, FAN_DSTEP):
-        if dist_m > MAX_TARGET_DIST and best_vx is not None:
-            break  # 已经找到候选, 不再往更远看 (渐进放置)
-
         for ang_deg in np.arange(-FAN_ANGLE, FAN_ANGLE + 1, FAN_ASTEP):
             ang = heading + math.radians(ang_deg)
             wx = bx + math.cos(ang) * dist_m
             wy = by + math.sin(ang) * dist_m
-            # clip to map bounds (0,100) world
             if not (0 < wx < 100 and 0 < wy < 100):
                 continue
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
-
-            # yellow ball must be line-of-sight reachable (no walls between robot and target)
             if not line_clear(int(bx/VOXEL), int(by/VOXEL), vx, vy):
                 continue
-
             if not walkable(vx, vy):
                 continue
-
-            # frontier constraint: must neighbor UNKNOWN
             if not is_frontier(vx, vy):
                 continue
-
-            wd = wall_dist(vx, vy)
-            if wd < MIN_TARGET_WD:
+            if (vx, vy) in _bad_targets:
                 continue
+            wd = wall_dist(vx, vy)
+            candidates.append((wd, dist_m, vx, vy))
 
-            # 选wall_dist最大的; 平局时选更远的
-            if wd > best_wd or (wd == best_wd and dist_m > best_dist):
-                best_wd = wd
-                best_dist = dist_m
-                best_vx, best_vy = vx, vy
+    # Phase 2: 360 fallback if fan found nothing
+    if not candidates:
+        for dist_m in np.arange(FAN_NEAR, FAN_FAR + VOXEL, FAN_DSTEP):
+            for ang in np.arange(0, 2*math.pi, math.radians(FAN_ASTEP)):
+                wx = bx + math.cos(ang) * dist_m
+                wy = by + math.sin(ang) * dist_m
+                if not (0 < wx < 100 and 0 < wy < 100):
+                    continue
+                vx, vy = int(wx/VOXEL), int(wy/VOXEL)
+                if not line_clear(int(bx/VOXEL), int(by/VOXEL), vx, vy):
+                    continue
+                if not walkable(vx, vy):
+                    continue
+                if not is_frontier(vx, vy):
+                    continue
+                if (vx, vy) in _bad_targets:
+                    continue
+                wd = wall_dist(vx, vy)
+                candidates.append((wd, dist_m, vx, vy))
 
-    if best_vx is None:
+    if not candidates:
         return None
 
-    return best_vx, best_vy, best_wd
+    # sort: near/wide first
+    near = [c for c in candidates if c[1] <= MAX_TARGET_DIST]
+    pool = near if near else candidates
+    pool.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    wd, dist_m, vx, vy = pool[0]
+    return vx, vy, wd
 
 # ═══════════════════════════════════════════
 # 可视化
@@ -531,16 +530,27 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                         print(f"  [MAXWD] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) wd={gwd} path={len(path)}", flush=True)
                 else:
                     no_path_count += 1
+                    if no_path_count == 1:
+                        print(f"  [NOPATH] [{step}] pick=({gvx},{gvy}) wd={gwd} start=({vx},{vy})", flush=True)
+                    _bad_targets.add((gvx, gvy))
             else:
                 no_path_count += 1
-                if no_path_count == 1:
-                    twd = wall_dist(gvx, gvy)
-                    tfree = gget(gvx, gvy)
-                    print(f"  [NOPATH] [{step}] pick=({gvx},{gvy}) wd_pick={gwd} wd_tgt={twd} free_tgt={tfree} start=({vx},{vy}) wd_start={wall_dist(vx,vy)} free_start={gget(vx,vy)}", flush=True)
 
             # A*失败或无候选 → 恢复
+            # ★ bounce escape: >20次 → 强制跳最远里程碑
+            if mv.bounce > 20 and milestones:
+                mx, my = milestones[-1]
+                d.qpos[0] = (mx+0.5)*VOXEL
+                d.qpos[1] = (my+0.5)*VOXEL
+                mujoco.mj_forward(m, d)
+                mv.bounce = 0; mv.yaw = 0.0; mv.escaping = False
+                no_path_count = 0; path = None
+                _bad_targets.clear()
+                print(f"  [ESCAPE] [{step}] bounce=20+ → ms[-1] ({d.qpos[0]:.1f},{d.qpos[1]:.1f})", flush=True)
+
             if no_path_count > MAX_NO_PATH:
                 if len(milestones) > 1:
+                    rescued = False
                     for mx, my in reversed(milestones[-5:]):
                         bp = astar_to(vx, vy, mx, my)
                         if bp:
@@ -548,11 +558,35 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                             wander = 0; last_dist = 999
                             print(f"  [BACK] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
                             no_path_count = 0
+                            rescued = True
                             break
-                    else:
-                        mv._bounce(90, 180)
+                    if not rescued:
+                        # BACK loop: try much earlier milestone
+                        if len(milestones) > 10:
+                            mx, my = milestones[len(milestones)//3]
+                            bp = astar_to(vx, vy, mx, my)
+                            if bp:
+                                path = bp; path_idx = 0
+                                wander = 0; last_dist = 999
+                                no_path_count = 0
+                                print(f"  [ESCAPE] [{step}] BACK死循环 → ms[1/3] ({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                            else:
+                                mv._bounce(90, 180)
+                        else:
+                            mv._bounce(90, 180)
                 else:
                     mv._bounce(90, 180)
+
+        # ★ bounce/path-loss escape: checked every step
+        if mv.bounce >= 20 and milestones:
+            mx, my = milestones[-1]
+            d.qpos[0] = (mx+0.5)*VOXEL
+            d.qpos[1] = (my+0.5)*VOXEL
+            mujoco.mj_forward(m, d)
+            mv.bounce = 0; mv.yaw = 0.0; mv.escaping = False
+            path = None; no_path_count = 0
+            _bad_targets.clear()
+            print(f"  [ESCAPE] [{step}] bounce={mv.bounce} → ms[-1] ({d.qpos[0]:.1f},{d.qpos[1]:.1f})", flush=True)
 
         # 沿路径移动
         if path is not None and path_idx < len(path):
