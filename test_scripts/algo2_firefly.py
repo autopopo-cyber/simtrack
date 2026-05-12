@@ -76,19 +76,14 @@ blocked = lambda wx, wy: is_wall(wx, wy) or is_obs(wx, wy)
 walkable = lambda vx, vy: 0<=vx<W and 0<=vy<W and vox[vy,vx] in (FREE, VISITED)
 
 # ── 文件读写 ──
-def save_state(milestones, finished):
+def save_state(finished):
     np.save(SCAN_VOX, vox)
-    meta = {
-        "seed": FIXED_SEED,
-        "milestones": milestones,
-        "finished": finished,
-        "vox_shape": list(vox.shape)
-    }
+    meta = {"seed": FIXED_SEED, "finished": finished}
     with open(SCAN_META, 'w') as f:
         json.dump(meta, f)
 
 def load_state():
-    """返回 (vox_grid, milestones, finished) 或 None"""
+    """返回 (vox_grid, finished) 或 None"""
     if not (os.path.exists(SCAN_VOX) and os.path.exists(SCAN_META)):
         return None
     loaded_vox = np.load(SCAN_VOX)
@@ -97,8 +92,8 @@ def load_state():
     with open(SCAN_META) as f:
         meta = json.load(f)
     if meta.get("seed") != FIXED_SEED:
-        return None  # 种子变了, 扫图作废
-    return loaded_vox, meta["milestones"], meta["finished"]
+        return None
+    return loaded_vox, meta["finished"]
 
 def state_exists_and_finished():
     if not (os.path.exists(SCAN_VOX) and os.path.exists(SCAN_META)):
@@ -333,12 +328,12 @@ class Mover:
 # 1. 加载或初始化扫图
 existing = load_state()
 if existing is not None:
-    loaded_vox, loaded_milestones, loaded_finished = existing
-    print(f"[LOAD] 加载扫图: seed={FIXED_SEED} milestones={len(loaded_milestones)} finished={loaded_finished}")
+    loaded_vox, loaded_finished = existing
+    print(f"[LOAD] 加载扫图: seed={FIXED_SEED} finished={loaded_finished}")
     np.copyto(vox, loaded_vox)
-    milestones = loaded_milestones
+    milestones = []  # 路标不持久化, 运行时重建
     if loaded_finished:
-        print("  [OK] 扫图已标注'路径已到达终点', 直接沿路标走")
+        print("  [OK] 扫图已完成, 任意点A*直达终点")
 else:
     print(f"[NEW] 新扫图: seed={FIXED_SEED}")
     milestones = []
@@ -363,7 +358,7 @@ for wx, wy in milestones:
 step=0; t0=time.time(); RENDER_SKIP=20
 last_milestone_x = last_milestone_y = 0
 path = None; path_idx = 0
-finish_found = existing is not None and existing[2]
+finish_found = existing is not None and existing[1]
 no_gate_count = 0
 current_target_type = ""  # "gate" or "milestone"
 
@@ -410,7 +405,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 milestones.append((vx, vy))
                 last_milestone_x, last_milestone_y = vx, vy
                 balls.add_milestone(bx, by)
-                save_state(milestones, False)
+                save_state(False)
                 if len(milestones) % 20 == 0:
                     print(f"  [WAYPOINT] milestones={len(milestones)} @({bx:.1f},{by:.1f})", flush=True)
         
@@ -423,7 +418,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if 0<=fx<W and 0<=fy<W and vox[fy,fx] in (FREE, VISITED):
                 if math.hypot(FINISH[0]-bx, FINISH[1]-by) < 5.0:
                     finish_found = True
-                    save_state(milestones, True)
+                    save_state(True)
                     print(f"  [FINISH] FINISH! step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
                     break
 
@@ -491,6 +486,6 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             print(f"  ... step={step} V{int(np.sum(vox==VISITED))} F{int(np.sum(vox==FREE))} milestones={len(milestones)}", flush=True)
         if step % RENDER_SKIP == 0: v.sync()
     
-    save_state(milestones, finish_found)
+    save_state(finish_found)
     result = "FINISH" if finish_found else "stopped"
     print(f"done({result}): milestones={len(milestones)} step={step} time={time.time()-t0:.1f}s bounce={mv.bounce}", flush=True)
