@@ -24,7 +24,7 @@ import sys, os, math, time, random, heapq, json
 import numpy as np
 from PIL import Image
 # 软件渲染 — 避免 viewer 线程 GL segfault
-os.environ.setdefault('MUJOCO_GL', 'osmesa')
+os.environ.setdefault('MUJOCO_GL', 'egl')
 import mujoco, mujoco.viewer
 
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
