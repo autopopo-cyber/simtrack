@@ -185,11 +185,9 @@ def scan(bx, by):
                 i += 1
             gate_edges = edges[start_i:i]
             first = gate_edges[0]; last = gate_edges[-1]
-            # 门中心: 弧中点, 距离取LIDAR_RANGE的80%
-            mid_a = (first[5] + last[6]) / 2
-            mid_d = LIDAR_RANGE * 0.8
-            gate_mx = bx + math.cos(mid_a) * mid_d
-            gate_my = by + math.sin(mid_a) * mid_d
+            # 门中心: GATE边的中点 (在边界上, 不投射到远处)
+            gate_mx = (first[0] + last[2]) / 2
+            gate_my = (first[1] + last[3]) / 2
             merged.append((first[0], first[1], last[2], last[3], 'GATE', gate_mx, gate_my))
     polygon = merged
 
@@ -377,30 +375,24 @@ def polygon_gates(bx, by):
     gates.sort(key=lambda g: g[0])
     return gates
 
-# ── A*路径→黄色路点: line_clear直线可达的最远点 ──
+# ── A*路径→黄色路点: 每1m一个 ──
 
-def simplify_waypoints(raw_path, fvx, fvy):
-    """A*细密路点→黄色路点: 每个点是从当前位置直线能到的最远点"""
+def gen_yellow_waypoints(raw_path):
+    """沿A*路径每1米生成一个黄色路点"""
     if not raw_path: return []
-    waypoints = []
-    cvx, cvy = fvx, fvy
-    i = 0
-    while i < len(raw_path):
-        furthest = i
-        for j in range(i, len(raw_path)):
-            wx, wy = raw_path[j]
-            gvx, gvy = int(wx/VOXEL), int(wy/VOXEL)
-            if line_clear(cvx, cvy, gvx, gvy):
-                furthest = j
-            else:
-                break
-        waypoints.append(raw_path[furthest])
-        if furthest >= len(raw_path) - 1:
-            break
-        wx, wy = raw_path[furthest]
-        cvx, cvy = int(wx/VOXEL), int(wy/VOXEL)
-        i = furthest + 1
-    return waypoints
+    wp = [raw_path[0]]
+    acc = 0.0; px, py = raw_path[0]
+    for wx, wy in raw_path[1:]:
+        acc += math.hypot(wx-px, wy-py)
+        if acc >= 1.0:
+            wp.append((wx, wy))
+            acc = 0.0
+        px, py = wx, wy
+    # 确保终点在列
+    last = raw_path[-1]
+    if not wp or (abs(wp[-1][0]-last[0]) > 0.01 or abs(wp[-1][1]-last[1]) > 0.01):
+        wp.append(last)
+    return wp
 
 
 def pick_gate(gates, mode="far", stuck=False):
@@ -524,7 +516,7 @@ class Mover:
             err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
             dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
             self.yaw += dyaw
-            self.speed = max(MIN_SPEED, min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR))
+            self.speed = SPEED
         vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
         nx, ny = bx+vx*dt, by+vy*dt
         if step-self.stuck_t > STUCK_TIMEOUT:
@@ -663,7 +655,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
                 _, _, gx, gy = gate
                 raw = astar_to(vx, vy, gx, gy)
                 if raw:
-                    yellow_wps = simplify_waypoints(raw, vx, vy)
+                    yellow_wps = gen_yellow_waypoints(raw)
                     target_wp = None
                     no_gate_count = 0
                     gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
