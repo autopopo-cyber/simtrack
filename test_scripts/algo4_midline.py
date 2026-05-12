@@ -384,7 +384,7 @@ def save_state():
     arr = np.full((h, w), UNKNOWN, dtype=np.int8)
     for (vx, vy), val in grid.items():
         arr[vy-miny, vx-minx] = val
-    np.savez(SCAN_STATE, grid=arr, offset=(minx, miny), seed=FIXED_SEED)
+    np.savez(SCAN_STATE, grid=arr, offset=(minx, miny), seed=FIXED_SEED, mode='v4_maxvoxel')
 
 def load_state():
     if not os.path.exists(SCAN_STATE): return None
@@ -396,7 +396,7 @@ def load_state():
         for vx in range(arr.shape[1]):
             if arr[vy, vx] != UNKNOWN:
                 loaded[(vx+ox, vy+oy)] = int(arr[vy, vx])
-    return loaded
+    return loaded  # v4不需要mode字段
 
 # ═══════════════════════════════════════════
 # 主入口
