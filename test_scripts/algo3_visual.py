@@ -59,14 +59,9 @@ FINISH = (3.0, 95.0)
 HIT_BACKOFF = 0.2   # 激光后退距离
 GAP_YELLOW_M = 1.0  # 黄线/蓝线阈值
 DECIDE_RADIUS = 10.0  # polygon决策半径
-VIRTUAL_CONE_DEG = 90  # 虚拟门前方锥形角度
-VIRTUAL_RANGE = 15.0   # 虚拟锚点最远距离
 
 # 墙体点集（供可视化）
 wall_set = set()
-# 持久墙线：蓝线永不删，黄线对照降级
-saved_blues = []       # [(fx,fy,tx,ty), ...] 全部历史蓝线
-saved_eps = set()      # 历史蓝线端点集合，供黄线对照
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -155,145 +150,75 @@ def scan(bx, by):
             prev_vx, prev_vy = vx, vy
 
 # ═══════════════════════════════════════════
-# 可视化：增量墙段拼接 + user_scn画线
-# 新旧分离：旧蓝线永久保留，新激光点聚类成墙段→端点仅连新端点
+# 可视化：递归增量多边形 + user_scn画线
 # ═══════════════════════════════════════════
 
-V6_CONNECT_R = 0.5  # 新点聚类阈值
-
-def _cluster_points(points):
-    """Union-Find聚类：距离<V6_CONNECT_R的点归一组。
-    Returns [[(x,y),...], ...]"""
-    if not points: return []
+def polygon_boundary(points, bx, by):
+    """V7递归增量多边形。点集→蓝线(墙)/黄线(门)"""
     n = len(points)
-    parent = list(range(n))
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj: parent[ri] = rj
-
-    for i in range(n):
-        xi, yi = points[i]
-        for j in range(i+1, n):
-            xj, yj = points[j]
-            if abs(xi-xj) <= V6_CONNECT_R and abs(yi-yj) <= V6_CONNECT_R:
-                if math.hypot(xi-xj, yi-yj) < V6_CONNECT_R:
-                    union(i, j)
-
-    comps = {}
-    for i, p in enumerate(points):
-        root = find(i)
-        if root not in comps: comps[root] = []
-        comps[root].append(p)
-    return list(comps.values())
-
-def _trace_chain(comp):
-    """追一条点链：从端点出发沿最近邻走。Returns [[(x,y),...], ...]"""
-    if len(comp) < 2:
-        return []   # 至少2点才能成链
-    comp_set = set(comp)
-    # 找端点（邻居最少的点）
-    def neighbors(p):
-        return [q for q in comp_set if q != p and math.hypot(p[0]-q[0], p[1]-q[1]) < V6_CONNECT_R]
-    deg = {p: len(neighbors(p)) for p in comp}
-    starts = [p for p, d in deg.items() if d <= 1]
-    if not starts: starts = [comp[0]]
-    
-    visited = set()
-    chains = []
-    for start in starts:
-        if start in visited: continue
-        chain = [start]
-        visited.add(start)
-        cur = start
-        while True:
-            nbs = [n for n in neighbors(cur) if n not in visited]
-            if not nbs: break
-            # 选最近邻（延续方向）
-            if len(chain) >= 2:
-                dx, dy = chain[-1][0]-chain[-2][0], chain[-1][1]-chain[-2][1]
-                nxt = min(nbs, key=lambda n: abs(math.atan2(n[1]-cur[1], n[0]-cur[0]) - math.atan2(dy, dx)))
-            else:
-                nxt = min(nbs, key=lambda n: math.hypot(n[0]-cur[0], n[1]-cur[1]))
-            cur = nxt
-            visited.add(cur)
-            chain.append(cur)
-        chains.append(chain)
-    return chains
-
-def incremental_update(bx, by):
-    """增量更新：新激光点→聚类→墙段→与旧墙端点对接。
-    Returns [(fx,fy,tx,ty,color), ...] (本次新增线)"""
-    
-    # 1. 取新点（附近DECIDE_RADIUS内，排除已归入旧墙的点）
-    nearby = []
-    for wx, wy in wall_set:
-        if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS:
-            # 检查是否已被旧墙覆盖
-            near_old = False
-            for (ox, oy) in saved_eps:
-                if abs(wx-ox) < 0.3 and abs(wy-oy) < 0.3:
-                    near_old = True
-                    break
-            if not near_old:
-                nearby.append((wx, wy))
-    
-    if len(nearby) < 2:
+    if n < 3:
         return []
-    
-    # 2. 聚类
-    comps = _cluster_points(nearby)
-    
-    # 3. 追链 → 蓝线
-    new_lines = []
-    new_endpoints = []  # [(x,y,comp_id), ...]
-    for ci, comp in enumerate(comps):
-        chains = _trace_chain(comp)
-        for chain in chains:
-            if len(chain) < 2: continue
-            for i in range(len(chain)-1):
-                new_lines.append((chain[i][0], chain[i][1], chain[i+1][0], chain[i+1][1], 'blue'))
-            # 端点 (带来源标记)
-            new_endpoints.append((chain[0][0], chain[0][1], ci))
-            new_endpoints.append((chain[-1][0], chain[-1][1], ci))
-    
-    # 4. 新旧端点对接
-    for ex, ey, _ in new_endpoints:
-        # 找最近的旧端点
-        best_d, best_old = 999, None
-        for (ox, oy) in saved_eps:
-            d = math.hypot(ex-ox, ey-oy)
-            if d < best_d:
-                best_d = d
-                best_old = (ox, oy)
-        if best_old and best_d < 2.0:
-            color = 'blue' if best_d <= GAP_YELLOW_M else 'yellow'
-            new_lines.append((ex, ey, best_old[0], best_old[1], color))
-    
-    # 5. 新端点间互连 (不同来源才连)
-    for i in range(len(new_endpoints)):
-        for j in range(i+1, len(new_endpoints)):
-            ex1, ey1, c1 = new_endpoints[i]
-            ex2, ey2, c2 = new_endpoints[j]
-            if c1 == c2:
-                continue  # 同源不连，避免门线跟墙平行
-            d = math.hypot(ex1-ex2, ey1-ey2)
-            if d < 3.0:
-                color = 'blue' if d <= GAP_YELLOW_M else 'yellow'
-                new_lines.append((ex1, ey1, ex2, ey2, color))
-    
-    # 6. 持久化：新蓝线端点存入saved_eps，蓝线段存入saved_blues
-    for fx, fy, tx, ty, c in new_lines:
-        if c == 'blue':
-            saved_blues.append((fx, fy, tx, ty))
-            saved_eps.add((round(fx,1), round(fy,1)))
-            saved_eps.add((round(tx,1), round(ty,1)))
-    
-    return new_lines
+    robx, roby = bx, by
+    polar = [(math.atan2(wy-roby, wx-robx), math.hypot(wx-robx, wy-roby), wx, wy) for wx, wy in points]
+    polar.sort()
+
+    def _subdivide(ax, ay, bx_w, by_w, depth=0):
+        d = math.hypot(bx_w-ax, by_w-ay)
+        if d <= GAP_YELLOW_M or depth > 60:
+            return [(ax, ay), (bx_w, by_w)]
+        ang_a = math.atan2(ay-roby, ax-robx)
+        ang_b = math.atan2(by_w-roby, bx_w-robx)
+        if ang_b < ang_a: ang_b += 2*math.pi
+        best_pt, best_dist = None, float('inf')
+        for ang, dist, wx, wy in polar:
+            a = ang if ang >= ang_a else ang + 2*math.pi
+            if ang_a < a < ang_b and dist < best_dist:
+                if not (abs(wx-ax)<0.05 and abs(wy-ay)<0.05) and not (abs(wx-bx_w)<0.05 and abs(wy-by_w)<0.05):
+                    best_dist = dist; best_pt = (wx, wy)
+        if not best_pt:
+            return [(ax, ay), (bx_w, by_w)]
+        cx, cy = best_pt
+        left = _subdivide(ax, ay, cx, cy, depth+1)
+        right = _subdivide(cx, cy, bx_w, by_w, depth+1)
+        return left[:-1] + right
+
+    _, _, wx0, wy0 = polar[0]
+    _, _, wx1, wy1 = polar[n//2]
+    _, _, wx2, wy2 = polar[-1]
+    init = [(wx0, wy0), (wx1, wy1), (wx2, wy2)]
+    poly = []
+    for k in range(3):
+        ax, ay = init[k]; bx_w, by_w = init[(k+1)%3]
+        seg = _subdivide(ax, ay, bx_w, by_w)
+        poly.extend(seg if k==0 else seg[1:])
+
+    lines = []
+    for k in range(len(poly)):
+        fx, fy = poly[k]; tx, ty = poly[(k+1)%len(poly)]
+        d = math.hypot(tx-fx, ty-fy)
+        color = 'yellow' if d > GAP_YELLOW_M else 'blue'
+        # 长线段分类修正：采样线上点
+        if color == 'yellow':
+            _d = math.hypot(tx-fx, ty-fy)
+            steps = max(4, int(_d / 0.3))
+            is_wall = False
+            for i in range(1, steps):
+                sx = round(fx + (tx-fx)*i/steps, 1)
+                sy = round(fy + (ty-fy)*i/steps, 1)
+                if (sx, sy) in wall_set:
+                    is_wall = True
+                    break
+            if is_wall:
+                color = 'blue'
+        lines.append((fx, fy, tx, ty, color))
+    return lines
+
+def decide_visual(bx, by):
+    """取附近墙体点做polygon"""
+    nearby = [(wx, wy) for wx, wy in wall_set if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS]
+    if len(nearby) < 3:
+        return []
+    return polygon_boundary(nearby, bx, by)
 
 def _rot_z_to_xy(dx, dy):
     L = math.hypot(dx, dy)
@@ -302,21 +227,8 @@ def _rot_z_to_xy(dx, dy):
     return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
 
 def draw_polygon(user_scn, lines):
-    """画多边形线到user_scn（含历史蓝线）"""
+    """画多边形线到user_scn"""
     user_scn.ngeom = 0
-    # 先画历史蓝线（暗淡）
-    for fx, fy, tx, ty in saved_blues:
-        if user_scn.ngeom >= user_scn.maxgeom: break
-        geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
-        d = math.hypot(tx-fx, ty-fy)
-        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.04, max(d/2, 0.01), 0], dtype=np.float64),
-            mid, np.eye(3, dtype=np.float64).flatten(),
-            np.array([0.15, 0.4, 0.8, 0.7], dtype=np.float32))
-        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
-        user_scn.ngeom += 1
-    # 再画本轮新线
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom: break
         geom = user_scn.geoms[user_scn.ngeom]
@@ -756,16 +668,16 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % RENDER_SKIP == 0:
             v.sync()
 
-        # 每1秒增量更新
+        # 每1秒更新多边形可视化
         if step % 200 == 0:
-            lines = incremental_update(d.qpos[0], d.qpos[1])
+            lines = decide_visual(d.qpos[0], d.qpos[1])
             if lines:
                 blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
                 yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
                 grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
-                print(f"  [VIS] step={step} new_blues={blues} new_yellows={yellows} saved_total={len(saved_blues)}", flush=True)
-            draw_polygon(v.user_scn, lines)
-            v.sync()
+                print(f"  [VIS] step={step} blues={blues} yellows={yellows} grays={grays}", flush=True)
+                draw_polygon(v.user_scn, lines)
+                v.sync()
 
     save_state()
     print(f"done: ms={len(milestones)} step={step} t={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
