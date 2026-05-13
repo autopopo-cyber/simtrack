@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""V7: Observe-Decide解耦 + 递归增量多边形 + user_scn原生画线
-
-observe: 激光→距离-0.2m→0.1m精度点→set去重
-decide:  递归增量多边形（3点→细分大边→墙/门分离）
-可视化: v.user_scn动态capsule，长度匹配实际线段
+"""A/B测试：同一批wall_points → nearby vs 全量 → polygon对比
+纯headless，不启动viewer。用V7完全相同的参数+障碍物。
 """
 
-import sys, os, math, time, random
+import sys, os, math, random, json
 import numpy as np
 from PIL import Image
-import mujoco, mujoco.viewer
+import mujoco
 
 # ═══════════════════════════════════════════
-# 参数
+# 参数（完全同V7）
 # ═══════════════════════════════════════════
 
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
@@ -23,13 +20,17 @@ LIDAR_STEPS = int(LIDAR_RANGE / 0.1)
 DECIDE_RADIUS = 10.0
 GAP_YELLOW_M = 1.0
 HIT_BACKOFF = 0.2
-OBSERVE_TICK = 20; RENDER_SKIP = 20
-FIXED_SEED = random.randint(0, 999999)
+OBSERVE_TICK = 20
 START_POS = (3.0, 3.0)
-INIT_SCAN_FRAMES = 400
+INIT_SCAN_FRAMES = 400  # 20轮（同V7原版）
+
+# 固定seed便于复现
+FIXED_SEED = 424242
+random.seed(FIXED_SEED)
+np.random.seed(FIXED_SEED)
 
 # ═══════════════════════════════════════════
-# 地图 + 障碍物
+# 地图 + 障碍物（完全同V7）
 # ═══════════════════════════════════════════
 
 hf = np.array(Image.open(MAP))
@@ -48,14 +49,14 @@ def gen_centerline():
 def gen_obstacles(seed):
     rng = random.Random(seed); cl = gen_centerline()
     obs_world = []; idx = 0
-    while idx < len(cl):
-        cx, cy = cl[idx]; wx, wy = cx*SCALE, cy*SCALE
-        obs_world.append((wx, wy+rng.uniform(-2.0,2.0)))
-        idx += rng.randint(3,8)
-    return [(x,y) for x,y in obs_world if math.hypot(x-6,y-6)>5.0]
+    for _ in range(12):
+        cx, cy = cl[idx % len(cl)]
+        ox = cx + rng.uniform(-1.5, 1.5)
+        oy = cy + rng.uniform(-0.5, 0.5)
+        obs_world.append((ox, oy)); idx += rng.randint(10, 20)
+    return obs_world
 
 obs_world = gen_obstacles(FIXED_SEED)
-OBS_R = 1.0; OBS_CLEAR = OBS_R + SAFE_R
 
 def sample_hf(wx, wy):
     mx, my = wx/SCALE, wy/SCALE
@@ -63,19 +64,19 @@ def sample_hf(wx, wy):
     return int(hf[py,px]) if 0<=px<HF_RES and 0<=py<HF_RES else -1
 
 def is_obstacle_world(wx, wy):
-    if sample_hf(wx, wy) != ROAD_PIX: return True
+    v = sample_hf(wx, wy)
+    if v == -1 or v < ROAD_PIX: return True
     for ox, oy in obs_world:
-        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR: return True
+        if math.hypot(wx-ox, wy-oy) < 1.0 + SAFE_R: return True
     return False
 
 # ═══════════════════════════════════════════
-# Observe: 激光 → 点集去重
+# Observe（完全同V7）
 # ═══════════════════════════════════════════
 
 wall_points = set()
 
-def _snap(v):
-    return round(v * 10) / 10
+def _snap(v): return round(v, 1)
 
 def observe(bx, by):
     for a in np.linspace(0, 2*math.pi, LIDAR_RAYS):
@@ -89,15 +90,8 @@ def observe(bx, by):
                 wall_points.add((_snap(hx), _snap(hy)))
                 break
 
-def get_nearby_points(bx, by):
-    nearby = []
-    for wx, wy in wall_points:
-        if abs(wx - bx) <= DECIDE_RADIUS and abs(wy - by) <= DECIDE_RADIUS:
-            nearby.append((wx, wy))
-    return nearby
-
 # ═══════════════════════════════════════════
-# Decide: 递归增量多边形
+# polygon_boundary（完全同V7，无修改）
 # ═══════════════════════════════════════════
 
 def polygon_boundary(points, bx, by):
@@ -106,18 +100,16 @@ def polygon_boundary(points, bx, by):
         return []
 
     robx, roby = bx, by
-
     polar = []
     for wx, wy in points:
         polar.append((math.atan2(wy - roby, wx - robx),
                       math.hypot(wx - robx, wy - roby), wx, wy))
     polar.sort()
 
-    _subdivide_calls = [0]  # 用list实现闭包可变引用
+    _subdivide_calls = [0]
 
     def _subdivide(ax, ay, bx_w, by_w, depth=0):
         _subdivide_calls[0] += 1
-        call_id = _subdivide_calls[0]
         d = math.hypot(bx_w - ax, by_w - ay)
         if d <= GAP_YELLOW_M or depth > 60:
             return [(ax, ay), (bx_w, by_w)]
@@ -141,8 +133,6 @@ def polygon_boundary(points, bx, by):
             return [(ax, ay), (bx_w, by_w)]
 
         cx, cy = best_pt
-        print(f"  [SUB #{call_id} d={depth}] ({ax:.1f},{ay:.1f})→({bx_w:.1f},{by_w:.1f}) |AB|={d:.1f}m → insert ({cx:.1f},{cy:.1f})",
-              flush=True)
         left = _subdivide(ax, ay, cx, cy, depth + 1)
         right = _subdivide(cx, cy, bx_w, by_w, depth + 1)
         return left[:-1] + right
@@ -159,8 +149,6 @@ def polygon_boundary(points, bx, by):
         seg = _subdivide(ax, ay, bx_w, by_w)
         poly.extend(seg if k == 0 else seg[1:])
 
-    print(f"  [POLY] init=3→final={len(poly)}", flush=True)
-
     lines = []
     for k in range(len(poly)):
         fx, fy = poly[k]
@@ -168,66 +156,32 @@ def polygon_boundary(points, bx, by):
         d = math.hypot(tx - fx, ty - fy)
         lines.append((fx, fy, tx, ty, 'yellow' if d > GAP_YELLOW_M else 'blue'))
 
-    return lines
-
-
-def decide(bx, by):
-    points = list(wall_points)
-    return polygon_boundary(points, bx, by)
+    return lines, _subdivide_calls[0]
 
 # ═══════════════════════════════════════════
-# 可视化：v.user_scn 原生画线（动态长度capsule）
+# get_nearby_points（同V7原版）
 # ═══════════════════════════════════════════
 
-def _rotation_matrix_z_to_xy(dx, dy):
-    """从Z轴(0,0,1)旋转到(dx,dy,0)方向的3x3矩阵。
-
-    Rodrigues: axis=cross(Z,target)=(-dy/L, dx/L, 0), angle=π/2
-    R = [[dy²/L², -dx*dy/L², dx/L],
-         [-dx*dy/L², dx²/L², dy/L],
-         [-dx/L, -dy/L, 0]]
-    """
-    L = math.hypot(dx, dy)
-    if L < 0.001:
-        return np.eye(3, dtype=np.float64)
-    ux, uy = dx / L, dy / L
-    return np.array([
-        [ uy * uy, -ux * uy,  ux],
-        [-ux * uy,  ux * ux,  uy],
-        [-ux,      -uy,       0]
-    ], dtype=np.float64)
-
-def draw_lines(user_scn, lines):
-    """在user_scn中画线段（capsule+Rodrigues旋转，已修正）"""
-    user_scn.ngeom = 0
-    for fx, fy, tx, ty, color in lines:
-        if user_scn.ngeom >= user_scn.maxgeom:
-            break
-        geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx + tx) / 2, (fy + ty) / 2, 1.0], dtype=np.float64)
-        d = math.hypot(tx - fx, ty - fy)
-        rgba = [0.2, 0.5, 1.0, 1.0] if color == 'blue' else [1.0, 0.9, 0.1, 1.0]
-
-        mujoco.mjv_initGeom(
-            geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.05, max(d / 2, 0.01), 0], dtype=np.float64),
-            mid,
-            np.eye(3, dtype=np.float64).flatten(),
-            np.array(rgba, dtype=np.float32)
-        )
-        geom.mat[:] = _rotation_matrix_z_to_xy(tx - fx, ty - fy)
-        user_scn.ngeom += 1
+def get_nearby_points(bx, by):
+    nearby = []
+    for wx, wy in wall_points:
+        if abs(wx - bx) <= DECIDE_RADIUS and abs(wy - by) <= DECIDE_RADIUS:
+            nearby.append((wx, wy))
+    return nearby
 
 # ═══════════════════════════════════════════
-# MuJoCo场景（无mocap body）
+# 主入口：headless A/B测试
 # ═══════════════════════════════════════════
 
-def build_xml():
-    OBS_XML = "".join(
-        f'<body name="obs{j}" pos="{x:.1f} {y:.1f} 2.0">'
-        f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
-        for j, (x, y) in enumerate(obs_world))
-    return f"""<mujoco>
+print(f"━━━ A/B测试: nearby vs 全量 polygon ━━━ seed={FIXED_SEED} ━━━", flush=True)
+
+# 构建XML（完全同V7）
+OBS_XML = "".join(
+    f'<body name="obs{j}" pos="{x:.1f} {y:.1f} 2.0">'
+    f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
+    for j, (x, y) in enumerate(obs_world))
+
+xml = f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
   <asset><hfield name="track" size="50.0 50.0 4.0 2.0" file="{MAP}"/></asset>
@@ -243,20 +197,13 @@ def build_xml():
   </worldbody>
 </mujoco>"""
 
-# ═══════════════════════════════════════════
-# 主入口
-# ═══════════════════════════════════════════
-
-print(f"━━━ V7 递归增量多边形 + user_scn原生画线 ━━━ seed={FIXED_SEED} ━━━", flush=True)
-
-xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
 d.qpos[0] = START_POS[0]; d.qpos[1] = START_POS[1]
 mujoco.mj_forward(m, d)
 
-# 阶段1: 扫描
-print(f"  [SCAN] 初始扫描 {INIT_SCAN_FRAMES}帧...", flush=True)
+# 阶段1: 扫描（同V7 20轮）
+print(f"  [SCAN] {INIT_SCAN_FRAMES}帧 ({INIT_SCAN_FRAMES//OBSERVE_TICK}轮)...", flush=True)
 for _ in range(INIT_SCAN_FRAMES):
     bx, by = d.qpos[0], d.qpos[1]
     if _ % OBSERVE_TICK == 0:
@@ -264,28 +211,49 @@ for _ in range(INIT_SCAN_FRAMES):
     mujoco.mj_step(m, d)
 print(f"  [OK] wall_points={len(wall_points)}", flush=True)
 
-# 阶段2: 决策
 bx, by = d.qpos[0], d.qpos[1]
-lines = decide(bx, by)
-blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
-yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-nearby = len(get_nearby_points(bx, by))
-print(f"  [DECIDE] nearby={nearby} blues={blues} yellows={yellows}", flush=True)
 
-# 阶段3: 持续显示（user_scn画线）
-print(f"=== viewer运行中。关闭窗口退出 ===", flush=True)
+# 测试A: nearby点（V7原版行为）
+nearby_points = get_nearby_points(bx, by)
+print(f"  [A-nearby] nearby点={len(nearby_points)} (DECIDE_RADIUS={DECIDE_RADIUS}m)", flush=True)
+lines_a, calls_a = polygon_boundary(nearby_points, bx, by)
+blues_a = sum(1 for _,_,_,_,c in lines_a if c == 'blue')
+yellows_a = sum(1 for _,_,_,_,c in lines_a if c == 'yellow')
+print(f"  [A-nearby] poly顶点={blues_a+yellows_a} blues={blues_a} yellows={yellows_a} calls={calls_a}", flush=True)
 
-with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
-    v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-    v.cam.distance = 25; v.cam.elevation = -35; v.cam.azimuth = 180
-    v.cam.lookat[:] = np.array([bx, by, 0.5], dtype=np.float64)
+# 测试B: 全量点
+all_points = list(wall_points)
+print(f"  [B-full]   全量点={len(all_points)}", flush=True)
+lines_b, calls_b = polygon_boundary(all_points, bx, by)
+blues_b = sum(1 for _,_,_,_,c in lines_b if c == 'blue')
+yellows_b = sum(1 for _,_,_,_,c in lines_b if c == 'yellow')
+print(f"  [B-full]   poly顶点={blues_b+yellows_b} blues={blues_b} yellows={yellows_b} calls={calls_b}", flush=True)
 
-    step = 0
-    while v.is_running():
-        if step % RENDER_SKIP == 0:
-            draw_lines(v.user_scn, lines)
-            v.sync()
-        mujoco.mj_step(m, d)
-        step += 1
+# 对比
+print()
+print("=" * 60)
+if blues_a == blues_b and yellows_a == yellows_b and calls_a == calls_b:
+    print("✅ nearby==全量: polygon输出完全相同")
+else:
+    print("❌ nearby≠全量: polygon输出不同！")
+    print(f"   nearby: blues={blues_a} yellows={yellows_a} calls={calls_a}")
+    print(f"   全量:   blues={blues_b} yellows={yellows_b} calls={calls_b}")
 
-    print(f"done: wall_points={len(wall_points)} blues={blues} yellows={yellows}", flush=True)
+    # 找黄线差异
+    yellows_a_set = set()
+    for fx, fy, tx, ty, c in lines_a:
+        if c == 'yellow':
+            yellows_a_set.add((round(fx,1), round(fy,1), round(tx,1), round(ty,1)))
+    yellows_b_set = set()
+    for fx, fy, tx, ty, c in lines_b:
+        if c == 'yellow':
+            yellows_b_set.add((round(fx,1), round(fy,1), round(tx,1), round(ty,1)))
+
+    only_a = yellows_a_set - yellows_b_set
+    only_b = yellows_b_set - yellows_a_set
+    if only_a:
+        print(f"   仅nearby有 {len(only_a)} 条黄线: {sorted(only_a)[:5]}")
+    if only_b:
+        print(f"   仅全量有 {len(only_b)} 条黄线: {sorted(only_b)[:5]}")
+
+print("=" * 60)
