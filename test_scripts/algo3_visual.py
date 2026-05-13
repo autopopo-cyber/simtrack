@@ -197,11 +197,26 @@ def polygon_boundary(points, bx, by):
         fx, fy = poly[k]; tx, ty = poly[(k+1)%len(poly)]
         d = math.hypot(tx-fx, ty-fy)
         color = 'yellow' if d > GAP_YELLOW_M else 'blue'
-        # 长线段检查中点：如果穿墙→改蓝线
+        # 长线段分类修正：采样线上点
         if color == 'yellow':
-            mx, my = (fx+tx)/2, (fy+ty)/2
-            if is_obstacle_world(mx, my):
+            _d = math.hypot(tx-fx, ty-fy)
+            steps = max(4, int(_d / 0.3))
+            is_wall = False
+            is_explored = False
+            for i in range(1, steps):
+                sx = round(fx + (tx-fx)*i/steps, 1)
+                sy = round(fy + (ty-fy)*i/steps, 1)
+                if (sx, sy) in wall_set:
+                    is_wall = True
+                    break
+                # 检查体素：已探索区域→不是真门
+                vx, vy = int(sx/VOXEL), int(sy/VOXEL)
+                if gget(vx, vy) == FREE:
+                    is_explored = True
+            if is_wall:
                 color = 'blue'
+            elif is_explored:
+                color = 'gray'
         lines.append((fx, fy, tx, ty, color))
     return lines
 
@@ -226,7 +241,7 @@ def draw_polygon(user_scn, lines):
         geom = user_scn.geoms[user_scn.ngeom]
         mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
         d = math.hypot(tx-fx, ty-fy)
-        rgba = [0.2, 0.5, 1.0, 1.0] if color == 'blue' else [1.0, 0.9, 0.1, 1.0]
+        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
         mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
             np.array([0.06, max(d/2, 0.01), 0], dtype=np.float64),
             mid, np.eye(3, dtype=np.float64).flatten(),
@@ -666,7 +681,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if lines:
                 blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
                 yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-                print(f"  [VIS] step={step} blues={blues} yellows={yellows}", flush=True)
+                grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
+                print(f"  [VIS] step={step} blues={blues} yellows={yellows} grays={grays}", flush=True)
                 draw_polygon(v.user_scn, lines)
                 v.sync()
 
