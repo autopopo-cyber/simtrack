@@ -190,8 +190,9 @@ def _cluster_points(points):
     return list(comps.values())
 
 def _trace_chain(comp):
-    """追一条点链：从端点出发沿最近邻走。Returns [(x,y),...]"""
-    if len(comp) <= 1: return comp[:]
+    """追一条点链：从端点出发沿最近邻走。Returns [[(x,y),...], ...]"""
+    if len(comp) < 2:
+        return []   # 至少2点才能成链
     comp_set = set(comp)
     # 找端点（邻居最少的点）
     def neighbors(p):
