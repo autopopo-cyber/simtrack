@@ -198,25 +198,24 @@ def _rotation_matrix_z_to_xy(dx, dy):
     ], dtype=np.float64)
 
 def draw_lines(user_scn, lines):
-    """在user_scn中画线段。lines=[(fx,fy,tx,ty,color),...]"""
+    """在user_scn中用mjGEOM_LINE画线段（纯2D，无需旋转）"""
     user_scn.ngeom = 0
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom:
             break
         geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx + tx) / 2, (fy + ty) / 2, 1.0], dtype=np.float64)
-        d = math.hypot(tx - fx, ty - fy)
         rgba = [0.2, 0.5, 1.0, 1.0] if color == 'blue' else [1.0, 0.9, 0.1, 1.0]
-
         mujoco.mjv_initGeom(
-            geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.05, max(d / 2, 0.01), 0], dtype=np.float64),
-            mid,
+            geom, mujoco.mjtGeom.mjGEOM_LINE,
+            np.zeros(3, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
             np.eye(3, dtype=np.float64).flatten(),
             np.array(rgba, dtype=np.float32)
         )
-        # 旋转capsule到线段方向
-        geom.mat[:] = _rotation_matrix_z_to_xy(tx - fx, ty - fy)
+        geom.vert[0][:3] = [fx, fy, 1.0]
+        geom.vert[1][:3] = [tx, ty, 1.0]
+        geom.vert[2][:3] = [0, 0, 0]   # 直线不需要第三个点
+        geom.vert[3][:3] = [0, 0, 0]
         user_scn.ngeom += 1
 
 # ═══════════════════════════════════════════
