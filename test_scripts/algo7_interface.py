@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""V7: Observe-Decide 解耦 + 接口化 + 多边形连线（待实现）
+"""V7: Observe-Decide解耦 + 递归增量多边形 + user_scn原生画线
 
-observe(10Hz): 激光扫描 → hit距离-0.2m → 0.1m精度点 → set去重
-decide(1Hz):   取10m内墙点 → 多边形边界提取 → 蓝线/黄线连线
-               算法: 待填（角度排序 / Alpha Shape / Concave Hull）
-
-机器人起始(3,3)，不移动。
+observe: 激光→距离-0.2m→0.1m精度点→set去重
+decide:  递归增量多边形（3点→细分大边→墙/门分离）
+可视化: v.user_scn动态capsule，长度匹配实际线段
 """
 
 import sys, os, math, time, random
@@ -20,23 +18,15 @@ import mujoco, mujoco.viewer
 MAP = os.path.expanduser("~/workspace/simtrack/confirmed/track_clean.png")
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.5
-
-LIDAR_RANGE = 15.0
-LIDAR_RAYS = 120
-LIDAR_STEPS = int(LIDAR_RANGE / 0.1)           # 150步
-
-DECIDE_RADIUS = 10.0                            # 决策范围 10m
-GAP_YELLOW_M = 1.0                              # >1m 黄线=门, ≤1m 蓝线=墙
-
-MAX_LINES = 600
-HIT_BACKOFF = 0.2                               # 击中后退0.2m
-
-OBSERVE_TICK = 20                               # 10Hz
-DECIDE_TICK = 200                               # 1Hz
-RENDER_SKIP = 20
-
+LIDAR_RANGE = 15.0; LIDAR_RAYS = 120
+LIDAR_STEPS = int(LIDAR_RANGE / 0.1)
+DECIDE_RADIUS = 10.0
+GAP_YELLOW_M = 1.0
+HIT_BACKOFF = 0.2
+OBSERVE_TICK = 20; RENDER_SKIP = 20
 FIXED_SEED = random.randint(0, 999999)
 START_POS = (3.0, 3.0)
+INIT_SCAN_FRAMES = 400
 
 # ═══════════════════════════════════════════
 # 地图 + 障碍物
@@ -79,32 +69,27 @@ def is_obstacle_world(wx, wy):
     return False
 
 # ═══════════════════════════════════════════
-# Observe: 激光 → 0.1m精度点集 (set去重)
+# Observe: 激光 → 点集去重
 # ═══════════════════════════════════════════
 
-wall_points = set()  # {(wx, wy) 0.1m精度}
+wall_points = set()
 
 def _snap(v):
-    """四舍五入到0.1m精度"""
     return round(v * 10) / 10
 
 def observe(bx, by):
-    """10Hz激光扫描。射线打到墙→距离减0.2m→0.1m精度取整→加入set。
-    多次打同一位置自动去重。"""
     for a in np.linspace(0, 2*math.pi, LIDAR_RAYS):
         cos_a, sin_a = math.cos(a), math.sin(a)
         for step_i in range(1, LIDAR_STEPS + 1):
             wx = bx + cos_a * step_i * 0.1
             wy = by + sin_a * step_i * 0.1
             if is_obstacle_world(wx, wy):
-                # 击中墙 → 后退0.2m → 0.1m精度
                 hx = bx + cos_a * (step_i * 0.1 - HIT_BACKOFF)
                 hy = by + sin_a * (step_i * 0.1 - HIT_BACKOFF)
                 wall_points.add((_snap(hx), _snap(hy)))
                 break
 
 def get_nearby_points(bx, by):
-    """取机器人10m范围内的墙点 → list of (wx, wy)"""
     nearby = []
     for wx, wy in wall_points:
         if abs(wx - bx) <= DECIDE_RADIUS and abs(wy - by) <= DECIDE_RADIUS:
@@ -112,72 +97,36 @@ def get_nearby_points(bx, by):
     return nearby
 
 # ═══════════════════════════════════════════
-# Decide: 接口化 — 多边形边界提取（待实现）
+# Decide: 递归增量多边形
 # ═══════════════════════════════════════════
 
-def _point_line_dist(px, py, ax, ay, bx, by):
-    """点到线段AB的距离"""
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
-
-def _douglas_peucker(pts, epsilon):
-    """Douglas-Peucker简化。pts=[(x,y),...]，epsilon=最大允许偏差(m)"""
-    if len(pts) < 3:
-        return list(pts)
-    fx, fy = pts[0]; tx, ty = pts[-1]
-    max_dist = 0; max_idx = 0
-    for i in range(1, len(pts) - 1):
-        d = _point_line_dist(pts[i][0], pts[i][1], fx, fy, tx, ty)
-        if d > max_dist:
-            max_dist = d; max_idx = i
-    if max_dist > epsilon:
-        left = _douglas_peucker(pts[:max_idx + 1], epsilon)
-        right = _douglas_peucker(pts[max_idx:], epsilon)
-        return left[:-1] + right
-    return [pts[0], pts[-1]]
-
 def polygon_boundary(points, bx, by):
-    """递归增量多边形：三角形→对大边递归细分→墙/门自然分离。
-
-    1. 初始化：取角度范围的三点（首/中/尾）构成三角形
-    2. 递归：subdivide(边AB) → 在AB角度范围内找最近点C → 递归AC, CB
-    3. 基底：边长≤1m 或 找不到更多点
-    4. 最终：≤1m蓝线(墙)，>1m黄线(门)
-    """
     n = len(points)
     if n < 3:
         return []
 
-    robx, roby = bx, by  # 机器人位置（避免闭包变量名冲突）
+    robx, roby = bx, by
 
-    # 所有点按极角(-π→π)排序
     polar = []
     for wx, wy in points:
         polar.append((math.atan2(wy - roby, wx - robx),
                       math.hypot(wx - robx, wy - roby), wx, wy))
     polar.sort()
 
-    # ── 递归细分一条边 ──
-    def _subdivide(ax, ay, bx_w, by_w, depth=0):
-        """递归细分边AB，返回从A到B的顶点列表 [(wx,wy),...]"""
-        d = math.hypot(bx_w - ax, by_w - ay)
+    _subdivide_calls = [0]  # 用list实现闭包可变引用
 
-        # 基底：边长≤1m 或 深度超限
+    def _subdivide(ax, ay, bx_w, by_w, depth=0):
+        _subdivide_calls[0] += 1
+        call_id = _subdivide_calls[0]
+        d = math.hypot(bx_w - ax, by_w - ay)
         if d <= GAP_YELLOW_M or depth > 60:
             return [(ax, ay), (bx_w, by_w)]
 
-        # A和B相对机器人的极角
         ang_a = math.atan2(ay - roby, ax - robx)
         ang_b = math.atan2(by_w - roby, bx_w - robx)
-
-        # 角度范围 [ang_a, ang_b] 逆时针
         if ang_b < ang_a:
             ang_b += 2 * math.pi
 
-        # 在AB角度范围内找距离机器人最近的点
         best_pt = None
         best_dist = float('inf')
         for ang, dist, wx, wy in polar:
@@ -192,17 +141,17 @@ def polygon_boundary(points, bx, by):
             return [(ax, ay), (bx_w, by_w)]
 
         cx, cy = best_pt
+        print(f"  [SUB #{call_id} d={depth}] ({ax:.1f},{ay:.1f})→({bx_w:.1f},{by_w:.1f}) |AB|={d:.1f}m → insert ({cx:.1f},{cy:.1f})",
+              flush=True)
         left = _subdivide(ax, ay, cx, cy, depth + 1)
         right = _subdivide(cx, cy, bx_w, by_w, depth + 1)
         return left[:-1] + right
 
-    # ── 初始化：取首/中/尾三点构成三角形 ──
     _, _, wx0, wy0 = polar[0]
     _, _, wx1, wy1 = polar[n // 2]
     _, _, wx2, wy2 = polar[-1]
     init = [(wx0, wy0), (wx1, wy1), (wx2, wy2)]
 
-    # ── 对三角形每条边递归细分 ──
     poly = []
     for k in range(len(init)):
         ax, ay = init[k]
@@ -210,85 +159,69 @@ def polygon_boundary(points, bx, by):
         seg = _subdivide(ax, ay, bx_w, by_w)
         poly.extend(seg if k == 0 else seg[1:])
 
-    print(f"  [POLY] recursive init=3→final={len(poly)}", flush=True)
+    print(f"  [POLY] init=3→final={len(poly)}", flush=True)
 
-    # ── 连线 ──
     lines = []
     for k in range(len(poly)):
         fx, fy = poly[k]
         tx, ty = poly[(k + 1) % len(poly)]
         d = math.hypot(tx - fx, ty - fy)
-        color = 'yellow' if d > GAP_YELLOW_M else 'blue'
-        lines.append((fx, fy, tx, ty, color))
+        lines.append((fx, fy, tx, ty, 'yellow' if d > GAP_YELLOW_M else 'blue'))
 
     return lines
 
 
 def decide(bx, by):
-    """1Hz决策：取墙点→多边形边界提取→连线。"""
     points = get_nearby_points(bx, by)
     return polygon_boundary(points, bx, by)
 
 # ═══════════════════════════════════════════
-# 线段可视化 (复用V6)
+# 可视化：v.user_scn 原生画线（动态长度capsule）
 # ═══════════════════════════════════════════
 
-class LineManager:
-    """分蓝/黄两组mocap body。蓝色用line_b*，黄色用line_y*。"""
-    def __init__(self, m, d):
-        self.m = m; self.d = d
-        self.blue_active = 0
-        self.yellow_active = 0
+def _rotation_matrix_z_to_xy(dx, dy):
+    """从Z轴(0,0,1)旋转到(dx,dy,0)方向的3x3矩阵"""
+    L = math.hypot(dx, dy)
+    if L < 0.001:
+        return np.eye(3, dtype=np.float64)
+    ux, uy = dx / L, dy / L
+    # Rodrigues: axis = (uy, -ux, 0), angle = π/2
+    # R = I + sinθ·K + (1-cosθ)·K²  with θ=π/2, sin=1, cos=0
+    # K = [[0,0,uy],[0,0,-ux],[-uy,ux,0]]
+    # R = I + K + K²
+    return np.array([
+        [ux * ux,  ux * uy,  uy],
+        [ux * uy,  uy * uy, -ux],
+        [-uy,      ux,       0]
+    ], dtype=np.float64)
 
-    def update(self, lines):
-        for i in range(MAX_LINES // 2):
-            self.d.mocap_pos[self.m.body(f"line_b{i}").mocapid] = [0, 0, -10]
-            self.d.mocap_pos[self.m.body(f"line_y{i}").mocapid] = [0, 0, -10]
-        self.blue_active = 0
-        self.yellow_active = 0
-
-        for fx, fy, tx, ty, color in lines:
-            if color == 'blue':
-                if self.blue_active >= MAX_LINES // 2: continue
-                idx = self.blue_active; name = f"line_b{idx}"
-                self.blue_active += 1
-            else:
-                if self.yellow_active >= MAX_LINES // 2: continue
-                idx = self.yellow_active; name = f"line_y{idx}"
-                self.yellow_active += 1
-            self._set_line(name, fx, fy, tx, ty)
-
-    def _set_line(self, name, fx, fy, tx, ty):
-        body = self.m.body(name)
+def draw_lines(user_scn, lines):
+    """在user_scn中画线段。lines=[(fx,fy,tx,ty,color),...]"""
+    user_scn.ngeom = 0
+    for fx, fy, tx, ty, color in lines:
+        if user_scn.ngeom >= user_scn.maxgeom:
+            break
+        geom = user_scn.geoms[user_scn.ngeom]
         mid = np.array([(fx + tx) / 2, (fy + ty) / 2, 1.0], dtype=np.float64)
-        self.d.mocap_pos[body.mocapid] = mid
-        dx, dy = tx - fx, ty - fy
-        L = math.hypot(dx, dy)
-        if L < 0.01:
-            self.d.mocap_quat[body.mocapid] = [1, 0, 0, 0]
-            return
-        axis = np.array([dy / L, -dx / L, 0.0], dtype=np.float64)
-        angle = math.pi / 2.0
-        s = math.sin(angle / 2)
-        q = np.array([math.cos(angle / 2), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float64)
-        self.d.mocap_quat[body.mocapid] = q
+        d = math.hypot(tx - fx, ty - fy)
+        rgba = [0.2, 0.5, 1.0, 1.0] if color == 'blue' else [1.0, 0.9, 0.1, 1.0]
+
+        mujoco.mjv_initGeom(
+            geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
+            np.array([0.05, max(d / 2, 0.01), 0], dtype=np.float64),
+            mid,
+            np.eye(3, dtype=np.float64).flatten(),
+            np.array(rgba, dtype=np.float32)
+        )
+        # 旋转capsule到线段方向
+        geom.mat[:] = _rotation_matrix_z_to_xy(tx - fx, ty - fy)
+        user_scn.ngeom += 1
 
 # ═══════════════════════════════════════════
-# MuJoCo场景
+# MuJoCo场景（无mocap body）
 # ═══════════════════════════════════════════
 
 def build_xml():
-    blue_bodies = ""
-    yellow_bodies = ""
-    for i in range(MAX_LINES // 2):
-        blue_bodies += (
-            f'<body name="line_b{i}" mocap="true" pos="0 0 -10">'
-            f'<geom type="capsule" size="0.05 0.5" rgba="0.2 0.5 1.0 0.9"/></body>\n'
-        )
-        yellow_bodies += (
-            f'<body name="line_y{i}" mocap="true" pos="0 0 -10">'
-            f'<geom type="capsule" size="0.05 0.5" rgba="1.0 0.9 0.1 0.9"/></body>\n'
-        )
     OBS_XML = "".join(
         f'<body name="obs{j}" pos="{x:.1f} {y:.1f} 2.0">'
         f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
@@ -300,8 +233,6 @@ def build_xml():
   <worldbody>
     <light pos="50 50 80" dir="0 0 -1"/>
     {OBS_XML}
-    {blue_bodies}
-    {yellow_bodies}
     <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
     <body name="bot" pos="{START_POS[0]} {START_POS[1]} 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
@@ -315,17 +246,15 @@ def build_xml():
 # 主入口
 # ═══════════════════════════════════════════
 
-print(f"━━━ V7 接口化 ━━━ observe点集去重 + decide空壳 ━━━ seed={FIXED_SEED} ━━━", flush=True)
+print(f"━━━ V7 递归增量多边形 + user_scn原生画线 ━━━ seed={FIXED_SEED} ━━━", flush=True)
 
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
 d.qpos[0] = START_POS[0]; d.qpos[1] = START_POS[1]
 mujoco.mj_forward(m, d)
-lm = LineManager(m, d)
 
-# ── 阶段1: 初始扫描 ──
-INIT_SCAN_FRAMES = 400
+# 阶段1: 扫描
 print(f"  [SCAN] 初始扫描 {INIT_SCAN_FRAMES}帧...", flush=True)
 for _ in range(INIT_SCAN_FRAMES):
     bx, by = d.qpos[0], d.qpos[1]
@@ -334,15 +263,15 @@ for _ in range(INIT_SCAN_FRAMES):
     mujoco.mj_step(m, d)
 print(f"  [OK] wall_points={len(wall_points)}", flush=True)
 
-# ── 阶段2: 决策画图 ──
+# 阶段2: 决策
 bx, by = d.qpos[0], d.qpos[1]
 lines = decide(bx, by)
-lm.update(lines)
-
+blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
+yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
 nearby = len(get_nearby_points(bx, by))
-print(f"  [DECIDE] nearby={nearby} blines={lm.blue_active} ylines={lm.yellow_active}", flush=True)
+print(f"  [DECIDE] nearby={nearby} blues={blues} yellows={yellows}", flush=True)
 
-# ── 阶段3: 持续显示 ──
+# 阶段3: 持续显示（user_scn画线）
 print(f"=== viewer运行中。关闭窗口退出 ===", flush=True)
 
 with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False) as v:
@@ -353,8 +282,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
     step = 0
     while v.is_running():
         if step % RENDER_SKIP == 0:
+            draw_lines(v.user_scn, lines)
             v.sync()
         mujoco.mj_step(m, d)
         step += 1
 
-    print(f"done: wall_points={len(wall_points)} blines={lm.blue_active} ylines={lm.yellow_active}", flush=True)
+    print(f"done: wall_points={len(wall_points)} blues={blues} yellows={yellows}", flush=True)
