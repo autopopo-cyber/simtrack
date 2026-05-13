@@ -20,8 +20,9 @@ SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.5
 LIDAR_RANGE = 15.0; LIDAR_RAYS = 120
 LIDAR_STEPS = int(LIDAR_RANGE / 0.1)
-DECIDE_RADIUS = 10.0
+DECIDE_RADIUS = 15.0
 GAP_YELLOW_M = 1.0
+GRID_RES = 0.5  # 0.5m grid（10m=400格）
 HIT_BACKOFF = 0.2
 OBSERVE_TICK = 20; DECIDE_TICK = 200; RENDER_SKIP = 20
 LINE_RADIUS = 0.08
@@ -65,7 +66,7 @@ def _add_point(wx, wy):
     if (wx, wy) in wall_set:
         return
     wall_set.add((wx, wy))
-    gx, gy = int(wx), int(wy)
+    gx, gy = int(wx / GRID_RES), int(wy / GRID_RES)
     wall_grid[(gx, gy)].add((wx, wy))
 
 def observe(bx, by):
@@ -79,10 +80,10 @@ def observe(bx, by):
                 hy = by + sin_a * (step_i * 0.1 - HIT_BACKOFF)
                 _add_point(_snap(hx), _snap(hy))
                 break
-
 def get_nearby_points(bx, by):
-    gx0, gy0 = int(bx - DECIDE_RADIUS), int(by - DECIDE_RADIUS)
-    gx1, gy1 = int(bx + DECIDE_RADIUS), int(by + DECIDE_RADIUS)
+    """用grid索引取bx,by周围DECIDE_RADIUS内的点"""
+    gx0, gy0 = int((bx - DECIDE_RADIUS) / GRID_RES), int((by - DECIDE_RADIUS) / GRID_RES)
+    gx1, gy1 = int((bx + DECIDE_RADIUS) / GRID_RES), int((by + DECIDE_RADIUS) / GRID_RES)
     nearby = []
     for gx in range(gx0, gx1 + 1):
         for gy in range(gy0, gy1 + 1):
@@ -93,8 +94,32 @@ def get_nearby_points(bx, by):
     return nearby
 
 # ═══════════════════════════════════════════
-# Decide: 递归增量多边形
+# Grid状态机: active(≤R) / archived(>R)
 # ═══════════════════════════════════════════
+
+grid_cells = {}  # {(gx,gy): {'status': 'active'|'archived', 'gate': (fx,fy,tx,ty)|None}}
+
+def update_grid_status(bx, by):
+    """根据机器人位置更新所有非空grid的状态。"""
+    for (gx, gy), pts in wall_grid.items():
+        cx, cy = (gx + 0.5) * GRID_RES, (gy + 0.5) * GRID_RES
+        dist = math.hypot(cx - bx, cy - by)
+        new_status = 'active' if dist <= DECIDE_RADIUS else 'archived'
+        if (gx, gy) not in grid_cells:
+            grid_cells[(gx, gy)] = {'status': new_status, 'gate': None}
+        else:
+            grid_cells[(gx, gy)]['status'] = new_status
+
+def classify_gate_line(fx, fy, tx, ty):
+    """判断黄线是真门还是archived衔接。
+    两端grid都archived→'gray'，否则None(保留原色)。"""
+    g1 = (int(fx / GRID_RES), int(fy / GRID_RES))
+    g2 = (int(tx / GRID_RES), int(ty / GRID_RES))
+    s1 = grid_cells.get(g1, {}).get('status', 'active')
+    s2 = grid_cells.get(g2, {}).get('status', 'active')
+    if s1 == 'archived' and s2 == 'archived':
+        return 'gray'
+    return None  # 保留原色（真门黄线）
 
 def polygon_boundary(points, bx, by):
     n = len(points)
@@ -159,8 +184,20 @@ def polygon_boundary(points, bx, by):
 
 
 def decide(bx, by):
+    update_grid_status(bx, by)
     points = get_nearby_points(bx, by)
-    return polygon_boundary(points, bx, by)
+    raw_lines = polygon_boundary(points, bx, by)
+
+    # 分类：archived衔接→灰线，真门→黄线保留
+    lines = []
+    for fx, fy, tx, ty, color in raw_lines:
+        if color == 'yellow':
+            gcolor = classify_gate_line(fx, fy, tx, ty)
+            if gcolor:
+                lines.append((fx, fy, tx, ty, gcolor))  # 灰线
+                continue
+        lines.append((fx, fy, tx, ty, color))
+    return lines
 
 # ═══════════════════════════════════════════
 # 选门：从黄线中选朝终点最近的门
@@ -434,7 +471,12 @@ if gate:
     path = astar_to(bx, by, gate[0], gate[1])
     dots = path_to_yellow_dots(path) if path else []
     print(f"  [GATE] →({gate[0]:.1f},{gate[1]:.1f}) path={len(path) if path else 0} dots={len(dots)}", flush=True)
-print(f"  [DECIDE] nearby={len(get_nearby_points(bx,by))} blues={sum(1 for _,_,_,_,c in lines if c=='blue')} yellows={sum(1 for _,_,_,_,c in lines if c=='yellow')}", flush=True)
+    blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
+    yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
+    grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
+    active = sum(1 for v in grid_cells.values() if v['status'] == 'active')
+    archived = sum(1 for v in grid_cells.values() if v['status'] == 'archived')
+    print(f"  [DECIDE] nearby={len(get_nearby_points(bx,by))} blues={blues} yellows={yellows} grays={grays} grids active={active} archived={archived}", flush=True)
 
 print(f"=== Pipeline running. 关闭窗口退出 ===", flush=True)
 
@@ -464,7 +506,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
             blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
             yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-            print(f"  [D] step={step} wall_set={len(wall_set)} blues={blues} yellows={yellows}"
+            grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
+            print(f"  [D] step={step} wall_set={len(wall_set)} blues={blues} yellows={yellows} grays={grays}"
                   + (f" gate=({gate[0]:.1f},{gate[1]:.1f}) dots={len(dots)}" if gate else " gate=None"),
                   flush=True)
 
