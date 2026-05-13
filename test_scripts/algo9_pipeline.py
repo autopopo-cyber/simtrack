@@ -22,12 +22,12 @@ LIDAR_RANGE = 15.0; LIDAR_RAYS = 120
 LIDAR_STEPS = int(LIDAR_RANGE / 0.1)
 DECIDE_RADIUS = 15.0
 GAP_YELLOW_M = 1.0
-GRID_RES = 0.5  # 0.5m grid（10m=400格）
+GRID_RES = 1  # 1m grid
 HIT_BACKOFF = 0.2
 OBSERVE_TICK = 20; DECIDE_TICK = 200; RENDER_SKIP = 20
 LINE_RADIUS = 0.08
 
-SPEED = 5.0; SPEED_MAX = 8.0; MIN_SPEED = 3.0; SPEED_FACTOR = 2.0
+SPEED = 2.0; SPEED_MAX = 8.0; MIN_SPEED = 1.0; SPEED_FACTOR = 2.0
 YAW_RATE = 6.0
 BOUNCE_FORCE_DURATION = 0.3
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
@@ -204,17 +204,19 @@ def decide(bx, by):
 # ═══════════════════════════════════════════
 
 def pick_gate(lines, bx, by):
-    """选门：宽门且近的优先。score = 门宽度 - 到机器人距离。
-    取最大值。Returns (gate_wx, gate_wy) or None."""
+    """选门：宽门且近的优先。黄线满分，灰线扣5分（降级）。
+    Returns (gate_wx, gate_wy) or None."""
     best = None
     best_score = -float('inf')
     for fx, fy, tx, ty, color in lines:
-        if color != 'yellow':
+        if color not in ('yellow', 'gray'):
             continue
-        width = math.hypot(tx - fx, ty - fy)          # 门宽
+        width = math.hypot(tx - fx, ty - fy)
         mx, my = (fx + tx) / 2, (fy + ty) / 2
-        dist = math.hypot(mx - bx, my - by)            # 到机器人距离
+        dist = math.hypot(mx - bx, my - by)
         score = width - dist
+        if color == 'gray':
+            score -= 5  # 灰线降级
         if score > best_score:
             best_score = score
             best = (mx, my)
@@ -386,13 +388,12 @@ def _rotation_matrix_z_to_xy(dx, dy):
         [-ux,      -uy,       0]
     ], dtype=np.float64)
 
-def draw_lines(user_scn, lines, extras=None):
-    """画多边形线。extras=[(fx,fy,tx,ty,color),...]额外线段"""
+def draw_scene(user_scn, lines, robot_trail, path_dots, bx, by):
+    """画完整场景：线段(蓝/黄/灰/绿) + 蓝球(轨迹) + 黄球(路径) + 绿球(机器人)"""
     user_scn.ngeom = 0
-    all_lines = list(lines)
-    if extras:
-        all_lines.extend(extras)
-    for fx, fy, tx, ty, color in all_lines:
+
+    # 线段
+    for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom:
             break
         geom = user_scn.geoms[user_scn.ngeom]
@@ -408,12 +409,37 @@ def draw_lines(user_scn, lines, extras=None):
         mujoco.mjv_initGeom(
             geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
             np.array([LINE_RADIUS, max(d / 2, 0.01), 0], dtype=np.float64),
-            mid,
-            np.eye(3, dtype=np.float64).flatten(),
+            mid, np.eye(3, dtype=np.float64).flatten(),
             np.array(rgba, dtype=np.float32)
         )
         geom.mat[:] = _rotation_matrix_z_to_xy(tx - fx, ty - fy)
         user_scn.ngeom += 1
+
+    # 蓝球（机器人轨迹，每1秒一个）
+    for wx, wy in robot_trail:
+        if user_scn.ngeom >= user_scn.maxgeom: break
+        _add_sphere(user_scn, wx, wy, 0.15, [0.2, 0.5, 1.0, 0.8])
+
+    # 黄球（路径点）
+    for wx, wy in path_dots:
+        if user_scn.ngeom >= user_scn.maxgeom: break
+        _add_sphere(user_scn, wx, wy, 0.15, [1.0, 0.9, 0.1, 0.9])
+
+    # 绿球（机器人当前位置）
+    _add_sphere(user_scn, bx, by, 0.2, [0.2, 1.0, 0.2, 0.9])
+
+
+def _add_sphere(user_scn, wx, wy, radius, rgba):
+    if user_scn.ngeom >= user_scn.maxgeom: return
+    geom = user_scn.geoms[user_scn.ngeom]
+    mujoco.mjv_initGeom(
+        geom, mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.array([radius, 0, 0], dtype=np.float64),
+        np.array([wx, wy, 1.0], dtype=np.float64),
+        np.eye(3, dtype=np.float64).flatten(),
+        np.array(rgba, dtype=np.float32)
+    )
+    user_scn.ngeom += 1
 
 # ═══════════════════════════════════════════
 # MuJoCo场景
@@ -467,6 +493,8 @@ lines = decide(bx, by)
 gate = pick_gate(lines, bx, by)
 dots = []
 dot_idx = 0
+robot_trail = [(bx, by)]
+path_dots = []
 if gate:
     path = astar_to(bx, by, gate[0], gate[1])
     dots = path_to_yellow_dots(path) if path else []
@@ -500,9 +528,15 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if gate:
                 path = astar_to(bx, by, gate[0], gate[1])
                 dots = path_to_yellow_dots(path) if path else []
+                path_dots = dots[:]
                 dot_idx = 0
             else:
                 dots = []
+                path_dots = []
+
+            # 每1秒记录机器人位置（蓝球轨迹）
+            if step > 0:
+                robot_trail.append((bx, by))
 
             blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
             yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
@@ -526,10 +560,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             print(f"\n  ★ ARRIVED! @({bx:.1f},{by:.1f}) step={step}", flush=True)
             break
 
-        # render: 多边形 + 黄点路径
+        # render: 多边形 + 黄点线段 + 球
+        all_lines = list(lines)
         extras = yellow_dots_to_lines(dots[dot_idx:], bx, by) if dots and dot_idx < len(dots) else []
+        all_lines.extend(extras)
         if step % RENDER_SKIP == 0:
-            draw_lines(v.user_scn, lines, extras)
+            draw_scene(v.user_scn, all_lines, robot_trail, path_dots, bx, by)
             v.sync()
 
         step += 1
