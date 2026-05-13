@@ -196,7 +196,13 @@ def polygon_boundary(points, bx, by):
     for k in range(len(poly)):
         fx, fy = poly[k]; tx, ty = poly[(k+1)%len(poly)]
         d = math.hypot(tx-fx, ty-fy)
-        lines.append((fx, fy, tx, ty, 'yellow' if d > GAP_YELLOW_M else 'blue'))
+        color = 'yellow' if d > GAP_YELLOW_M else 'blue'
+        # 长线段检查中点：如果穿墙→改蓝线
+        if color == 'yellow':
+            mx, my = (fx+tx)/2, (fy+ty)/2
+            if is_obstacle_world(mx, my):
+                color = 'blue'
+        lines.append((fx, fy, tx, ty, color))
     return lines
 
 def decide_visual(bx, by):
