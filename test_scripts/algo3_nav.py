@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""萤火算法 Firefly v3 SLAM — 字典地图 + 可变体素A* + far探索
+"""萤火 V3 多边形导航 — 历史墙累积+多边形门可视化
 
-可变体素:
-  细格 0.1m — LIDAR精度, 边缘/门检测
-  粗格 0.5m — A*寻路, 5×5细格聚合
-  粗格状态: 全FREE→FREE, 有WALL→WALL, 否则UNKNOWN
-  A*节点减少~25×, 配合缓存→O(1)查粗格
+基于 v3-polygon-stable。V3导航(find_gates+A*+Mover)+每1秒多边形边界绘制。
+历史墙: saved_blues永久保留，黄线门从多边形端点产生，wall_set采样消穿墙假门。
 """
 
 import sys, os, math, time, random, heapq, json
@@ -23,7 +20,7 @@ SCAN_STATE = os.path.join(SCAN_DIR, "scan_dict.npz")
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 SCALE = 2.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-SAFE_R = 0.5; SPEED = 4.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
+SAFE_R = 0.5; SPEED = 5.0; SPEED_MAX = 8.0; YAW_RATE = 6.0
 LIDAR_RANGE = 15.0
 
 VOXEL = 0.1                                   # 细格精度
@@ -219,22 +216,6 @@ def decide_visual(bx, by):
     if len(nearby) < 3:
         return []
     return polygon_boundary(nearby, bx, by)
-
-def pick_gate_polygon(lines, bx, by):
-    """从多边形黄线中选门：最长门优先（宽度-距离×0.5）"""
-    best = None
-    best_score = -float('inf')
-    for fx, fy, tx, ty, color in lines:
-        if color != 'yellow':
-            continue
-        width = math.hypot(tx-fx, ty-fy)
-        mx, my = (fx+tx)/2, (fy+ty)/2
-        dist = math.hypot(mx-bx, my-by)
-        score = width - dist * 0.5
-        if score > best_score:
-            best_score = score
-            best = (mx, my)
-    return best
 
 def _rot_z_to_xy(dx, dy):
     L = math.hypot(dx, dy)
@@ -615,54 +596,63 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % LIDAR_TICK == 0:
             scan(bx, by)
 
-        if step % 200 == 0:
-            # 1Hz: polygon → 选门 + 可视化
-            bx_w, by_w = d.qpos[0], d.qpos[1]
-            lines = decide_visual(bx_w, by_w)
-            
-            # 选门 (仅在无路径时)
-            if path is None or path_idx >= len(path):
-                gate_wp = pick_gate_polygon(lines, bx_w, by_w)
-                if gate_wp:
-                    print(f"  [DEBUG] gate_wp=({gate_wp[0]:.1f},{gate_wp[1]:.1f})", flush=True)
-                else:
-                    # debug: dump yellow lines
-                    yl = [(fx,fy,tx,ty) for fx,fy,tx,ty,c in lines if c=='yellow']
-                    print(f"  [DEBUG] gate_wp=None yellows_dump={yl[:3]}", flush=True)
-                if gate_wp:
-                    gx, gy = gate_wp
-                    gvx, gvy = int(gx/VOXEL), int(gy/VOXEL)
-                    path = astar_to(vx, vy, gvx, gvy)
-                    if path:
-                        path_idx = 0
-                        balls.clear_gates()
-                        balls.add_gate(gx, gy)
-                        blues = sum(1 for _,_,_,_,c in lines if c=='blue')
-                        yellows = sum(1 for _,_,_,_,c in lines if c=='yellow')
-                        print(f"  [GATE] [{step}] →({gx:.1f},{gy:.1f}) path={len(path)} blues={blues} yellows={yellows}", flush=True)
-                if not gate_wp:
-                    no_gate_count += 1
-                    if no_gate_count > 20:
-                        mv._bounce(90, 180)
-                        no_gate_count = 0
-            
-            # 画多边形
-            if lines:
-                blues = sum(1 for _,_,_,_,c in lines if c=='blue')
-                yellows = sum(1 for _,_,_,_,c in lines if c=='yellow')
-                print(f"  [VIS] step={step} blues={blues} yellows={yellows}", flush=True)
-                draw_polygon(v.user_scn, lines)
-                v.sync()
+        if path is None or path_idx >= len(path):
+            gates, came_from = find_gates(vx, vy)
+            gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
+
+            if gate is not None:
+                cg, gx, gy = gate
+                path = fine_path(vx, vy, gx, gy, came_from)
+                path_idx = 0; wander = 0; last_dist = 999
+                no_gate_count = 0
+                gate_wx, gate_wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
+                balls.clear_gates()
+                balls.add_gate(gate_wx, gate_wy)
+                print(f"  [GATE] [{step}] →({gate_wx:.1f},{gate_wy:.1f}) path={len(path)} gates={len(gates)} F={_cnt[FREE]} W={_cnt[WALL]}", flush=True)
+            else:
+                no_gate_count += 1
+                if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
+                    # 遍历路标从近到远, 第一个可达的就跳
+                    saved = False
+                    for i in range(len(milestones)-2, -1, -1):
+                        mx, my = milestones[i]
+                        bp = astar_to(vx, vy, mx, my)
+                        if bp:
+                            path = bp; path_idx = 0; wander = 0; last_dist = 999
+                            balls.clear_gates()
+                            print(f"  [BACK] [{step}] →路标#{i}({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                            no_gate_count = 0
+                            saved = True
+                            break
+                    if not saved:
+                        if no_gate_count < 10: mv._bounce(90, 180)
+                        else: mv._bounce(150, 210)  # 死胡同加大转角
 
         if path is not None and path_idx < len(path):
             tx, ty = path[path_idx]
-            if math.hypot(tx-bx, ty-by) < ARRIVE_THRESH:
+            ddist = math.hypot(tx-bx, ty-by)
+            if ddist < ARRIVE_THRESH:
                 path_idx += 1
+                last_dist = 999; wander = 0
+            elif ddist > last_dist * WANDER_DRIFT_RATIO:
+                wander += 1
+                if wander > WANDER_TIMEOUT:
+                    for mx, my in reversed(milestones[-RESCUE_MS_COUNT:]):
+                        if line_clear(vx, vy, mx, my):
+                            path = [((mx+0.5)*VOXEL, (my+0.5)*VOXEL)]
+                            path_idx = 0; wander = 0; last_dist = 999
+                            print(f"  [LOST] [{step}] →路标({(mx+0.5)*VOXEL:.1f},{(my+0.5)*VOXEL:.1f})", flush=True)
+                            break
+                    else:
+                        path = None; path_idx = 0; wander = 0; last_dist = 999
+                        print(f"  [LOST] [{step}] 重新规划", flush=True)
+                else:
+                    last_dist = ddist; mv.step(tx, ty, step)
             else:
+                wander = max(0, wander-1); last_dist = ddist
                 mv.step(tx, ty, step)
-        elif path is not None:
-            # 路径走完，置空等下一轮重规划
-            path = None
+        else:
+            mv._bounce(90, 180)
 
         step += 1
         # ── 终点检测 ──
@@ -675,7 +665,16 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % RENDER_SKIP == 0:
             v.sync()
 
-
+        # 每1秒更新多边形可视化
+        if step % 200 == 0:
+            lines = decide_visual(d.qpos[0], d.qpos[1])
+            if lines:
+                blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
+                yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
+                grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
+                print(f"  [VIS] step={step} blues={blues} yellows={yellows} grays={grays}", flush=True)
+                draw_polygon(v.user_scn, lines)
+                v.sync()
 
     save_state()
     print(f"done: ms={len(milestones)} step={step} t={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
