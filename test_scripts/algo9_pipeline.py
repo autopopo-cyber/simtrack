@@ -204,8 +204,8 @@ def decide(bx, by):
 # ═══════════════════════════════════════════
 
 def pick_gate(lines, bx, by):
-    """选门：宽门且近的优先。黄线满分，灰线扣5分（降级）。
-    Returns (gate_wx, gate_wy) or None."""
+    """选门：宽门+近门+朝终点方向。score = width - dist - angle_penalty。
+    灰线扣5分降级。Returns (gate_wx, gate_wy) or None."""
     best = None
     best_score = -float('inf')
     for fx, fy, tx, ty, color in lines:
@@ -214,9 +214,18 @@ def pick_gate(lines, bx, by):
         width = math.hypot(tx - fx, ty - fy)
         mx, my = (fx + tx) / 2, (fy + ty) / 2
         dist = math.hypot(mx - bx, my - by)
-        score = width - dist
+
+        # 方向惩罚：门方向偏离终点越远扣分越多
+        ang_gate = math.atan2(my - by, mx - bx)
+        ang_finish = math.atan2(FINISH[1] - by, FINISH[0] - bx)
+        angle_diff = abs(ang_gate - ang_finish)
+        if angle_diff > math.pi:
+            angle_diff = 2 * math.pi - angle_diff
+        angle_penalty = angle_diff * 8  # 每弧度扣8分
+
+        score = width - dist - angle_penalty
         if color == 'gray':
-            score -= 5  # 灰线降级
+            score -= 5
         if score > best_score:
             best_score = score
             best = (mx, my)
