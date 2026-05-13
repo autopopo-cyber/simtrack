@@ -184,41 +184,26 @@ def polygon_boundary(points, bx, by):
 
 
 def decide(bx, by):
-    update_grid_status(bx, by)
-    points = get_nearby_points(bx, by)
-    raw_lines = polygon_boundary(points, bx, by)
-
-    # 分类：archived衔接→灰线，真门→黄线保留
-    lines = []
-    for fx, fy, tx, ty, color in raw_lines:
-        if color == 'yellow':
-            gcolor = classify_gate_line(fx, fy, tx, ty)
-            if gcolor:
-                lines.append((fx, fy, tx, ty, gcolor))  # 灰线
-                continue
-        lines.append((fx, fy, tx, ty, color))
-    return lines
+    """全量polygon：取所有wall_set点做递归增量多边形。"""
+    points = list(wall_set)
+    return polygon_boundary(points, bx, by)
 
 # ═══════════════════════════════════════════
 # 选门：从黄线中选朝终点最近的门
 # ═══════════════════════════════════════════
 
 def pick_gate(lines, bx, by):
-    """选门：宽门+远门优先（最远门=未探索区域，和V3 far模式一致）。
-    灰线扣5分降级。Returns (gate_wx, gate_wy) or None."""
+    """选门：宽门+远门优先（最远门=未探索区域，V3 far模式）。
+    Returns (gate_wx, gate_wy) or None."""
     best = None
     best_score = -float('inf')
     for fx, fy, tx, ty, color in lines:
-        if color not in ('yellow', 'gray'):
+        if color != 'yellow':
             continue
         width = math.hypot(tx - fx, ty - fy)
         mx, my = (fx + tx) / 2, (fy + ty) / 2
         dist = math.hypot(mx - bx, my - by)
-
-        # far模式：远门加分（鼓励探索未探索区域）
-        score = width + dist * 0.5  # 宽且远的门优先
-        if color == 'gray':
-            score -= 5
+        score = width + dist * 0.5
         if score > best_score:
             best_score = score
             best = (mx, my)
@@ -503,10 +488,7 @@ if gate:
     print(f"  [GATE] →({gate[0]:.1f},{gate[1]:.1f}) path={len(path) if path else 0} dots={len(dots)}", flush=True)
     blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
     yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-    grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
-    active = sum(1 for v in grid_cells.values() if v['status'] == 'active')
-    archived = sum(1 for v in grid_cells.values() if v['status'] == 'archived')
-    print(f"  [DECIDE] nearby={len(get_nearby_points(bx,by))} blues={blues} yellows={yellows} grays={grays} grids active={active} archived={archived}", flush=True)
+    print(f"  [DECIDE] wall_set={len(wall_set)} blues={blues} yellows={yellows}", flush=True)
 
 print(f"=== Pipeline running. 关闭窗口退出 ===", flush=True)
 
@@ -542,8 +524,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
             blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
             yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-            grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
-            print(f"  [D] step={step} wall_set={len(wall_set)} blues={blues} yellows={yellows} grays={grays}"
+            print(f"  [D] step={step} wall_set={len(wall_set)} blues={blues} yellows={yellows}"
                   + (f" gate=({gate[0]:.1f},{gate[1]:.1f}) dots={len(dots)}" if gate else " gate=None"),
                   flush=True)
 
