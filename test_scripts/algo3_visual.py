@@ -59,6 +59,8 @@ FINISH = (3.0, 95.0)
 HIT_BACKOFF = 0.2   # 激光后退距离
 GAP_YELLOW_M = 1.0  # 黄线/蓝线阈值
 DECIDE_RADIUS = 10.0  # polygon决策半径
+VIRTUAL_CONE_DEG = 90  # 虚拟门前方锥形角度
+VIRTUAL_RANGE = 15.0   # 虚拟锚点最远距离
 
 # 墙体点集（供可视化）
 wall_set = set()
@@ -248,39 +250,41 @@ def incremental_update(bx, by):
     
     # 3. 追链 → 蓝线
     new_lines = []
-    new_endpoints = []
-    for comp in comps:
+    new_endpoints = []  # [(x,y,comp_id), ...]
+    for ci, comp in enumerate(comps):
         chains = _trace_chain(comp)
         for chain in chains:
             if len(chain) < 2: continue
             for i in range(len(chain)-1):
                 new_lines.append((chain[i][0], chain[i][1], chain[i+1][0], chain[i+1][1], 'blue'))
-            # 端点
-            new_endpoints.append(chain[0])
-            new_endpoints.append(chain[-1])
+            # 端点 (带来源标记)
+            new_endpoints.append((chain[0][0], chain[0][1], ci))
+            new_endpoints.append((chain[-1][0], chain[-1][1], ci))
     
     # 4. 新旧端点对接
-    for ep in new_endpoints:
+    for ex, ey, _ in new_endpoints:
         # 找最近的旧端点
         best_d, best_old = 999, None
         for (ox, oy) in saved_eps:
-            d = math.hypot(ep[0]-ox, ep[1]-oy)
+            d = math.hypot(ex-ox, ey-oy)
             if d < best_d:
                 best_d = d
                 best_old = (ox, oy)
         if best_old and best_d < 2.0:
             color = 'blue' if best_d <= GAP_YELLOW_M else 'yellow'
-            new_lines.append((ep[0], ep[1], best_old[0], best_old[1], color))
+            new_lines.append((ex, ey, best_old[0], best_old[1], color))
     
-    # 5. 新端点间互连
+    # 5. 新端点间互连 (不同来源才连)
     for i in range(len(new_endpoints)):
         for j in range(i+1, len(new_endpoints)):
-            d = math.hypot(new_endpoints[i][0]-new_endpoints[j][0],
-                          new_endpoints[i][1]-new_endpoints[j][1])
+            ex1, ey1, c1 = new_endpoints[i]
+            ex2, ey2, c2 = new_endpoints[j]
+            if c1 == c2:
+                continue  # 同源不连，避免门线跟墙平行
+            d = math.hypot(ex1-ex2, ey1-ey2)
             if d < 3.0:
                 color = 'blue' if d <= GAP_YELLOW_M else 'yellow'
-                new_lines.append((new_endpoints[i][0], new_endpoints[i][1],
-                                  new_endpoints[j][0], new_endpoints[j][1], color))
+                new_lines.append((ex1, ey1, ex2, ey2, color))
     
     # 6. 持久化：新蓝线端点存入saved_eps，蓝线段存入saved_blues
     for fx, fy, tx, ty, c in new_lines:
