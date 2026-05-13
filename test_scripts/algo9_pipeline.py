@@ -464,7 +464,7 @@ def build_xml():
     <light pos="50 50 80" dir="0 0 -1"/>
     {FINISH_XML}
     <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
-    <body name="bot" pos="{START_POS[0]} {START_POS[1]} 0.5">
+    <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <geom type="cylinder" size="0.5 0.5" rgba="1 0.3 0 1" friction="0 0 0"/>
