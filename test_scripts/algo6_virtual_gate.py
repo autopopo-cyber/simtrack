@@ -382,8 +382,8 @@ def main():
             bx, by = d.qpos[0], d.qpos[1]
             v.cam.lookat[:] = np.array([bx, by, 0.5], dtype=np.float64)
 
-            # 键盘移动机器人 (WASD)
-            _handle_keyboard(v, d, m)
+            # 自动移动
+            heading = _handle_keyboard(v, d, m, heading)
 
             # 观察 10Hz
             if step % OBSERVE_TICK == 0:
@@ -406,14 +406,20 @@ def main():
     print(f"done: step={step} walls={len(wall_voxels)}", flush=True)
 
 
-def _handle_keyboard(v, d, m):
-    """WASD 移动机器人 (测试用)。"""
-    speed = 3.0
+def _handle_keyboard(v, d, m, heading):
+    """自动缓慢前进 + 左右转向，探索不同区域。按Q退出。"""
+    speed = 2.0
     dt = m.opt.timestep
-    # 读取键盘状态来移动机器人
-    # (mujoco.viewer 的键盘处理比较原始，这里简化)
-    # 实际使用: 通过 v.user_scn 或其他方式
-    pass  # 保持机器人不动，纯扫描
+    # 自动向前 + 缓慢右转（绕圈探索）
+    new_heading = heading + 0.3 * dt  # 缓慢右转
+    d.qpos[0] += math.cos(new_heading) * speed * dt
+    d.qpos[1] += math.sin(new_heading) * speed * dt
+    # 保持在赛道内(粗略)
+    if not (0 < d.qpos[0] < 100 and 0 < d.qpos[1] < 100):
+        d.qpos[0] = max(1, min(99, d.qpos[0]))
+        d.qpos[1] = max(1, min(99, d.qpos[1]))
+        new_heading = heading + math.pi  # 掉头
+    return new_heading
 
 
 if __name__ == '__main__':
