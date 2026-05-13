@@ -76,13 +76,15 @@ wall_distance = 在光斑里选离墙最远的
 
 体素1m太粗，绕障碍物不优雅。到此为止，不改了。标签 `v1.0-firefly-1m` 永远封存。
 
-### 第三代：0.1m精度（algo3_firefly.py）⚡ ← 你在这里
+### 第三代：0.1m精度（algo3_firefly.py）🔒
 
-体素降级为布尔表。障碍物永远保持0.1m间隙。门/路径/前线不变。
+体素降级为字典SLAM。find_gates + far模式 + 三级跳A* → 跑完全程。
 
 ```
-500×500 bool数组 · 31KB · A*秒达任意两点
+字典SLAM · 0.1m精度 · find_gates+far+A* · 主人跑完全程 🏆
 ```
+
+🔒 锁定: `v3-locked` (commit 0e4097c) — 跟 V2 一样，以后不改。
 
 ---
 
