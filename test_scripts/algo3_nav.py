@@ -58,9 +58,8 @@ GAP_YELLOW_M = 1.0
 DECIDE_RADIUS = 15.0  # 跟激光同范围
 DECIDE_TICK = 200  # 1Hz 多边形更新
 
-# 墙体点集 + 上一帧蓝线(用于merge消黄)
+# 墙体点集
 wall_set = set()
-prev_blues = []  # [(fx,fy,tx,ty), ...] 仅上一帧
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -212,45 +211,22 @@ def polygon_boundary(points, bx, by):
         lines.append((fx, fy, tx, ty, color))
     return lines
 
-def decide_with_history(bx, by):
-    """生成新多边形 + 跟上一帧merge消黄。Returns 当前帧全部线"""
-    global prev_blues
-
+def decide_frontline(bx, by, heading):
+    """生成多边形 + 黄线只保留前线(±90°)。Returns 当前帧全部线"""
     nearby = [(wx, wy) for wx, wy in wall_set if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS]
     if len(nearby) < 3:
-        return prev_blues  # 无新数据时沿用上一帧
-
+        return []
     new_lines = polygon_boundary(nearby, bx, by)
 
-    # Merge: 新黄线对照上一帧蓝线 → 重合→降蓝
-    # 收集上一帧蓝线的采样点 (每隔0.3m)
-    prev_samples = set()
-    for fx, fy, tx, ty in prev_blues:
-        _d = math.hypot(tx-fx, ty-fy)
-        steps = max(2, int(_d / 0.3))
-        for si in range(steps + 1):
-            sx = round(fx + (tx-fx)*si/steps, 1)
-            sy = round(fy + (ty-fy)*si/steps, 1)
-            prev_samples.add((sx, sy))
-
+    # 黄线在前线? 中点方向vs机器人朝向
     for i, (fx, fy, tx, ty, c) in enumerate(new_lines):
         if c != 'yellow':
             continue
-        # 黄线采样点命中上一帧蓝线 → 假门 → 降蓝
-        _d = math.hypot(tx-fx, ty-fy)
-        steps = max(3, int(_d / 0.3))
-        hit = False
-        for si in range(steps + 1):
-            sx = round(fx + (tx-fx)*si/steps, 1)
-            sy = round(fy + (ty-fy)*si/steps, 1)
-            if (sx, sy) in prev_samples:
-                hit = True
-                break
-        if hit:
+        mx, my = (fx+tx)/2, (fy+ty)/2
+        ang = math.atan2(my-by, mx-bx)
+        diff = abs((ang - heading + math.pi) % (2*math.pi) - math.pi)
+        if diff > math.radians(80):  # 后方 >80° → 降蓝
             new_lines[i] = (fx, fy, tx, ty, 'blue')
-
-    # 更新prev_blues为本帧蓝线
-    prev_blues = [(fx, fy, tx, ty) for fx, fy, tx, ty, c in new_lines if c == 'blue']
 
     return new_lines
 
@@ -261,27 +237,14 @@ def _rot_z_to_xy(dx, dy):
     return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
 
 def draw_polygon(user_scn, lines):
-    """画上一帧蓝线(暗淡) + 当前帧多边形"""
+    """画当前帧多边形 (蓝墙+前线黄门)"""
     user_scn.ngeom = 0
-    # 先画上一帧蓝线（暗淡）
-    for fx, fy, tx, ty in prev_blues:
-        if user_scn.ngeom >= user_scn.maxgeom: break
-        geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx+tx)/2, (fy+ty)/2, 0.8], dtype=np.float64)
-        d = math.hypot(tx-fx, ty-fy)
-        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.03, max(d/2, 0.01), 0], dtype=np.float64),
-            mid, np.eye(3, dtype=np.float64).flatten(),
-            np.array([0.15, 0.4, 0.8, 0.4], dtype=np.float32))
-        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
-        user_scn.ngeom += 1
-    # 再画当前帧线
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom: break
         geom = user_scn.geoms[user_scn.ngeom]
         mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
         d = math.hypot(tx-fx, ty-fy)
-        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
+        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0]}.get(color, [1,1,1,1])
         mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
             np.array([0.06, max(d/2, 0.01), 0], dtype=np.float64),
             mid, np.eye(3, dtype=np.float64).flatten(),
@@ -598,7 +561,7 @@ last_mx = last_my = 0
 path = None; path_idx = 0
 wander = 0; last_dist = 999
 no_gate_count = 0
-lines = []  # 当前黄线(持续可见)
+lines = []  # 当前帧多边形线
 
 if milestones:
     last_mx, last_my = milestones[-1]
@@ -718,9 +681,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         # 每1秒更新多边形可视化
         if step % DECIDE_TICK == 0:
-            lines = decide_with_history(d.qpos[0], d.qpos[1])
+            lines = decide_frontline(d.qpos[0], d.qpos[1], mv.yaw)
+            blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
             yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-            print(f"  [VIS] step={step} blues={len(prev_blues)} yellows={yellows}", flush=True)
+            print(f"  [VIS] step={step} blues={blues} yellows={yellows}", flush=True)
         draw_polygon(v.user_scn, lines)
         if step % RENDER_SKIP == 0:
             v.sync()
