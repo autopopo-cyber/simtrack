@@ -55,7 +55,7 @@ MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
 FINISH = (3.0, 95.0)
 HIT_BACKOFF = 0.2
 GAP_YELLOW_M = 1.0
-DECIDE_RADIUS = 10.0
+DECIDE_RADIUS = 15.0  # 跟激光同范围
 DECIDE_TICK = 200  # 1Hz 多边形更新
 
 # 墙体点集 + 上一帧蓝线(用于merge消黄)
