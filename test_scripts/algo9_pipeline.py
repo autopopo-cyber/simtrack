@@ -204,7 +204,7 @@ def decide(bx, by):
 # ═══════════════════════════════════════════
 
 def pick_gate(lines, bx, by):
-    """选门：宽门+近门+朝终点方向。score = width - dist - angle_penalty。
+    """选门：宽门+远门优先（最远门=未探索区域，和V3 far模式一致）。
     灰线扣5分降级。Returns (gate_wx, gate_wy) or None."""
     best = None
     best_score = -float('inf')
@@ -215,15 +215,8 @@ def pick_gate(lines, bx, by):
         mx, my = (fx + tx) / 2, (fy + ty) / 2
         dist = math.hypot(mx - bx, my - by)
 
-        # 方向惩罚：门方向偏离终点越远扣分越多
-        ang_gate = math.atan2(my - by, mx - bx)
-        ang_finish = math.atan2(FINISH[1] - by, FINISH[0] - bx)
-        angle_diff = abs(ang_gate - ang_finish)
-        if angle_diff > math.pi:
-            angle_diff = 2 * math.pi - angle_diff
-        angle_penalty = angle_diff * 8  # 每弧度扣8分
-
-        score = width - dist - angle_penalty
+        # far模式：远门加分（鼓励探索未探索区域）
+        score = width + dist * 0.5  # 宽且远的门优先
         if color == 'gray':
             score -= 5
         if score > best_score:
