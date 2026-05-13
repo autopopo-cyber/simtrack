@@ -552,8 +552,10 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if math.hypot(bx - tx, by - ty) < ARRIVE_THRESH:
                 dot_idx += 1
         elif gate:
-            # fallback：朝门走
             mv.step(gate[0], gate[1], step)
+
+        # 重新读取move后的真实位置
+        bx, by = d.qpos[0], d.qpos[1]
 
         # 终点检测
         if math.hypot(bx - FINISH[0], by - FINISH[1]) < 3.0:
@@ -569,5 +571,4 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             v.sync()
 
         step += 1
-
     print(f"done: step={step} wall_set={len(wall_set)} bounce={mv.bounce}", flush=True)
