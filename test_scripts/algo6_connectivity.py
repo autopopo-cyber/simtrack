@@ -142,47 +142,44 @@ def _find_components(points, adj):
     return list(comps.values())
 
 def _trace_component(comp, adj):
-    """追踪一个连通分量内部的所有线段。
-    返回 [(fx,fy,tx,ty,color), ...]，内部连线都是蓝色。
-    同时返回端点列表。
-    """
+    """追踪连通分量：从端点出发沿链走，画蓝线。"""
     lines = []
-    visited_edges = set()
-    endpoints = []
-
-    for p in comp:
-        neighbors = list(adj.get(p, set()) & set(comp))
-        if len(neighbors) <= 1:
-            endpoints.append(p)
+    comp_set = set(comp)
+    # 计算每个点的度
+    degree = {p: len(adj.get(p, set()) & comp_set) for p in comp}
+    endpoints = [p for p, d in degree.items() if d <= 1]
 
     if not endpoints:
-        # 闭环：取任意点做起点
-        endpoints = [comp[0], comp[0]]
+        # 闭环：取任意点，走一圈
+        endpoints = [comp[0]]
 
-    # BFS遍历整条链，画蓝线
+    visited = set()
+
     for start in endpoints:
-        if start in visited_edges:
+        if start in visited:
             continue
-        stack = [start]
-        parent = {start: None}
-        ordered = []
-        while stack:
-            cur = stack.pop()
-            ordered.append(cur)
-            for nb in adj.get(cur, set()) & set(comp):
-                if nb not in parent:
-                    parent[nb] = cur
-                    stack.append(nb)
+        # 沿链走：每次选一个未访问邻居
+        cur = start
+        visited.add(cur)
+        chain = [cur]
+        while True:
+            neighbors = [n for n in (adj.get(cur, set()) & comp_set) if n not in visited]
+            if not neighbors:
+                break
+            # 优先选最接近当前方向的邻居
+            if len(chain) >= 2:
+                dx, dy = chain[-1][0] - chain[-2][0], chain[-1][1] - chain[-2][1]
+                nxt = min(neighbors, key=lambda n: abs(math.atan2(
+                    n[1]-cur[1], n[0]-cur[0]) - math.atan2(dy, dx)))
+            else:
+                nxt = neighbors[0]
+            cur = nxt
+            visited.add(cur)
+            chain.append(cur)
 
-        # 去重后画线
-        seen = set()
-        for cur in ordered:
-            for nb in adj.get(cur, set()) & set(comp):
-                edge = (min(cur, nb), max(cur, nb))
-                if edge not in seen:
-                    seen.add(edge)
-                    lines.append((cur[0], cur[1], nb[0], nb[1], 'blue'))
-        visited_edges.update(ordered)
+        # 沿chain顺序画线
+        for i in range(len(chain) - 1):
+            lines.append((chain[i][0], chain[i][1], chain[i+1][0], chain[i+1][1], 'blue'))
 
     return lines, endpoints
 
