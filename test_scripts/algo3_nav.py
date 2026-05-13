@@ -53,12 +53,14 @@ RESCUE_MS_COUNT = 5
 FIXED_SEED = random.randint(0, 999999)
 MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
 FINISH = (3.0, 95.0)
-HIT_BACKOFF = 0.2   # 激光后退距离
-GAP_YELLOW_M = 1.0  # 黄线/蓝线阈值
-DECIDE_RADIUS = 10.0  # polygon决策半径
+HIT_BACKOFF = 0.2
+GAP_YELLOW_M = 1.0
+DECIDE_RADIUS = 10.0
+DECIDE_TICK = 200  # 1Hz 多边形更新
 
-# 墙体点集（供可视化）
+# 墙体点集 + 历史蓝线
 wall_set = set()
+saved_blues = []  # [(fx,fy,tx,ty), ...] 永久保留的历史蓝线
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -210,12 +212,19 @@ def polygon_boundary(points, bx, by):
         lines.append((fx, fy, tx, ty, color))
     return lines
 
-def decide_visual(bx, by):
-    """取附近墙体点做polygon"""
+def decide_with_history(bx, by):
+    """生成新多边形 + 蓝线存入历史。Returns 当前黄线 [(fx,fy,tx,ty,'yellow'),...]"""
     nearby = [(wx, wy) for wx, wy in wall_set if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS]
     if len(nearby) < 3:
-        return []
-    return polygon_boundary(nearby, bx, by)
+        return []  # 无新数据，无黄线
+    new_lines = polygon_boundary(nearby, bx, by)
+    # 蓝线存入历史
+    for fx, fy, tx, ty, c in new_lines:
+        if c == 'blue':
+            saved_blues.append((fx, fy, tx, ty))
+    # 只返回本轮黄线
+    yellows = [(fx, fy, tx, ty, c) for fx, fy, tx, ty, c in new_lines if c == 'yellow']
+    return yellows
 
 def _rot_z_to_xy(dx, dy):
     L = math.hypot(dx, dy)
@@ -224,14 +233,28 @@ def _rot_z_to_xy(dx, dy):
     return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
 
 def draw_polygon(user_scn, lines):
-    """画多边形线到user_scn"""
+    """画历史蓝线(暗淡) + 当前黄门"""
     user_scn.ngeom = 0
+    # 先画历史蓝线（暗淡）
+    for fx, fy, tx, ty in saved_blues:
+        if user_scn.ngeom >= user_scn.maxgeom: break
+        geom = user_scn.geoms[user_scn.ngeom]
+        mid = np.array([(fx+tx)/2, (fy+ty)/2, 0.8], dtype=np.float64)
+        d = math.hypot(tx-fx, ty-fy)
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
+            np.array([0.03, max(d/2, 0.01), 0], dtype=np.float64),
+            mid, np.eye(3, dtype=np.float64).flatten(),
+            np.array([0.15, 0.4, 0.8, 0.5], dtype=np.float32))
+        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
+        user_scn.ngeom += 1
+    # 再画本轮黄门(亮)
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom: break
+        if color != 'yellow': continue
         geom = user_scn.geoms[user_scn.ngeom]
         mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
         d = math.hypot(tx-fx, ty-fy)
-        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
+        rgba = {'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
         mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
             np.array([0.06, max(d/2, 0.01), 0], dtype=np.float64),
             mid, np.eye(3, dtype=np.float64).flatten(),
@@ -546,8 +569,9 @@ for wx, wy in milestones:
 step = 0; t0 = time.time()
 last_mx = last_my = 0
 path = None; path_idx = 0
-no_gate_count = 0
 wander = 0; last_dist = 999
+no_gate_count = 0
+lines = []  # 当前黄线(持续可见)
 
 if milestones:
     last_mx, last_my = milestones[-1]
@@ -666,15 +690,13 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             v.sync()
 
         # 每1秒更新多边形可视化
-        if step % 200 == 0:
-            lines = decide_visual(d.qpos[0], d.qpos[1])
-            if lines:
-                blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
-                yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-                grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
-                print(f"  [VIS] step={step} blues={blues} yellows={yellows} grays={grays}", flush=True)
-                draw_polygon(v.user_scn, lines)
-                v.sync()
+        if step % DECIDE_TICK == 0:
+            lines = decide_with_history(d.qpos[0], d.qpos[1])
+            yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
+            print(f"  [VIS] step={step} saved_blues={len(saved_blues)} yellows={yellows}", flush=True)
+        draw_polygon(v.user_scn, lines)
+        if step % RENDER_SKIP == 0:
+            v.sync()
 
     save_state()
     print(f"done: ms={len(milestones)} step={step} t={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
