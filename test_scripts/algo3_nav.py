@@ -223,18 +223,30 @@ def decide_with_history(bx, by):
     new_lines = polygon_boundary(nearby, bx, by)
 
     # Merge: 新黄线对照上一帧蓝线 → 重合→降蓝
-    prev_eps = set()
+    # 收集上一帧蓝线的采样点 (每隔0.3m)
+    prev_samples = set()
     for fx, fy, tx, ty in prev_blues:
-        prev_eps.add((round(fx,1), round(fy,1)))
-        prev_eps.add((round(tx,1), round(ty,1)))
+        _d = math.hypot(tx-fx, ty-fy)
+        steps = max(2, int(_d / 0.3))
+        for si in range(steps + 1):
+            sx = round(fx + (tx-fx)*si/steps, 1)
+            sy = round(fy + (ty-fy)*si/steps, 1)
+            prev_samples.add((sx, sy))
 
     for i, (fx, fy, tx, ty, c) in enumerate(new_lines):
         if c != 'yellow':
             continue
-        # 黄线任一端点靠近上一帧蓝线端点 → 假门 → 降蓝
-        near = any(math.hypot(fx-ox, fy-oy) < 0.3 for (ox,oy) in prev_eps) or \
-               any(math.hypot(tx-ox, ty-oy) < 0.3 for (ox,oy) in prev_eps)
-        if near:
+        # 黄线采样点命中上一帧蓝线 → 假门 → 降蓝
+        _d = math.hypot(tx-fx, ty-fy)
+        steps = max(3, int(_d / 0.3))
+        hit = False
+        for si in range(steps + 1):
+            sx = round(fx + (tx-fx)*si/steps, 1)
+            sy = round(fy + (ty-fy)*si/steps, 1)
+            if (sx, sy) in prev_samples:
+                hit = True
+                break
+        if hit:
             new_lines[i] = (fx, fy, tx, ty, 'blue')
 
     # 更新prev_blues为本帧蓝线
@@ -249,8 +261,21 @@ def _rot_z_to_xy(dx, dy):
     return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
 
 def draw_polygon(user_scn, lines):
-    """画当前帧多边形 (蓝墙+黄门)"""
+    """画上一帧蓝线(暗淡) + 当前帧多边形"""
     user_scn.ngeom = 0
+    # 先画上一帧蓝线（暗淡）
+    for fx, fy, tx, ty in prev_blues:
+        if user_scn.ngeom >= user_scn.maxgeom: break
+        geom = user_scn.geoms[user_scn.ngeom]
+        mid = np.array([(fx+tx)/2, (fy+ty)/2, 0.8], dtype=np.float64)
+        d = math.hypot(tx-fx, ty-fy)
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
+            np.array([0.03, max(d/2, 0.01), 0], dtype=np.float64),
+            mid, np.eye(3, dtype=np.float64).flatten(),
+            np.array([0.15, 0.4, 0.8, 0.4], dtype=np.float32))
+        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
+        user_scn.ngeom += 1
+    # 再画当前帧线
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom: break
         geom = user_scn.geoms[user_scn.ngeom]
