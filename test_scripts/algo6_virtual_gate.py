@@ -384,6 +384,7 @@ def main():
 
             # 自动移动
             heading = _handle_keyboard(v, d, m, heading)
+            mujoco.mj_step(m, d)
 
             # 观察 10Hz
             if step % OBSERVE_TICK == 0:
@@ -407,13 +408,17 @@ def main():
 
 
 def _handle_keyboard(v, d, m, heading):
-    """自动缓慢前进 + 左右转向，探索不同区域。按Q退出。"""
+    """自动缓慢前进 + 左右转向，探索不同区域。"""
     speed = 2.0
     dt = m.opt.timestep
     # 自动向前 + 缓慢右转（绕圈探索）
-    new_heading = heading + 0.3 * dt  # 缓慢右转
+    new_heading = heading + 0.3 * dt
     d.qpos[0] += math.cos(new_heading) * speed * dt
     d.qpos[1] += math.sin(new_heading) * speed * dt
+    d.qpos[2] = 0.5  # 保持在地面
+    # 设朝向(四元数: z轴旋转)
+    half = new_heading / 2
+    d.qpos[3:7] = [math.cos(half), 0, 0, math.sin(half)]
     # 保持在赛道内(粗略)
     if not (0 < d.qpos[0] < 100 and 0 < d.qpos[1] < 100):
         d.qpos[0] = max(1, min(99, d.qpos[0]))
