@@ -202,20 +202,19 @@ def polygon_boundary(points, bx, by):
             _d = math.hypot(tx-fx, ty-fy)
             steps = max(4, int(_d / 0.3))
             is_wall = False
-            is_explored = False
+            free_hits = 0
             for i in range(1, steps):
                 sx = round(fx + (tx-fx)*i/steps, 1)
                 sy = round(fy + (ty-fy)*i/steps, 1)
                 if (sx, sy) in wall_set:
                     is_wall = True
                     break
-                # 检查体素：已探索区域→不是真门
                 vx, vy = int(sx/VOXEL), int(sy/VOXEL)
                 if gget(vx, vy) == FREE:
-                    is_explored = True
+                    free_hits += 1
             if is_wall:
                 color = 'blue'
-            elif is_explored:
+            elif free_hits >= max(2, steps // 3):
                 color = 'gray'
         lines.append((fx, fy, tx, ty, color))
     return lines
