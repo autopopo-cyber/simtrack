@@ -58,9 +58,9 @@ GAP_YELLOW_M = 1.0
 DECIDE_RADIUS = 10.0
 DECIDE_TICK = 200  # 1Hz 多边形更新
 
-# 墙体点集 + 历史蓝线
+# 墙体点集 + 上一帧蓝线(用于merge消黄)
 wall_set = set()
-saved_blues = []  # [(fx,fy,tx,ty), ...] 永久保留的历史蓝线
+prev_blues = []  # [(fx,fy,tx,ty), ...] 仅上一帧
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -213,18 +213,34 @@ def polygon_boundary(points, bx, by):
     return lines
 
 def decide_with_history(bx, by):
-    """生成新多边形 + 蓝线存入历史。Returns 当前黄线 [(fx,fy,tx,ty,'yellow'),...]"""
+    """生成新多边形 + 跟上一帧merge消黄。Returns 当前帧全部线"""
+    global prev_blues
+
     nearby = [(wx, wy) for wx, wy in wall_set if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS]
     if len(nearby) < 3:
-        return []  # 无新数据，无黄线
+        return prev_blues  # 无新数据时沿用上一帧
+
     new_lines = polygon_boundary(nearby, bx, by)
-    # 蓝线存入历史
-    for fx, fy, tx, ty, c in new_lines:
-        if c == 'blue':
-            saved_blues.append((fx, fy, tx, ty))
-    # 只返回本轮黄线
-    yellows = [(fx, fy, tx, ty, c) for fx, fy, tx, ty, c in new_lines if c == 'yellow']
-    return yellows
+
+    # Merge: 新黄线对照上一帧蓝线 → 重合→降蓝
+    prev_eps = set()
+    for fx, fy, tx, ty in prev_blues:
+        prev_eps.add((round(fx,1), round(fy,1)))
+        prev_eps.add((round(tx,1), round(ty,1)))
+
+    for i, (fx, fy, tx, ty, c) in enumerate(new_lines):
+        if c != 'yellow':
+            continue
+        # 黄线任一端点靠近上一帧蓝线端点 → 假门 → 降蓝
+        near = any(math.hypot(fx-ox, fy-oy) < 0.3 for (ox,oy) in prev_eps) or \
+               any(math.hypot(tx-ox, ty-oy) < 0.3 for (ox,oy) in prev_eps)
+        if near:
+            new_lines[i] = (fx, fy, tx, ty, 'blue')
+
+    # 更新prev_blues为本帧蓝线
+    prev_blues = [(fx, fy, tx, ty) for fx, fy, tx, ty, c in new_lines if c == 'blue']
+
+    return new_lines
 
 def _rot_z_to_xy(dx, dy):
     L = math.hypot(dx, dy)
@@ -233,28 +249,14 @@ def _rot_z_to_xy(dx, dy):
     return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
 
 def draw_polygon(user_scn, lines):
-    """画历史蓝线(暗淡) + 当前黄门"""
+    """画当前帧多边形 (蓝墙+黄门)"""
     user_scn.ngeom = 0
-    # 先画历史蓝线（暗淡）
-    for fx, fy, tx, ty in saved_blues:
-        if user_scn.ngeom >= user_scn.maxgeom: break
-        geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx+tx)/2, (fy+ty)/2, 0.8], dtype=np.float64)
-        d = math.hypot(tx-fx, ty-fy)
-        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.03, max(d/2, 0.01), 0], dtype=np.float64),
-            mid, np.eye(3, dtype=np.float64).flatten(),
-            np.array([0.15, 0.4, 0.8, 0.5], dtype=np.float32))
-        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
-        user_scn.ngeom += 1
-    # 再画本轮黄门(亮)
     for fx, fy, tx, ty, color in lines:
         if user_scn.ngeom >= user_scn.maxgeom: break
-        if color != 'yellow': continue
         geom = user_scn.geoms[user_scn.ngeom]
         mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
         d = math.hypot(tx-fx, ty-fy)
-        rgba = {'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
+        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
         mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
             np.array([0.06, max(d/2, 0.01), 0], dtype=np.float64),
             mid, np.eye(3, dtype=np.float64).flatten(),
@@ -693,7 +695,7 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % DECIDE_TICK == 0:
             lines = decide_with_history(d.qpos[0], d.qpos[1])
             yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-            print(f"  [VIS] step={step} saved_blues={len(saved_blues)} yellows={yellows}", flush=True)
+            print(f"  [VIS] step={step} blues={len(prev_blues)} yellows={yellows}", flush=True)
         draw_polygon(v.user_scn, lines)
         if step % RENDER_SKIP == 0:
             v.sync()
