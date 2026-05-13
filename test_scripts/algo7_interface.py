@@ -180,19 +180,21 @@ def decide(bx, by):
 # ═══════════════════════════════════════════
 
 def _rotation_matrix_z_to_xy(dx, dy):
-    """从Z轴(0,0,1)旋转到(dx,dy,0)方向的3x3矩阵"""
+    """从Z轴(0,0,1)旋转到(dx,dy,0)方向的3x3矩阵。
+
+    Rodrigues: axis=cross(Z,target)=(-dy/L, dx/L, 0), angle=π/2
+    R = [[dy²/L², -dx*dy/L², dx/L],
+         [-dx*dy/L², dx²/L², dy/L],
+         [-dx/L, -dy/L, 0]]
+    """
     L = math.hypot(dx, dy)
     if L < 0.001:
         return np.eye(3, dtype=np.float64)
     ux, uy = dx / L, dy / L
-    # Rodrigues: axis = (uy, -ux, 0), angle = π/2
-    # R = I + sinθ·K + (1-cosθ)·K²  with θ=π/2, sin=1, cos=0
-    # K = [[0,0,uy],[0,0,-ux],[-uy,ux,0]]
-    # R = I + K + K²
     return np.array([
-        [ux * ux,  ux * uy,  uy],
-        [ux * uy,  uy * uy, -ux],
-        [-uy,      ux,       0]
+        [ uy * uy, -ux * uy,  ux],
+        [-ux * uy,  ux * ux,  uy],
+        [-ux,      -uy,       0]
     ], dtype=np.float64)
 
 def draw_lines(user_scn, lines):
