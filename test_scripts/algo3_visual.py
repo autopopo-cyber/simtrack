@@ -658,6 +658,9 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % 200 == 0:
             lines = decide_visual(d.qpos[0], d.qpos[1])
             if lines:
+                blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
+                yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
+                print(f"  [VIS] step={step} blues={blues} yellows={yellows}", flush=True)
                 draw_polygon(v.user_scn, lines)
                 v.sync()
 
