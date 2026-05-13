@@ -624,6 +624,12 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
             if path is None or path_idx >= len(path):
                 gate_wp = pick_gate_polygon(lines, bx_w, by_w)
                 if gate_wp:
+                    print(f"  [DEBUG] gate_wp=({gate_wp[0]:.1f},{gate_wp[1]:.1f})", flush=True)
+                else:
+                    # debug: dump yellow lines
+                    yl = [(fx,fy,tx,ty) for fx,fy,tx,ty,c in lines if c=='yellow']
+                    print(f"  [DEBUG] gate_wp=None yellows_dump={yl[:3]}", flush=True)
+                if gate_wp:
                     gx, gy = gate_wp
                     gvx, gvy = int(gx/VOXEL), int(gy/VOXEL)
                     path = astar_to(vx, vy, gvx, gvy)
