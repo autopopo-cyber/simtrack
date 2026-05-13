@@ -57,11 +57,11 @@ FIXED_SEED = random.randint(0, 999999)
 MAX_MILESTONE_BALLS = 300; MAX_GATE_BALLS = 50
 FINISH = (3.0, 95.0)
 HIT_BACKOFF = 0.2   # 激光后退距离
-GAP_YELLOW_M = 1.0  # 黄线/蓝线阈值
-DECIDE_RADIUS = 10.0  # polygon决策半径
-
-# 墙体点集（供可视化）
-wall_set = set()
+VOXEL_DISPLAY_R = 15.0  # 体素球显示半径
+MAX_WALL_BALLS = 200     # 墙体素球上限
+MAX_GATE_VIS_BALLS = 60  # 门球上限
+BALL_R_WALL = 0.12       # 墙体素球半径
+BALL_R_GATE = 0.18       # 门球半径
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -140,106 +140,73 @@ def scan(bx, by):
             if is_obstacle_world(wx, wy):
                 gset(vx, vy, WALL)
                 gset(prev_vx, prev_vy, WALL)
-                # 收集墙体激光点（0.1m精度）
-                hx = bx + cos_a * (step_i*VOXEL - HIT_BACKOFF)
-                hy = by + sin_a * (step_i*VOXEL - HIT_BACKOFF)
-                wall_set.add((round(hx, 1), round(hy, 1)))
                 break
             if gget(vx, vy) == UNKNOWN:
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
 
 # ═══════════════════════════════════════════
-# 可视化：递归增量多边形 + user_scn画线
+# 体素球可视化：墙(蓝球) + 门(橙球)
 # ═══════════════════════════════════════════
 
-def polygon_boundary(points, bx, by):
-    """V7递归增量多边形。点集→蓝线(墙)/黄线(门)"""
-    n = len(points)
-    if n < 3:
-        return []
-    robx, roby = bx, by
-    polar = [(math.atan2(wy-roby, wx-robx), math.hypot(wx-robx, wy-roby), wx, wy) for wx, wy in points]
-    polar.sort()
+def cluster_voxels(voxels, connect_r=0.3):
+    """Union-Find聚类体素。Returns [[(wx,wy),...], ...]"""
+    if len(voxels) < 2:
+        return [list(voxels)] if voxels else []
+    pts = list(voxels)
+    n = len(pts)
+    parent = list(range(n))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj: parent[ri] = rj
 
-    def _subdivide(ax, ay, bx_w, by_w, depth=0):
-        d = math.hypot(bx_w-ax, by_w-ay)
-        if d <= GAP_YELLOW_M or depth > 60:
-            return [(ax, ay), (bx_w, by_w)]
-        ang_a = math.atan2(ay-roby, ax-robx)
-        ang_b = math.atan2(by_w-roby, bx_w-robx)
-        if ang_b < ang_a: ang_b += 2*math.pi
-        best_pt, best_dist = None, float('inf')
-        for ang, dist, wx, wy in polar:
-            a = ang if ang >= ang_a else ang + 2*math.pi
-            if ang_a < a < ang_b and dist < best_dist:
-                if not (abs(wx-ax)<0.05 and abs(wy-ay)<0.05) and not (abs(wx-bx_w)<0.05 and abs(wy-by_w)<0.05):
-                    best_dist = dist; best_pt = (wx, wy)
-        if not best_pt:
-            return [(ax, ay), (bx_w, by_w)]
-        cx, cy = best_pt
-        left = _subdivide(ax, ay, cx, cy, depth+1)
-        right = _subdivide(cx, cy, bx_w, by_w, depth+1)
-        return left[:-1] + right
+    for i in range(n):
+        xi, yi = pts[i]
+        for j in range(i+1, n):
+            xj, yj = pts[j]
+            if abs(xi-xj) <= connect_r*1.5 and abs(yi-yj) <= connect_r*1.5:
+                if math.hypot(xi-xj, yi-yj) < connect_r:
+                    union(i, j)
 
-    _, _, wx0, wy0 = polar[0]
-    _, _, wx1, wy1 = polar[n//2]
-    _, _, wx2, wy2 = polar[-1]
-    init = [(wx0, wy0), (wx1, wy1), (wx2, wy2)]
-    poly = []
-    for k in range(3):
-        ax, ay = init[k]; bx_w, by_w = init[(k+1)%3]
-        seg = _subdivide(ax, ay, bx_w, by_w)
-        poly.extend(seg if k==0 else seg[1:])
+    comps = {}
+    for i, p in enumerate(pts):
+        root = find(i)
+        comps.setdefault(root, []).append(p)
+    return list(comps.values())
 
-    lines = []
-    for k in range(len(poly)):
-        fx, fy = poly[k]; tx, ty = poly[(k+1)%len(poly)]
-        d = math.hypot(tx-fx, ty-fy)
-        color = 'yellow' if d > GAP_YELLOW_M else 'blue'
-        # 长线段分类修正：采样线上点
-        if color == 'yellow':
-            _d = math.hypot(tx-fx, ty-fy)
-            steps = max(4, int(_d / 0.3))
-            is_wall = False
-            for i in range(1, steps):
-                sx = round(fx + (tx-fx)*i/steps, 1)
-                sy = round(fy + (ty-fy)*i/steps, 1)
-                if (sx, sy) in wall_set:
-                    is_wall = True
-                    break
-            if is_wall:
-                color = 'blue'
-        lines.append((fx, fy, tx, ty, color))
-    return lines
-
-def decide_visual(bx, by):
-    """取附近墙体点做polygon"""
-    nearby = [(wx, wy) for wx, wy in wall_set if abs(wx-bx) <= DECIDE_RADIUS and abs(wy-by) <= DECIDE_RADIUS]
-    if len(nearby) < 3:
-        return []
-    return polygon_boundary(nearby, bx, by)
-
-def _rot_z_to_xy(dx, dy):
-    L = math.hypot(dx, dy)
-    if L < 0.001: return np.eye(3, dtype=np.float64)
-    ux, uy = dx/L, dy/L
-    return np.array([[uy*uy, -ux*uy, ux], [-ux*uy, ux*ux, uy], [-ux, -uy, 0]], dtype=np.float64)
-
-def draw_polygon(user_scn, lines):
-    """画多边形线到user_scn"""
+def draw_voxel_balls(user_scn, wall_clusters, gate_positions):
+    """画体素球：墙(蓝) + 门(橙)。球在聚类中心。"""
     user_scn.ngeom = 0
-    for fx, fy, tx, ty, color in lines:
-        if user_scn.ngeom >= user_scn.maxgeom: break
+
+    # 墙球（蓝，小）
+    for i, comp in enumerate(wall_clusters):
+        if i >= MAX_WALL_BALLS or user_scn.ngeom >= user_scn.maxgeom:
+            break
+        cx = sum(p[0] for p in comp) / len(comp)
+        cy = sum(p[1] for p in comp) / len(comp)
         geom = user_scn.geoms[user_scn.ngeom]
-        mid = np.array([(fx+tx)/2, (fy+ty)/2, 1.0], dtype=np.float64)
-        d = math.hypot(tx-fx, ty-fy)
-        rgba = {'blue': [0.2, 0.5, 1.0, 1.0], 'yellow': [1.0, 0.9, 0.1, 1.0], 'gray': [0.5, 0.5, 0.5, 0.5]}.get(color, [1,1,1,1])
-        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([0.06, max(d/2, 0.01), 0], dtype=np.float64),
-            mid, np.eye(3, dtype=np.float64).flatten(),
-            np.array(rgba, dtype=np.float32))
-        geom.mat[:] = _rot_z_to_xy(tx-fx, ty-fy)
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([BALL_R_WALL, 0, 0], dtype=np.float64),
+            np.array([cx, cy, 0.8], dtype=np.float64),
+            np.eye(3, dtype=np.float64).flatten(),
+            np.array([0.2, 0.5, 1.0, 0.8], dtype=np.float32))
+        user_scn.ngeom += 1
+
+    # 门球（橙，大）
+    for i, (gx, gy) in enumerate(gate_positions):
+        if i >= MAX_GATE_VIS_BALLS or user_scn.ngeom >= user_scn.maxgeom:
+            break
+        geom = user_scn.geoms[user_scn.ngeom]
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([BALL_R_GATE, 0, 0], dtype=np.float64),
+            np.array([gx, gy, 1.0], dtype=np.float64),
+            np.eye(3, dtype=np.float64).flatten(),
+            np.array([1.0, 0.6, 0.1, 0.9], dtype=np.float32))
         user_scn.ngeom += 1
 
 def blocked(wx, wy):
@@ -551,6 +518,7 @@ last_mx = last_my = 0
 path = None; path_idx = 0
 no_gate_count = 0
 wander = 0; last_dist = 999
+saved_gate_positions = []  # 门世界坐标 (供可视化)
 
 if milestones:
     last_mx, last_my = milestones[-1]
@@ -601,6 +569,8 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
 
         if path is None or path_idx >= len(path):
             gates, came_from = find_gates(vx, vy)
+            # 保存所有门世界坐标 (供可视化)
+            saved_gate_positions = [((gvx+0.5)*VOXEL, (gvy+0.5)*VOXEL) for _, gvx, gvy in gates]
             gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
 
             if gate is not None:
@@ -668,16 +638,24 @@ with mujoco.viewer.launch_passive(m, d, show_left_ui=False, show_right_ui=False)
         if step % RENDER_SKIP == 0:
             v.sync()
 
-        # 每1秒更新多边形可视化
+        # 每1秒体素球可视化
         if step % 200 == 0:
-            lines = decide_visual(d.qpos[0], d.qpos[1])
-            if lines:
-                blues = sum(1 for _,_,_,_,c in lines if c == 'blue')
-                yellows = sum(1 for _,_,_,_,c in lines if c == 'yellow')
-                grays = sum(1 for _,_,_,_,c in lines if c == 'gray')
-                print(f"  [VIS] step={step} blues={blues} yellows={yellows} grays={grays}", flush=True)
-                draw_polygon(v.user_scn, lines)
-                v.sync()
+            bx, by = d.qpos[0], d.qpos[1]
+            # 墙：取15m内WALL体素→聚类→球
+            wall_voxels = set()
+            for (vx,vy), val in grid.items():
+                if val == WALL and abs((vx+0.5)*VOXEL - bx) <= VOXEL_DISPLAY_R and abs((vy+0.5)*VOXEL - by) <= VOXEL_DISPLAY_R:
+                    wx = (vx + 0.5) * VOXEL
+                    wy = (vy + 0.5) * VOXEL
+                    if math.hypot(wx-bx, wy-by) <= VOXEL_DISPLAY_R:
+                        wall_voxels.add((round(wx,1), round(wy,1)))
+            wall_clusters = cluster_voxels(wall_voxels, 0.3)
+            # 门：用当前gates(如有)
+            gate_positions = saved_gate_positions
+            n_wall = len(wall_voxels)
+            print(f"  [VIS] step={step} wall_voxels={n_wall} wall_balls={len(wall_clusters)} gates={len(gate_positions)}", flush=True)
+            draw_voxel_balls(v.user_scn, wall_clusters, gate_positions)
+            v.sync()
 
     save_state()
     print(f"done: ms={len(milestones)} step={step} t={time.time()-t0:.1f}s bounce={mv.bounce} mode={EXPLORE_MODE}", flush=True)
