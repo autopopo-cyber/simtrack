@@ -184,8 +184,8 @@ def polygon_boundary(points, bx, by):
 
 
 def decide(bx, by):
-    """全量polygon：取所有wall_set点做递归增量多边形。"""
-    points = list(wall_set)
+    """取周围DECIDE_RADIUS内墙体点做递归增量多边形（同V7行为）。"""
+    points = get_nearby_points(bx, by)
     return polygon_boundary(points, bx, by)
 
 # ═══════════════════════════════════════════
