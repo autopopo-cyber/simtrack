@@ -17,7 +17,7 @@ import mujoco
 
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from test_scripts.landmarks import landmark_xml, landmark_positions
+from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z
 
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
@@ -507,9 +507,9 @@ def build_xml():
         LM_ASSETS, LM_WORLD = landmark_xml()
     else:
         LM_ASSETS, LM_WORLD = "", ""
-    # 机器人前置相机：桅杆 0.5m（世界1.0m），euler y-90° 看 body +x 前进方向
-    # （MuJoCo 相机默认看 -z，body 绕 z 转 yaw 不改变 z 方向 → 必须 euler 转成水平）
-    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
+    # 机器人前置相机：桅杆 0.5m（世界 HF_SURF+0.5+0.5），euler y-86.6°（朝下 14°）看前方 2m 地面标牌
+    # （hfield 表面 4.008m，狗站表面上方；俯视 14° 时 1.5m 标牌完整入画 + 金字塔多尺度识别）
+    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.326 0"/>'
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
@@ -526,7 +526,7 @@ def build_xml():
     <geom type="box" size="1.0 25.0 2.0" pos="51.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
     <geom type="box" size="25.0 1.0 2.0" pos="25 -1.0 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
     <geom type="box" size="25.0 1.0 2.0" pos="25 51.0 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
-    <body name="bot" pos="0 0 0.5">
+    <body name="bot" pos="0 0 {BOT_Z}">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
@@ -1003,8 +1003,8 @@ stats["bounces"] = mv.bounce
 stats["collisions"] = stats.get("collisions", 0)
 if vis is not None:
     stats["landmarks_seen"] = vis.total_detected
-    stats["landmarks_unique"] = len(vis.seen_channels)
-    stats["landmark_channels"] = sorted(vis.seen_channels)
+    stats["landmarks_unique"] = len(vis.seen_ids)
+    stats["landmark_channels"] = sorted({idx // 3 for idx in vis.seen_ids})
 stats["milestones"] = len(milestones)
 stats["final_pos"] = [round(d.qpos[0], 2), round(d.qpos[1], 2)]
 stats["final_coverage"] = round(coverage_pct(), 2)

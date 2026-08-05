@@ -47,7 +47,9 @@ class VisionLandmark:
         else:
             self.detector = None
         # 图像金字塔尺度（主人指令：多尺度避免只拍局部）
-        self.pyramid_scales = [0.25, 0.5, 1.0, 1.5, 2.0]  # 远小码→近大码
+        # 码太小（远处）→ 放大 (2x,3x)；码太大（近处，占满视野）→ 缩小 (0.25x,0.5x)
+        # 实测：狗 2m 看 1.5m 标牌时 scale=0.5 识别成功（原图码太大检测器失败）
+        self.pyramid_scales = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0]  # 远小码→近大码
         # 统计
         self.total_detected = 0
         self.seen_ids = set()
@@ -92,9 +94,11 @@ class VisionLandmark:
         """图像金字塔多尺度 ArUco 检测。
         主人指令：生成不同分辨率金字塔，多尺度识别——远处小码用放大尺度，
         近处大码用缩小尺度，避免只拍到局部漏检。
+        一步内同一标牌去重（多尺度命中只记一次）。
         """
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         results = []
+        step_ids = set()  # 本步已记录标牌（多尺度去重）
         for scale in self.pyramid_scales:
             h, w = gray.shape
             nh, nw = int(h * scale), int(w * scale)
@@ -112,12 +116,12 @@ class VisionLandmark:
                 continue
             for i, marker_id in enumerate(ids.flatten()):
                 idx = int(marker_id)
-                if idx >= 30:   # 只有 30 个标牌
+                if idx >= 30 or idx not in self._pos_map():
                     continue
-                if idx not in self._pos_map():
+                if idx in step_ids:   # 本步已记录，跳过（多尺度去重）
                     continue
+                step_ids.add(idx)
                 ch, slot = self._idx_ch_slot(idx)
-                # 标牌中心（像素→世界坐标近似：标牌位置已知）
                 self.total_detected += 1
                 self.seen_ids.add(idx)
                 self.detections.append((step, idx, ch, slot))
@@ -130,7 +134,7 @@ class VisionLandmark:
         """idx → 世界坐标（从 landmarks 构建）"""
         if not hasattr(self, "_pm"):
             self._pm = {}
-            for idx, ch, slot, wx, wy in self.LM.landmark_positions():
+            for idx, ch, slot, wx, wy, wz in self.LM.landmark_positions():
                 self._pm[idx] = (wx, wy)
         return self._pm
 
