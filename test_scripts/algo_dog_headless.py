@@ -84,6 +84,8 @@ def run_test_sequence(m, d, out_dir, render_every, renderer, max_steps):
         max_w = 0.0
         steps = 0
         reached = False
+        spin_accum = 0.0  # 累计旋转角（spin 段用）
+        prev_yaw = start_yaw
         while time.time() - seg_start < 60 and cnt < max_steps:  # 每段最多60s
             bx, by, yaw = d.qpos[0], d.qpos[1], d.qpos[2]
             vx_c, vy_c, w_c = clamp_cmd(*cmd)
@@ -95,8 +97,13 @@ def run_test_sequence(m, d, out_dir, render_every, renderer, max_steps):
             max_w = max(max_w, abs(d.qvel[2]))
             # 进度判定
             if name == "spin":
-                progress = abs(((d.qpos[2] - start_yaw) % (2*math.pi)))
-                if progress >= target: reached = True; break
+                # 累计旋转角（增量累加，处理绕圈）
+                d_yaw = d.qpos[2] - prev_yaw
+                # 归一化到 [-π, π] 避免跨 2π 边界跳变
+                d_yaw = (d_yaw + math.pi) % (2 * math.pi) - math.pi
+                spin_accum += abs(d_yaw)
+                prev_yaw = d.qpos[2]
+                if spin_accum >= target: reached = True; break
             else:
                 dx = d.qpos[0] - start_pos[0]; dy = d.qpos[1] - start_pos[1]
                 if name in ("forward", "backward"):
