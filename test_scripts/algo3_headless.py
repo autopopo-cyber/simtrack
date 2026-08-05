@@ -414,7 +414,7 @@ print(f"━━━ 萤火 Firefly v3 SLAM headless ━━━ {VOXEL}m 三级跳A*
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
-d.qpos[0]=3; d.qpos[1]=3; mujoco.mj_forward(m,d)
+d.qpos[0]=2.5; d.qpos[1]=2.5; mujoco.mj_forward(m,d)
 
 # EGL 离屏渲染
 os.makedirs(args.out_dir, exist_ok=True)
