@@ -90,13 +90,26 @@ class VisionLandmark:
             return []
         return self._detect_pyramid(img, step)
 
+    def _coarse_gate(self, gray):
+        """粗筛：0.25x Laplacian 能量 < 200 → 无黑白高对比特征 → 跳过金字塔。
+        主人指令（2026-08-06）：低分辨率特征都没有，高分辨率检测就不用做。
+        实测（0.25x Laplacian 能量）：无标牌 23-84，有标牌 231-1684，阈值 200 零重叠。
+        """
+        h, w = gray.shape
+        g = cv2.resize(gray, (int(w * 0.25), int(h * 0.25)), interpolation=cv2.INTER_AREA)
+        lap = cv2.Laplacian(g, cv2.CV_64F)
+        return float((lap**2).mean()) >= 200.0
+
     def _detect_pyramid(self, img, step):
         """图像金字塔多尺度 ArUco 检测。
         主人指令：生成不同分辨率金字塔，多尺度识别——远处小码用放大尺度，
         近处大码用缩小尺度，避免只拍到局部漏检。
+        一级粗筛：Laplacian 能量不足（无黑白高对比特征）→ 跳过全部高分辨率。
         一步内同一标牌去重（多尺度命中只记一次）。
         """
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        if not self._coarse_gate(gray):
+            return []   # 无特征，跳过全部金字塔（省 ~25ms/帧）
         results = []
         step_ids = set()  # 本步已记录标牌（多尺度去重）
         for scale in self.pyramid_scales:
@@ -104,10 +117,8 @@ class VisionLandmark:
             nh, nw = int(h * scale), int(w * scale)
             if nh < 60 or nw < 60:   # 太小无意义
                 continue
-            if scale < 1.0:
-                g = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
-            else:
-                g = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_CUBIC)
+            # 用默认 INTER_LINEAR：INTER_AREA 缩小会模糊小码致 ArUco 识别失败（实测）
+            g = cv2.resize(gray, (nw, nh))
             try:
                 corners, ids, rejected = self.detector.detectMarkers(g)
             except Exception:
@@ -134,10 +145,10 @@ class VisionLandmark:
         """idx → 世界坐标（从 landmarks 构建）"""
         if not hasattr(self, "_pm"):
             self._pm = {}
-            for idx, ch, slot, wx, wy, wz in self.LM.landmark_positions():
+            for idx, ch, side, wx, wy, wz, quat in self.LM.landmark_positions():
                 self._pm[idx] = (wx, wy)
         return self._pm
 
     def _idx_ch_slot(self, idx):
-        """idx → (ch, slot)：idx = ch*3 + slot"""
-        return idx // 3, idx % 3
+        """idx → (ch, side)：idx = ch*2 + side"""
+        return idx // 2, idx % 2

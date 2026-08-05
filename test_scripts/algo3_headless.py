@@ -17,7 +17,7 @@ import mujoco
 
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z
+from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml
 
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
@@ -505,11 +505,12 @@ def build_xml():
     # 地标标牌（贴墙方案，--landmarks 1 启用；导航测试默认关避免干扰）
     if args.landmarks:
         LM_ASSETS, LM_WORLD = landmark_xml()
+        WALL_XML = wall_xml()
     else:
-        LM_ASSETS, LM_WORLD = "", ""
-    # 机器人前置相机：桅杆 0.5m（世界 HF_SURF+0.5+0.5），euler y-86.6°（朝下 14°）看前方 2m 地面标牌
-    # （hfield 表面 4.008m，狗站表面上方；俯视 14° 时 1.5m 标牌完整入画 + 金字塔多尺度识别）
-    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.326 0"/>'
+        LM_ASSETS, LM_WORLD, WALL_XML = "", "", ""
+    # 机器人前置相机：桅杆 0.5m（世界 HF_SURF+1.0=5.008），平视看墙上标牌
+    # （标牌中心离地 1m = 相机高度 = 视觉中心；MuJoCo euler 是 extrinsic xyz，y -90° 朝前）
+    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
@@ -520,6 +521,7 @@ def build_xml():
     <light pos="25 25 80" dir="0 0 -1"/>
     {FINISH_XML}{OBS_XML}
     <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0" contype="0" conaffinity="0"/>
+    {WALL_XML}
     {LM_WORLD}
     <!-- 方案A：边界几何纯可视化（contype=0），防穿墙靠算法走廊检查 -->
     <geom type="box" size="1.0 25.0 2.0" pos="-1.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
@@ -1004,7 +1006,7 @@ stats["collisions"] = stats.get("collisions", 0)
 if vis is not None:
     stats["landmarks_seen"] = vis.total_detected
     stats["landmarks_unique"] = len(vis.seen_ids)
-    stats["landmark_channels"] = sorted({idx // 3 for idx in vis.seen_ids})
+    stats["landmark_channels"] = sorted({idx // 2 for idx in vis.seen_ids})
 stats["milestones"] = len(milestones)
 stats["final_pos"] = [round(d.qpos[0], 2), round(d.qpos[1], 2)]
 stats["final_coverage"] = round(coverage_pct(), 2)
