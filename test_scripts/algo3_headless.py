@@ -84,6 +84,9 @@ ap.add_argument("--render-every", type=int, default=200, help="离屏渲染间�
 ap.add_argument("--out-dir", type=str, default="/tmp/firefly_frames", help="渲染帧输出目录")
 ap.add_argument("--timeout", type=float, default=900, help="墙钟超时（秒）")
 ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（默认 auto）")
+ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
+ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
+ap.add_argument("--vision", type=int, default=0, help="1=启用视觉地标识别（EGL渲染慢，默认关）")
 args = ap.parse_args()
 
 if args.seed is not None:
@@ -236,27 +239,27 @@ def wall_dist(vx, vy):
     best = 999
     for dy in range(-WALL_SCAN_RADIUS, WALL_SCAN_RADIUS+1):
         for dx in range(-WALL_SCAN_RADIUS, WALL_SCAN_RADIUS+1):
-            if gget(vx+dx, vy+dy) == WALL:
+            if gget_plan(vx+dx, vy+dy) == WALL:
                 d = abs(dx)+abs(dy)
                 if d < best: best = d
     _wd[key] = best
     return best
 
 def walkable(vx, vy):
-    return gget(vx, vy) == FREE and wall_dist(vx, vy) > ROBOT_R
+    return gget_plan(vx, vy) == FREE and wall_dist(vx, vy) > ROBOT_R
 
 def traversable(vx, vy):
     """探索可通行：FREE 或 UNKNOWN 都行（WALL 不行）。
     核心：frontier 探索允许走向未知——A* 规划激进，执行层(Mover)实时避障兜底。
     真实机器人也是这么干的：未知区域可通行，撞到才知道有墙。
     """
-    return gget(vx, vy) != WALL
+    return gget_plan(vx, vy) != WALL
 
 def line_clear(vx1, vy1, vx2, vy2):
     steps = max(abs(vx2-vx1), abs(vy2-vy1))
     if steps == 0: return True
     for i in range(steps+1):
-        if gget(int(vx1+(vx2-vx1)*i/steps), int(vy1+(vy2-vy1)*i/steps)) == WALL:
+        if gget_plan(int(vx1+(vx2-vx1)*i/steps), int(vy1+(vy2-vy1)*i/steps)) == WALL:
             return False
     return True
 
@@ -288,7 +291,7 @@ def _nearest_walkable(vx, vy, max_r=8):
 def find_gates(fvx, fvy):
     # 起点放宽：机器人物理位置可能是 UNKNOWN（刚起步未扫描）或贴墙边，
     # 但已实际站在那，必须允许寻路，否则 find_gates 返回空 → 主循环死循环
-    if gget(fvx, fvy) == WALL:
+    if gget_plan(fvx, fvy) == WALL:
         return [], {}
     start = _nearest_walkable(fvx, fvy)
     if start is None:
@@ -305,8 +308,8 @@ def find_gates(fvx, fvy):
         cg = g_score.get((cx,cy), 9999)
         if gates and cg > MAX_GATE_DIST:
             break
-        if gget(cx, cy) == FREE:
-            has_unk = any(gget(cx+dx, cy+dy) == UNKNOWN
+        if gget_plan(cx, cy) == FREE:
+            has_unk = any(gget_plan(cx+dx, cy+dy) == UNKNOWN
                           for dy in (-1,0,1) for dx in (-1,0,1))
             # 门=未知前沿。黑名单门（bounce 撞墙的）跳过
             if has_unk and wall_dist(cx, cy) > 1 and (cx, cy) not in bad_gates:
@@ -318,7 +321,7 @@ def find_gates(fvx, fvy):
             wd = wall_dist(nx, ny)
             penalty = max(0, WALL_BUFFER_CELLS - wd) * WALL_PENALTY
             # UNKNOWN 格可通行但代价高（优先已知路，必要时才穿未知）
-            if gget(nx, ny) == UNKNOWN:
+            if gget_plan(nx, ny) == UNKNOWN:
                 penalty += UNKNOWN_PENALTY
             ng = cg + js + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
@@ -405,7 +408,7 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
 
 def astar_to(fvx, fvy, tfx, tfy):
     # 起点放宽：未知/已知都可起步（WALL 才拒绝），机器人物理位置贴墙边也必须能回溯寻路
-    if gget(fvx, fvy) == WALL or not walkable(tfx, tfy):
+    if gget_plan(fvx, fvy) == WALL or not walkable(tfx, tfy):
         return None
     start = _nearest_walkable(fvx, fvy)
     if start is None:
@@ -441,8 +444,8 @@ def build_xml():
         f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
-    # 地标标牌：texture/material assets + box geom
-    LM_ASSETS, LM_WORLD = landmark_xml()
+    # 地标标牌（本次导航目标不需要；Task 8 标牌贴墙时启用）
+    LM_ASSETS, LM_WORLD = "", ""
     # 机器人前置相机：桅杆 0.5m（世界1.0m），euler y-90° 看 body +x 前进方向
     # （MuJoCo 相机默认看 -z，body 绕 z 转 yaw 不改变 z 方向 → 必须 euler 转成水平）
     CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
@@ -622,6 +625,34 @@ def load_state():
                 loaded[(vx+ox, vy+oy)] = int(arr[vy, vx])
     return loaded, str(data["mode"])
 
+def save_map(path):
+    """保存当前 grid（含墙+障碍）到文件，供阶段2加载为 static_grid"""
+    if not grid: return
+    xs = sorted(set(k[0] for k in grid)); ys = sorted(set(k[1] for k in grid))
+    minx, maxx = xs[0], xs[-1]; miny, maxy = ys[0], ys[-1]
+    arr = np.full((maxy-miny+1, maxx-minx+1), UNKNOWN, dtype=np.int8)
+    for (vx, vy), val in grid.items():
+        arr[vy-miny, vx-minx] = val
+    np.savez(path, grid=arr, offset=(minx, miny), seed=FIXED_SEED)
+    print(f"  [MAP] saved {len(grid)} cells → {path}", flush=True)
+
+def load_map(path):
+    """加载旧地图为 static_grid，开启 KNOWN_MAP_MODE（阶段2）"""
+    global static_grid, KNOWN_MAP_MODE
+    if not os.path.exists(path):
+        print(f"  [MAP] 警告: {path} 不存在", flush=True)
+        return False
+    data = np.load(path, allow_pickle=True)
+    arr = data["grid"]; ox, oy = data["offset"]
+    static_grid.clear()
+    for vy in range(arr.shape[0]):
+        for vx in range(arr.shape[1]):
+            if arr[vy, vx] != UNKNOWN:
+                static_grid[(vx+ox, vy+oy)] = int(arr[vy, vx])
+    KNOWN_MAP_MODE = True
+    print(f"  [MAP] loaded {len(static_grid)} cells from {path} (KNOWN_MAP_MODE)", flush=True)
+    return True
+
 # ═══════════════════════════════════════════
 # 指标统计
 # ═══════════════════════════════════════════
@@ -687,14 +718,21 @@ def render_frame(step):
 
 mv = Mover(m, d)
 
-# 视觉地标识别（前置相机 + ArUco；不可用时静默跳过）
-try:
-    from test_scripts.vision_landmark import VisionLandmark
-    vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=40)
-    print("  [VISION] 视觉地标识别已启用", flush=True)
-except Exception as e:
+# 阶段2：加载旧地图为 static_grid（已知地图快速寻路）
+if args.load_map:
+    load_map(args.load_map)
+
+# 视觉地标识别（前置相机 + ArUco；EGL 渲染 3.5s/帧拖慢导航，默认关闭，--vision 1 开启）
+if args.vision:
+    try:
+        from test_scripts.vision_landmark import VisionLandmark
+        vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=40)
+        print("  [VISION] 视觉地标识别已启用", flush=True)
+    except Exception as e:
+        vis = None
+        print(f"  [VISION] 视觉不可用: {e}", flush=True)
+else:
     vis = None
-    print(f"  [VISION] 视觉不可用: {e}", flush=True)
 
 step = 0; t0 = time.time()
 last_mx = last_my = 0
@@ -881,6 +919,10 @@ if RENDER_OK:
     render_frame(step)  # 最后帧
 
 save_state()
+
+# 阶段1：保存地图供后续阶段2加载
+if args.save_map:
+    save_map(args.save_map)
 
 # 成绩单
 if args.save_name:
