@@ -45,6 +45,7 @@ WALL_SCAN_RADIUS = 10
 WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
 WALL_PENALTY = 3
 UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
+VORONOI_C = 2.0      # 走中间代价系数：penalty = C/d² (d=离墙格数)，KNOWN_MAP_MODE 下启用
 MAX_GATE_DIST = 3000
 ASTAR_MAX_EXPAND = 30000
 
@@ -320,6 +321,9 @@ def find_gates(fvx, fvy):
             nx, ny = cx + dx*js, cy + dy*js
             wd = wall_dist(nx, ny)
             penalty = max(0, WALL_BUFFER_CELLS - wd) * WALL_PENALTY
+            # 走中间（KNOWN_MAP_MODE）：代价 + C/d²，贴墙爆炸、中线最低（Voronoi 骨架）
+            if KNOWN_MAP_MODE:
+                penalty += VORONOI_C / (max(1, wd) * max(1, wd))
             # UNKNOWN 格可通行但代价高（优先已知路，必要时才穿未知）
             if gget_plan(nx, ny) == UNKNOWN:
                 penalty += UNKNOWN_PENALTY
@@ -427,6 +431,10 @@ def astar_to(fvx, fvy, tfx, tfy):
             if js < 1: continue
             nx, ny = cx + dx*js, cy + dy*js
             ng = g_score.get((cx,cy), 999) + js
+            # 走中间（KNOWN_MAP_MODE）：代价 + C/d²
+            if KNOWN_MAP_MODE:
+                wd = wall_dist(nx, ny)
+                ng += VORONOI_C / (max(1, wd) * max(1, wd))
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
                 came_from[(nx,ny)] = (cx,cy)
