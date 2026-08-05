@@ -379,6 +379,7 @@ def pick_gate(gates, mode="score", stuck=False, robot=(0, 0), fin=(0, 0)):
         # 终点导向：任务=到达终点，优先向终点方向推进的门
         # score = 0.55·advance + 0.25·(1/dist) + 0.20·(size/50)
         # advance 主导：蛇形赛道 y 从 2.5→47.5，推进门 = y 增大方向
+        # 探索模式加信息增益：门附近 UNKNOWN 格数（可新扫面积）
         bx, by = robot
         fx, fy = fin
         best = None; best_score = -1
@@ -393,7 +394,13 @@ def pick_gate(gates, mode="score", stuck=False, robot=(0, 0), fin=(0, 0)):
             if denom > 1e-6:
                 adv = ((wx-bx)*(fx-bx) + (wy-by)*(fy-by)) / (denom * max(d, 0.01))
                 advance = max(0.0, min(1.0, adv))
-            score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
+            if not KNOWN_MAP_MODE:
+                # 探索：信息增益 = 门周围 5x5 UNKNOWN 数（新扫面积），加权鼓励去未知多的地方
+                gain = sum(1 for dy in range(-2,3) for dx in range(-2,3)
+                           if gget_plan(gx+dx, gy+dy) == UNKNOWN)
+                score = 0.45 * advance + 0.15 * (1.0/d) + 0.15 * (size / 50.0) + 0.25 * (gain / 25.0)
+            else:
+                score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
             if score > best_score:
                 best_score = score; best = g
         return best
