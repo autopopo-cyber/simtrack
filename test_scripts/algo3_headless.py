@@ -798,14 +798,13 @@ mv = Mover(m, d)
 if args.load_map:
     load_map(args.load_map)
 
-# 视觉地标识别（前置相机 + 颜色识别；EGL软渲染 223ms/帧(hfield降分辨率后)，--vision 1 开启）
+# 视觉地标识别（前置相机 + 颜色识别；GPU渲染 32ms/帧，--vision 1 开启）
 if args.vision:
     try:
         from test_scripts.vision_landmark import VisionLandmark
-        # detect_every=200：每 200 步(1s物理时间)渲染一帧——机器人 2m/s 走 2m/帧，
-        # 标牌 1m 宽在 10m 外可见，不会漏；渲染开销降到可接受
-        vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=200)
-        print("  [VISION] 视觉地标识别已启用 (detect_every=200)", flush=True)
+        # detect_every=40：GPU 渲染 32ms/帧，每 40 步(0.2s物理)一帧开销可接受，标牌识别灵敏
+        vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=40)
+        print("  [VISION] 视觉地标识别已启用 (GPU 32ms/帧, detect_every=40)", flush=True)
     except Exception as e:
         vis = None
         print(f"  [VISION] 视觉不可用: {e}", flush=True)
