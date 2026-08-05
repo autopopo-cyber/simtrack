@@ -88,6 +88,7 @@ ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
 ap.add_argument("--vision", type=int, default=0, help="1=启用视觉地标识别（EGL渲染慢，默认关）")
+ap.add_argument("--landmarks", type=int, default=0, help="1=启用标牌几何（贴墙，不挡路）")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
 args = ap.parse_args()
@@ -486,8 +487,11 @@ def build_xml():
         f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
-    # 地标标牌（本次导航目标不需要；Task 8 标牌贴墙时启用）
-    LM_ASSETS, LM_WORLD = "", ""
+    # 地标标牌（贴墙方案，--landmarks 1 启用；导航测试默认关避免干扰）
+    if args.landmarks:
+        LM_ASSETS, LM_WORLD = landmark_xml()
+    else:
+        LM_ASSETS, LM_WORLD = "", ""
     # 机器人前置相机：桅杆 0.5m（世界1.0m），euler y-90° 看 body +x 前进方向
     # （MuJoCo 相机默认看 -z，body 绕 z 转 yaw 不改变 z 方向 → 必须 euler 转成水平）
     CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
