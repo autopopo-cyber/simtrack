@@ -15,6 +15,10 @@ import numpy as np
 from PIL import Image
 import mujoco
 
+# 地标标牌系统（30 个 ArUco+数字标牌）
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from test_scripts.landmarks import landmark_xml, landmark_positions
+
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
 # ═══════════════════════════════════════════
@@ -90,6 +94,8 @@ if args.seed is not None:
 # ═══════════════════════════════════════════
 UNKNOWN, FREE, WALL = 0, 1, 2
 grid = {}
+static_grid = {}   # 旧地图背景（只读）：WALL=永久的墙；加载地图时填充
+KNOWN_MAP_MODE = False  # True=阶段2（加载旧地图），规划叠加 static_grid
 _wd = {}
 _cnt = {FREE: 0, WALL: 0}
 
@@ -104,6 +110,17 @@ def gset(vx, vy, val):
     _cnt[val] += 1
     if val == WALL:
         _wd.clear()
+
+def gget_plan(vx, vy):
+    """规划用叠加视图：static 的墙永远 WALL；live 障碍/自由优先；其余回退 static。
+    探索模式（KNOWN_MAP_MODE=False）下 static 空 → 等价于 gget。"""
+    s = static_grid.get((vx, vy), UNKNOWN)
+    if s == WALL:
+        return WALL
+    l = grid.get((vx, vy), UNKNOWN)
+    if l != UNKNOWN:
+        return l
+    return s
 
 # ═══════════════════════════════════════════
 # 地图加载 + 障碍物
@@ -422,14 +439,22 @@ def build_xml():
         f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
+    # 地标标牌：texture/material assets + box geom
+    LM_ASSETS, LM_WORLD = landmark_xml()
+    # 机器人前置相机：桅杆 0.5m（世界1.0m），euler y-90° 看 body +x 前进方向
+    # （MuJoCo 相机默认看 -z，body 绕 z 转 yaw 不改变 z 方向 → 必须 euler 转成水平）
+    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
-  <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{MAP}"/></asset>
+  <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{MAP}"/>
+    {LM_ASSETS}
+  </asset>
   <worldbody>
     <light pos="25 25 80" dir="0 0 -1"/>
     {FINISH_XML}{OBS_XML}
     <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0" contype="0" conaffinity="0"/>
+    {LM_WORLD}
     <!-- 方案A：边界几何纯可视化（contype=0），防穿墙靠算法走廊检查 -->
     <geom type="box" size="1.0 25.0 2.0" pos="-1.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
     <geom type="box" size="1.0 25.0 2.0" pos="51.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
@@ -441,6 +466,7 @@ def build_xml():
       <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
       <!-- 机器狗：水平圆柱（长轴沿 yaw 方向），0.8m 长 × 0.4m 径，contype=0 纯算法控制 -->
       <geom type="capsule" fromto="0 -0.4 0 0 0.4 0" size="0.2" rgba="1 0.3 0 1" friction="0 0 0" contype="0" conaffinity="0"/>
+      {CAM_XML}
     </body>
   </worldbody>
 </mujoco>"""
@@ -659,6 +685,15 @@ def render_frame(step):
 
 mv = Mover(m, d)
 
+# 视觉地标识别（前置相机 + ArUco；不可用时静默跳过）
+try:
+    from test_scripts.vision_landmark import VisionLandmark
+    vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=40)
+    print("  [VISION] 视觉地标识别已启用", flush=True)
+except Exception as e:
+    vis = None
+    print(f"  [VISION] 视觉不可用: {e}", flush=True)
+
 step = 0; t0 = time.time()
 last_mx = last_my = 0
 path = None; path_idx = 0; _plan_bounce_base = 0
@@ -697,6 +732,10 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     if step % LIDAR_TICK == 0:
         scan(bx, by)
+
+    # 视觉地标识别（相机帧 + ArUco；看到标牌记录唯一ID）
+    if vis is not None:
+        vis.scan_once(step)
 
     # 决策
     # 强制重规划：bounce 过多说明当前路径失效（偏离/被挡），换目标
@@ -824,6 +863,10 @@ stats["steps"] = step
 stats["time_sec"] = round(time.time() - t0, 2)
 stats["bounces"] = mv.bounce
 stats["collisions"] = stats.get("collisions", 0)
+if vis is not None:
+    stats["landmarks_seen"] = vis.total_detected
+    stats["landmarks_unique"] = len(vis.seen_channels)
+    stats["landmark_channels"] = sorted(vis.seen_channels)
 stats["milestones"] = len(milestones)
 stats["final_pos"] = [round(d.qpos[0], 2), round(d.qpos[1], 2)]
 stats["final_coverage"] = round(coverage_pct(), 2)
