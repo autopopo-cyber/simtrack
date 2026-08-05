@@ -122,12 +122,12 @@ def gen_obstacles(seed):
     obs_world = []; idx = 0
     while idx < len(cl):
         cx, cy = cl[idx]; wx, wy = cx*SCALE, cy*SCALE
-        obs_world.append((wx, wy+rng.uniform(-2.0,2.0)))
+        obs_world.append((wx, wy+rng.uniform(-1.5,1.5)))
         idx += rng.randint(3,8)
     return [(x,y) for x,y in obs_world if math.hypot(x-6,y-6)>5.0]
 
 obs_world = gen_obstacles(FIXED_SEED)
-OBS_R = 1.0; OBS_CLEAR = OBS_R + SAFE_R
+OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
 def sample_hf(wx, wy):
     mx, my = wx/SCALE, wy/SCALE
@@ -295,7 +295,7 @@ def astar_to(fvx, fvy, tfx, tfy):
 def build_xml():
     OBS_XML = "".join(
         f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
-        f'<geom type="cylinder" size="1.0 2.0" rgba="0.9 0.2 0.2 0.9"/></body>'
+        f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
     return f"""<mujoco>
@@ -338,6 +338,12 @@ class Mover:
         if self.force > 0:
             self.force -= 1; self.d.qvel[0] = vx; self.d.qvel[1] = vy
         elif blocked(nx, ny):
+            # 诊断：区分被墙挡还是被障碍物挡
+            _bx, _by = self.d.qpos[0], self.d.qpos[1]
+            _hit_wall = sample_hf(nx, ny) != 128
+            _near_obs = any(math.hypot(nx-ox, ny-oy) < OBS_CLEAR for ox, oy in obs_world)
+            if self.bounce % 5 == 0:
+                print(f"  [BOUNCE] bounce#{self.bounce} @({_bx:.1f},{_by:.1f})→({nx:.1f},{ny:.1f}) wall={_hit_wall} obs={_near_obs}", flush=True)
             self._bounce(45, 120)
         else:
             self.escaping = False
@@ -548,7 +554,7 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         break
 
     # 离屏渲染
-    if RENDER_OK and step % args.render_every == 0:
+    if RENDER_OK and args.render_every > 0 and step % args.render_every == 0:
         render_frame(step)
 
     # 进度日志

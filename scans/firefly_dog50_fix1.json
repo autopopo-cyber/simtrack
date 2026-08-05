@@ -1,0 +1,19 @@
+{
+  "gates_selected": 28,
+  "backtracks": 0,
+  "lost_rescues": 0,
+  "bounces": 352,
+  "milestones": 859,
+  "steps": 150559,
+  "arrived": true,
+  "time_sec": 407.95,
+  "final_coverage": 100.57,
+  "final_pos": [
+    5.46,
+    47.85
+  ],
+  "seed": 7,
+  "free_cells": 217973,
+  "wall_cells": 22783,
+  "mode": "far"
+}
