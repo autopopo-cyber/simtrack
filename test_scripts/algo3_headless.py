@@ -116,23 +116,37 @@ def gen_centerline():
         for gy in range(4): pts.append((mx, my+gy*10.0))
     return pts
 
+def sample_hf(wx, wy):
+    mx, my = wx/SCALE, wy/SCALE
+    px, py = int(mx*PIX_PER_M), HF_RES-1-int(my*PIX_PER_M)
+    return int(hf[py,px]) if 0<=px<HF_RES and 0<=py<HF_RES else -1
+
 def gen_obstacles(seed):
     rng = random.Random(seed)
     cl = gen_centerline()
     obs_world = []; idx = 0
     while idx < len(cl):
         cx, cy = cl[idx]; wx, wy = cx*SCALE, cy*SCALE
-        obs_world.append((wx, wy+rng.uniform(-1.5,1.5)))
-        idx += rng.randint(3,8)
+        ox, oy = wx, wy + rng.uniform(-1.5, 1.5)
+        # 障碍必须完全在道路内（不嵌墙）：中心在道路上 + 半径范围内无墙
+        if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, 0.5):
+            obs_world.append((ox, oy))
+        # 密度降为原来的 1/4（间距 4 倍）
+        idx += rng.randint(12, 32)
     return [(x,y) for x,y in obs_world if math.hypot(x-6,y-6)>5.0]
+
+def _obs_hits_wall(ox, oy, r):
+    """检查以 (ox,oy) 为中心 r 半径的圆是否碰到墙（确保障碍不嵌墙）"""
+    steps = 12
+    for i in range(steps):
+        a = 2 * math.pi * i / steps
+        wx, wy = ox + r * math.cos(a), oy + r * math.sin(a)
+        if sample_hf(wx, wy) != ROAD_PIX:
+            return True
+    return False
 
 obs_world = gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
-
-def sample_hf(wx, wy):
-    mx, my = wx/SCALE, wy/SCALE
-    px, py = int(mx*PIX_PER_M), HF_RES-1-int(my*PIX_PER_M)
-    return int(hf[py,px]) if 0<=px<HF_RES and 0<=py<HF_RES else -1
 
 def is_obstacle_world(wx, wy):
     if sample_hf(wx, wy) != ROAD_PIX: return True
@@ -160,6 +174,9 @@ def scan(bx, by):
             prev_vx, prev_vy = vx, vy
 
 def blocked(wx, wy):
+    # 越界保护：赛道外直接视为 blocked（防穿墙跑出地图）
+    if not (0.0 <= wx <= 50.0 and 0.0 <= wy <= 50.0):
+        return True
     vx, vy = int(wx/VOXEL), int(wy/VOXEL)
     for dy in range(-ROBOT_R, ROBOT_R+1):
         for dx in range(-ROBOT_R, ROBOT_R+1):
@@ -309,7 +326,9 @@ def build_xml():
     <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
-      <geom type="cylinder" size="0.2 0.4" rgba="1 0.3 0 1" friction="0 0 0"/>
+      <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
+      <!-- 机器狗：水平圆柱（长轴沿 yaw 方向），0.8m 长 × 0.4m 径，保留物理碰撞防穿墙 -->
+      <geom type="capsule" fromto="0 -0.4 0 0 0.4 0" size="0.2" rgba="1 0.3 0 1" friction="0 0 0"/>
     </body>
   </worldbody>
 </mujoco>"""
@@ -329,6 +348,8 @@ class Mover:
             dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
             self.yaw += dyaw
             self.speed = max(MIN_SPEED, min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR))
+        # 同步 yaw joint（qpos[2]），让狗身体实际转向（沿轴向前进，不横着走）
+        self.d.qpos[2] = self.yaw
         vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
         nx, ny = bx+vx*dt, by+vy*dt
         if step-self.stuck_t > STUCK_TIMEOUT:
@@ -337,6 +358,8 @@ class Mover:
             self.stuck_t = step; self.stuck_x = bx; self.stuck_y = by
         if self.force > 0:
             self.force -= 1; self.d.qvel[0] = vx; self.d.qvel[1] = vy
+            if self.force <= 0:
+                self.escaping = False  # force 耗尽复位
         elif blocked(nx, ny):
             # 诊断：区分被墙挡还是被障碍物挡
             _bx, _by = self.d.qpos[0], self.d.qpos[1]
@@ -354,8 +377,22 @@ class Mover:
             self.bounce += 1; self.escaping = True
             if self.bounce % 5 == 0:
                 print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
-        deg = random.uniform(lo, hi)*random.choice([-1,1])
-        self.yaw += math.radians(deg)
+        # 随机转向，但检查新方向是否可通行（避免 bounce 后直冲进墙/越界）
+        bx, by = self.d.qpos[0], self.d.qpos[1]
+        dt = self.m.opt.timestep
+        lookahead = max(1.0, self.speed * dt * 8)
+        for _attempt in range(8):
+            deg = random.uniform(lo, hi) * random.choice([-1, 1])
+            cand = self.yaw + math.radians(deg)
+            cx = bx + math.cos(cand) * lookahead
+            cy = by + math.sin(cand) * lookahead
+            if not blocked(cx, cy):
+                self.yaw = cand
+                self.d.qvel[:] = 0
+                self.force = int(BOUNCE_FORCE_DURATION/(SPEED*self.m.opt.timestep))
+                return
+        # 全方向堵 → 180° 掉头（防死角死循环）
+        self.yaw += math.pi
         self.d.qvel[:] = 0
         self.force = int(BOUNCE_FORCE_DURATION/(SPEED*self.m.opt.timestep))
 
