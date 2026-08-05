@@ -301,15 +301,15 @@ def build_xml():
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
-  <asset><hfield name="track" size="50.0 50.0 4.0 2.0" file="{MAP}"/></asset>
+  <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{MAP}"/></asset>
   <worldbody>
-    <light pos="50 50 80" dir="0 0 -1"/>
+    <light pos="25 25 80" dir="0 0 -1"/>
     {FINISH_XML}{OBS_XML}
-    <geom type="hfield" hfield="track" pos="50 50 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
+    <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
     <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
-      <geom type="cylinder" size="0.5 0.5" rgba="1 0.3 0 1" friction="0 0 0"/>
+      <geom type="cylinder" size="0.2 0.4" rgba="1 0.3 0 1" friction="0 0 0"/>
     </body>
   </worldbody>
 </mujoco>"""
