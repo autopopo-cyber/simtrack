@@ -26,7 +26,7 @@ SCAN_STATE = os.path.join(SCAN_DIR, "scan_dict.npz")
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 SCALE = 1.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-SAFE_R = 0.2; SPEED = 2.0; SPEED_MAX = 2.0; YAW_RATE = 1.5
+SAFE_R = 0.2; SPEED = 4.0; SPEED_MAX = 4.0; YAW_RATE = 1.5
 LIDAR_RANGE = 15.0
 
 VOXEL = 0.1
@@ -47,8 +47,8 @@ ASTAR_MAX_EXPAND = 30000
 MIN_SPEED = 1.0; SPEED_FACTOR = 1.5
 # 运动学约束（主人：现实中不允许碰撞）
 # 限速/限加速度/限减速度 + 前瞻测距 + 制动约束 v≤sqrt(2·A_DECEL·d)，物理上保证碰撞=0
-A_ACCEL = 3.0      # 加速度 (m/s²)：速度爬升上限
-A_DECEL = 5.0      # 减速度 (m/s²)：制动能力，任何速度都能在障碍前停住
+A_ACCEL = 5.0      # 加速度 (m/s²)：速度爬升上限
+A_DECEL = 8.0      # 减速度 (m/s²)：制动能力，任何速度都能在障碍前停住
 STOP_MARGIN = 0.4  # 停车时距障碍的安全余量 (m)
 LOOKAHEAD = 4.0    # 前瞻测距上限 (m)
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
@@ -476,6 +476,9 @@ class Mover:
         d_clear = self._forward_clear(bx, by, self.yaw)
         # ── 期望速度（限速）：目标距离速度 vs 制动约束，取小 ──
         v_des = min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR)
+        # 近墙限速：前方空间小（<2m）时降速，窄连接段/迷宫缺口慢速通过防过冲
+        if d_clear < 2.0:
+            v_des = min(v_des, 1.5)
         # 制动约束：当前速度 v 需满足 v² ≤ 2·A_DECEL·(d_clear-STOP_MARGIN)
         # → 任何速度下急刹都能在障碍前停住，物理上碰撞=0
         v_brake = math.sqrt(max(0.0, 2.0*A_DECEL*max(0.0, d_clear-STOP_MARGIN)))
