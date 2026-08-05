@@ -25,6 +25,9 @@ from test_scripts.landmarks import landmark_xml, landmark_positions
 
 PROJ = os.path.expanduser("~/workspace/simtrack")
 MAP = os.path.join(PROJ, "confirmed/track_clean.png")
+# 渲染用降分辨率 hfield（2000→500）：EGL/OSMesa 软渲染下 2000x2000 高度图 2.7s/帧，
+# 500x500 只要 223ms（快12倍）。sample_hf 碰撞检测仍用原图 MAP，精度不降。
+RENDER_MAP = os.path.join(PROJ, "confirmed/track_500.png")
 SCAN_DIR = os.path.join(PROJ, "scans")
 SCAN_STATE = os.path.join(SCAN_DIR, "scan_dict.npz")
 os.makedirs(SCAN_DIR, exist_ok=True)
@@ -347,7 +350,8 @@ def find_gates(fvx, fvy):
             has_unk = any(gget_plan(cx+dx, cy+dy) == UNKNOWN
                           for dy in (-1,0,1) for dx in (-1,0,1))
             # 门=未知前沿。黑名单门（bounce 撞墙的）跳过
-            if has_unk and wall_dist(cx, cy) > 1 and (cx, cy) not in bad_gates:
+            # wall_dist 过滤：>ROBOT_R-1 保证机器人能站（缺口处放宽 1 格）
+            if has_unk and wall_dist(cx, cy) > ROBOT_R - 1 and (cx, cy) not in bad_gates:
                 gates.append((cg, cx, cy))
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             js = jump_steps(cx, cy, dx, dy)
@@ -509,7 +513,7 @@ def build_xml():
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
-  <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{MAP}"/>
+  <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{RENDER_MAP}"/>
     {LM_ASSETS}
   </asset>
   <worldbody>
