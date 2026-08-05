@@ -46,7 +46,7 @@ WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
 WALL_PENALTY = 3
 UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
 VORONOI_C = 2.0      # 走中间代价系数：penalty = C/d² (d=离墙格数)，KNOWN_MAP_MODE 下启用
-MAX_GATE_DIST = 150  # 门搜索距离上限(格=15m)——找太远的门浪费全图搜索，走过去再找
+MAX_GATE_DIST = 300  # 门搜索距离上限(格=30m)——蛇形通道门常在20-30m外，30m覆盖整通道；避免全图(500格)搜索
 ASTAR_MAX_EXPAND = 30000
 
 MIN_SPEED = 1.0; SPEED_FACTOR = 1.5
@@ -339,8 +339,9 @@ def find_gates(fvx, fvy):
         cg = g_score.get((cx,cy), 9999)
         if gates and cg > MAX_GATE_DIST:
             break
-        # 距离剪枝：超过搜索半径的格不扩展（远处门走过去再找）
-        if abs(cx-fvx) + abs(cy-fvy) > search_radius:
+        # 距离剪枝：路径代价超过搜索半径的格不扩展（远处门走过去再找）
+        # 用 g_score(路径代价) 而非曼哈顿——蛇形通道路径近但直线远的门不会被误剪
+        if cg > search_radius:
             continue
         if gget_plan(cx, cy) == FREE:
             has_unk = any(gget_plan(cx+dx, cy+dy) == UNKNOWN
