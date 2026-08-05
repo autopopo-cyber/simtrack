@@ -88,10 +88,21 @@ ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
 ap.add_argument("--vision", type=int, default=0, help="1=启用视觉地标识别（EGL渲染慢，默认关）")
+ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
+ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
 args = ap.parse_args()
 
 if args.seed is not None:
     FIXED_SEED = args.seed
+
+# 目标动态设置（--target start|finish）
+if args.target == "start":
+    FINISH = (2.5, 2.5)
+elif args.target == "finish":
+    FINISH = (2.5, 47.5)
+else:
+    print(f"  [ARG] 未知目标: {args.target}，用 finish", flush=True)
+    FINISH = (2.5, 47.5)
 
 # ═══════════════════════════════════════════
 # SLAM字典地图
@@ -171,6 +182,22 @@ def _obs_hits_wall(ox, oy, r):
         if sample_hf(wx, wy) != ROAD_PIX:
             return True
     return False
+
+def random_road_pos(seed, min_dist_from=5.0, from_pos=(2.5, 2.5)):
+    """随机采样道路位置（不在墙里、不在墙边、不在障碍里、离给定点够远）。绑架测试用。"""
+    rng = random.Random(seed)
+    for _ in range(8000):
+        wx, wy = rng.uniform(1.0, 49.0), rng.uniform(1.0, 49.0)
+        if sample_hf(wx, wy) != ROAD_PIX:
+            continue                       # 不在墙里
+        if _obs_hits_wall(wx, wy, 0.7):
+            continue                       # 不在墙边
+        if any(math.hypot(wx-ox, wy-oy) < OBS_CLEAR + 0.3 for ox, oy in obs_world):
+            continue                       # 不在障碍里
+        if math.hypot(wx-from_pos[0], wy-from_pos[1]) < min_dist_from:
+            continue                       # 离目标别太近（绑架测试才有意义）
+        return wx, wy
+    return 25.0, 25.0  # fallback 中心（大概率是路）
 
 obs_world = gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
@@ -704,7 +731,13 @@ print(f"━━━ 萤火 Firefly v3 SLAM headless ━━━ {VOXEL}m 三级跳A*
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
-d.qpos[0]=2.5; d.qpos[1]=2.5; mujoco.mj_forward(m,d)
+if args.random_start:
+    rs_x, rs_y = random_road_pos(FIXED_SEED + 1000, min_dist_from=5.0, from_pos=FINISH)
+    d.qpos[0] = rs_x; d.qpos[1] = rs_y
+    print(f"  [KIDNAP] 随机起点: ({rs_x:.1f}, {rs_y:.1f}) → 目标 {FINISH}", flush=True)
+else:
+    d.qpos[0]=2.5; d.qpos[1]=2.5
+mujoco.mj_forward(m,d)
 
 # EGL 离屏渲染
 os.makedirs(args.out_dir, exist_ok=True)
