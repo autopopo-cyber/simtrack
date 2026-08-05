@@ -840,67 +840,78 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if vis is not None:
         vis.scan_once(step)
 
-    # 决策
-    # 强制重规划：bounce 过多说明当前路径失效（偏离/被挡），换目标
-    if path is not None and mv.bounce - _plan_bounce_base > 8:
-        # 当前门走不通（bounce 多）→ 拉黑，下次换门
-        if gate is not None and len(gates) > 1:
-            bad_gates.add((gate[1], gate[2]))
-        path = None; path_idx = 0; wander = 0; last_dist = 999
-        _plan_bounce_base = mv.bounce
     if path is None or path_idx >= len(path):
-        gates, came_from = find_gates(vx, vy)
-        gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0),
-                         robot=(bx, by), fin=FINISH)
-        if step % 10000 == 0:
-            print(f"    [DECIDE] step={step} gates={len(gates)} gate={'None' if gate is None else f'({gate[1]*VOXEL:.1f},{gate[2]*VOXEL:.1f})'} pos=({bx:.1f},{by:.1f})", flush=True)
-        if gate is not None:
-            cg, gx, gy, _gsize = gate
-            path = fine_path(vx, vy, gx, gy, came_from)
-            # 失败换门：A* 找不到当前门就试下一个（不 bounce，借鉴 frontier rank 机制）
-            try:
-                gidx = gates.index(gate)
-            except ValueError:
-                gidx = -1
-            tries = 0
-            while not path and tries < 3:
-                tries += 1
-                gidx += 1
-                if gidx >= len(gates):
-                    break
-                gate = gates[gidx]
+        if KNOWN_MAP_MODE:
+            # KNOWN_MAP_MODE：地图已知，直接 A* 到终点（不找门——地图无 UNKNOWN 前沿）
+            path = astar_to(vx, vy, int(FINISH[0]/VOXEL), int(FINISH[1]/VOXEL))
+            if path:
+                path_idx = 0; wander = 0; last_dist = 999; no_gate_count = 0
+                stats["gates_selected"] += 1
+                if step % 10000 == 0:
+                    print(f"    [DECIDE] KNOWN_MAP path={len(path)} →{FINISH} pos=({bx:.1f},{by:.1f})", flush=True)
+            else:
+                # A* 失败（新障碍挡住旧地图路径）→ 先避障，下轮重规划
+                path = None; path_idx = 0; no_gate_count += 1
+                mv._bounce(60, 120)
+        else:
+            # 强制重规划：bounce 过多说明当前路径失效（偏离/被挡），换目标
+            if path is not None and mv.bounce - _plan_bounce_base > 8:
+                if gate is not None and len(gates) > 1:
+                    bad_gates.add((gate[1], gate[2]))
+                path = None; path_idx = 0; wander = 0; last_dist = 999
+                _plan_bounce_base = mv.bounce
+            gates, came_from = find_gates(vx, vy)
+            gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0),
+                             robot=(bx, by), fin=FINISH)
+            if step % 10000 == 0:
+                print(f"    [DECIDE] step={step} gates={len(gates)} gate={'None' if gate is None else f'({gate[1]*VOXEL:.1f},{gate[2]*VOXEL:.1f})'} pos=({bx:.1f},{by:.1f})", flush=True)
+            if gate is not None:
                 cg, gx, gy, _gsize = gate
                 path = fine_path(vx, vy, gx, gy, came_from)
-            if not path:
-                # 所有候选门都不可达：不卡死，bounce 找路（下轮重试）
-                path = None; path_idx = 0; wander = 0; last_dist = 999
-                no_gate_count += 1
-                mv._bounce(60, 120)
-            else:
-                path_idx = 0; wander = 0; last_dist = 999
-                no_gate_count = 0
-                stats["gates_selected"] += 1
-                print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}", flush=True)
-        else:
-            no_gate_count += 1
-            if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
-                saved = False
-                for i in range(len(milestones)-2, -1, -1):
-                    if i in back_blacklist:
-                        continue  # 已 BACK 过但没新门，跳过（防死循环）
-                    mx, my = milestones[i]
-                    bp = astar_to(vx, vy, mx, my)
-                    if bp:
-                        path = bp; path_idx = 0; wander = 0; last_dist = 999
-                        no_gate_count = 0
-                        stats["backtracks"] += 1
-                        back_blacklist.add(i)
-                        print(f"  [BACK] [{step}] →路标#{i}", flush=True)
-                        saved = True
+                # 失败换门：A* 找不到当前门就试下一个（不 bounce，借鉴 frontier rank 机制）
+                try:
+                    gidx = gates.index(gate)
+                except ValueError:
+                    gidx = -1
+                tries = 0
+                while not path and tries < 3:
+                    tries += 1
+                    gidx += 1
+                    if gidx >= len(gates):
                         break
-                if not saved:
-                    if no_gate_count < 10: mv._bounce(90, 180)
-                    else: mv._bounce(150, 210)
+                    gate = gates[gidx]
+                    cg, gx, gy, _gsize = gate
+                    path = fine_path(vx, vy, gx, gy, came_from)
+                if not path:
+                    # 所有候选门都不可达：不卡死，bounce 找路（下轮重试）
+                    path = None; path_idx = 0; wander = 0; last_dist = 999
+                    no_gate_count += 1
+                    mv._bounce(60, 120)
+                else:
+                    path_idx = 0; wander = 0; last_dist = 999
+                    no_gate_count = 0
+                    stats["gates_selected"] += 1
+                    print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}", flush=True)
+            else:
+                no_gate_count += 1
+                if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
+                    saved = False
+                    for i in range(len(milestones)-2, -1, -1):
+                        if i in back_blacklist:
+                            continue  # 已 BACK 过但没新门，跳过（防死循环）
+                        mx, my = milestones[i]
+                        bp = astar_to(vx, vy, mx, my)
+                        if bp:
+                            path = bp; path_idx = 0; wander = 0; last_dist = 999
+                            no_gate_count = 0
+                            stats["backtracks"] += 1
+                            back_blacklist.add(i)
+                            print(f"  [BACK] [{step}] →路标#{i}", flush=True)
+                            saved = True
+                            break
+                    if not saved:
+                        if no_gate_count < 10: mv._bounce(90, 180)
+                        else: mv._bounce(150, 210)
 
     # 执行
     if step % 10000 == 0:
