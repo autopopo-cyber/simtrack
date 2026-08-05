@@ -828,9 +828,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     # B阶段：运行中障碍变化（--obs-reseed 指定步数换新障碍 seed）
     if args.obs_reseed > 0 and step == args.obs_reseed:
-        global obs_world
         old_obs = list(obs_world)
-        obs_world = gen_obstacles(FIXED_SEED + 777)  # 新障碍位置
+        obs_world = gen_obstacles(FIXED_SEED + 777)  # 新障碍位置（顶层代码直接赋值，全局生效）
         print(f"  [OBS] step={step} 障碍变化: {len(old_obs)}→{len(obs_world)} 个", flush=True)
         # 强制重规划（当前路径可能穿过新障碍）
         path = None; path_idx = 0; wander = 0; last_dist = 999
