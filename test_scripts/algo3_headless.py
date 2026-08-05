@@ -40,6 +40,7 @@ MAX_GATES = 200
 WALL_SCAN_RADIUS = 10
 WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
 WALL_PENALTY = 3
+UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
 MAX_GATE_DIST = 3000
 ASTAR_MAX_EXPAND = 30000
 
@@ -52,7 +53,7 @@ STOP_MARGIN = 0.4  # 停车时距障碍的安全余量 (m)
 LOOKAHEAD = 4.0    # 前瞻测距上限 (m)
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
 
-EXPLORE_MODE = "far"
+EXPLORE_MODE = "score"
 MIX_THRESHOLD = 50
 INIT_SCAN_STEPS = 200
 LIDAR_TICK = 20; RENDER_SKIP = 20
@@ -206,7 +207,7 @@ def jump_steps(vx, vy, dx, dy):
     else:               max_jump = JUMP_NEAR
     for step in range(1, max_jump + 1):
         nx, ny = vx + dx*step, vy + dy*step
-        if not walkable(nx, ny):
+        if not traversable(nx, ny):
             return step - 1
     return max_jump
 
@@ -225,6 +226,13 @@ def wall_dist(vx, vy):
 def walkable(vx, vy):
     return gget(vx, vy) == FREE and wall_dist(vx, vy) > ROBOT_R
 
+def traversable(vx, vy):
+    """探索可通行：FREE 或 UNKNOWN 都行（WALL 不行）。
+    核心：frontier 探索允许走向未知——A* 规划激进，执行层(Mover)实时避障兜底。
+    真实机器人也是这么干的：未知区域可通行，撞到才知道有墙。
+    """
+    return gget(vx, vy) != WALL
+
 def line_clear(vx1, vy1, vx2, vy2):
     steps = max(abs(vx2-vx1), abs(vy2-vy1))
     if steps == 0: return True
@@ -238,8 +246,9 @@ def line_clear(vx1, vy1, vx2, vy2):
 # ═══════════════════════════════════════════
 
 def _nearest_walkable(vx, vy, max_r=8):
-    """墙边脱困：从 (vx,vy) BFS 找最近的 walkable 格（机器人贴墙时跳不出 jump_steps）"""
-    if walkable(vx, vy):
+    """墙边脱困：从 (vx,vy) BFS 找最近的 walkable 格（机器人贴墙时跳不出 jump_steps）
+    放宽到 traversable：机器人位置贴墙边但前方可能是未知区域，也能起步"""
+    if traversable(vx, vy):
         return vx, vy
     seen = {(vx, vy)}
     q = [(vx, vy, 0)]
@@ -252,15 +261,15 @@ def _nearest_walkable(vx, vy, max_r=8):
             if (nx,ny) in seen:
                 continue
             seen.add((nx,ny))
-            if walkable(nx, ny):
+            if traversable(nx, ny):
                 return nx, ny
             q.append((nx, ny, dist+1))
     return None
 
 def find_gates(fvx, fvy):
-    # 起点放宽：机器人物理位置可能贴墙边（wall_dist ≤ ROBOT_R），
+    # 起点放宽：机器人物理位置可能是 UNKNOWN（刚起步未扫描）或贴墙边，
     # 但已实际站在那，必须允许寻路，否则 find_gates 返回空 → 主循环死循环
-    if gget(fvx, fvy) != FREE:
+    if gget(fvx, fvy) == WALL:
         return [], {}
     start = _nearest_walkable(fvx, fvy)
     if start is None:
@@ -280,7 +289,8 @@ def find_gates(fvx, fvy):
         if gget(cx, cy) == FREE:
             has_unk = any(gget(cx+dx, cy+dy) == UNKNOWN
                           for dy in (-1,0,1) for dx in (-1,0,1))
-            if has_unk and wall_dist(cx, cy) > CLEARANCE:
+            # 门=未知前沿。黑名单门（bounce 撞墙的）跳过
+            if has_unk and wall_dist(cx, cy) > 1 and (cx, cy) not in bad_gates:
                 gates.append((cg, cx, cy))
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             js = jump_steps(cx, cy, dx, dy)
@@ -288,20 +298,79 @@ def find_gates(fvx, fvy):
             nx, ny = cx + dx*js, cy + dy*js
             wd = wall_dist(nx, ny)
             penalty = max(0, WALL_BUFFER_CELLS - wd) * WALL_PENALTY
+            # UNKNOWN 格可通行但代价高（优先已知路，必要时才穿未知）
+            if gget(nx, ny) == UNKNOWN:
+                penalty += UNKNOWN_PENALTY
             ng = cg + js + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
                 g_score[(nx,ny)] = ng
                 came_from[(nx,ny)] = (cx,cy)
                 heapq.heappush(open_set, (ng, nx, ny))
-    return gates, came_from
+    return cluster_gates(gates), came_from
 
-def pick_gate(gates, mode="far", stuck=False):
+def cluster_gates(gates, min_size=8):
+    """门格聚类：相邻门格 BFS 聚成 region，取质心+size。借鉴 frontier_exploration。
+    gates: [(cg, vx, vy)] → [(cg, cx, cy, size)]，按质心格 cg 升序（近→远）
+    """
+    if not gates:
+        return []
+    cells = [(vx, vy) for _, vx, vy in gates]
+    cell_set = set(cells)
+    visited = set()
+    regions = []
+    for cg, vx, vy in gates:
+        if (vx, vy) in visited:
+            continue
+        # BFS 聚簇（4连通）
+        cluster = []
+        q = [(vx, vy)]
+        visited.add((vx, vy))
+        while q:
+            cx, cy = q.pop()
+            cluster.append((cx, cy))
+            for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
+                nx, ny = cx+dx, cy+dy
+                if (nx, ny) in cell_set and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    q.append((nx, ny))
+        if len(cluster) < min_size:
+            continue  # 过滤小区域（噪声/缝隙）
+        sx = sum(c[0] for c in cluster) // len(cluster)
+        sy = sum(c[1] for c in cluster) // len(cluster)
+        best_cg = min(c for c, x, y in gates if (x, y) in cluster)
+        regions.append((best_cg, sx, sy, len(cluster)))
+    regions.sort(key=lambda r: r[0])
+    return regions
+
+def pick_gate(gates, mode="score", stuck=False, robot=(0, 0), fin=(0, 0)):
     if not gates: return None
     if stuck: return gates[0]
     if mode == "far": return gates[-1]
     if mode == "near": return gates[0]
     if mode == "mix":
         return gates[-1] if len(gates) >= MIX_THRESHOLD else gates[0]
+    if mode == "score":
+        # 终点导向：任务=到达终点，优先向终点方向推进的门
+        # score = 0.55·advance + 0.25·(1/dist) + 0.20·(size/50)
+        # advance 主导：蛇形赛道 y 从 2.5→47.5，推进门 = y 增大方向
+        bx, by = robot
+        fx, fy = fin
+        best = None; best_score = -1
+        for g in gates:
+            cg, gx, gy, size = g
+            wx, wy = (gx+0.5)*VOXEL, (gy+0.5)*VOXEL
+            d = math.hypot(wx - bx, wy - by)
+            d = max(d, 1.0)
+            # 向终点推进度：目标-机器人 在 终点方向上的投影（归一化到 0~1）
+            advance = 0.0
+            denom = math.hypot(fx-bx, fy-by)
+            if denom > 1e-6:
+                adv = ((wx-bx)*(fx-bx) + (wy-by)*(fy-by)) / (denom * max(d, 0.01))
+                advance = max(0.0, min(1.0, adv))
+            score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
+            if score > best_score:
+                best_score = score; best = g
+        return best
     return gates[0]
 
 def fine_path(sx, sy, gx, gy, came_from, to_world=True):
@@ -316,8 +385,8 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
     return path
 
 def astar_to(fvx, fvy, tfx, tfy):
-    # 起点放宽（同上）：机器人物理位置贴墙边也必须能回溯寻路
-    if gget(fvx, fvy) != FREE or not walkable(tfx, tfy):
+    # 起点放宽：未知/已知都可起步（WALL 才拒绝），机器人物理位置贴墙边也必须能回溯寻路
+    if gget(fvx, fvy) == WALL or not walkable(tfx, tfy):
         return None
     start = _nearest_walkable(fvx, fvy)
     if start is None:
@@ -417,7 +486,7 @@ class Mover:
         else:
             self.speed = max(v_des, self.speed - A_DECEL*dt)
         # ── 前方被堵且已停住（speed≈0）→ 预判转向，不碰撞 ──
-        if self.speed <= 0.02 and d_clear < STOP_MARGIN + 0.15:
+        if self.speed <= 0.05 and d_clear < STOP_MARGIN + 0.15:
             _hit_wall = sample_hf(bx, by) != ROAD_PIX
             _near_obs = any(math.hypot(bx-ox, by-oy) < OBS_CLEAR for ox, oy in obs_world)
             if self.bounce % 5 == 0:
@@ -431,7 +500,18 @@ class Mover:
             self.stuck_t = step; self.stuck_x = bx; self.stuck_y = by
         # 执行移动（沿轴向速度，物理 yaw 由 hinge 积分）
         vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
-        self.d.qvel[0] = vx; self.d.qvel[1] = vy; self.d.qvel[2] = 0
+        nx, ny = bx+vx*dt, by+vy*dt
+        # 硬防穿墙/障碍：下一位置 blocked（中心0.2m圆触障碍）就不动——物理上不可能穿。
+        # bounce 决策已由上方 STOP 分支负责，这里只保证不移动（防低速漂移滑入）
+        if blocked(nx, ny):
+            self.speed = 0.0
+            self.d.qvel[0] = 0; self.d.qvel[1] = 0; self.d.qvel[2] = 0
+            # 从经验学习：撞到的未知格写回地图为 WALL（A* 下次就不会规划穿墙路径）
+            gvx, gvy = int(nx/VOXEL), int(ny/VOXEL)
+            if gget(gvx, gvy) == UNKNOWN:
+                gset(gvx, gvy, WALL)
+        else:
+            self.d.qvel[0] = vx; self.d.qvel[1] = vy; self.d.qvel[2] = 0
         mujoco.mj_step(self.m, self.d)
         # 物理积分后同步 yaw（qpos[2] 由 hinge joint 积分，这里读回）
         self.yaw = self.d.qpos[2]
@@ -447,16 +527,22 @@ class Mover:
         tx, ty = self.target
         tgt_yaw = math.atan2(ty - by, tx - bx)
         # 目标方向 ± 角度，全部测距，选能走最远的（斜墙/墙柱前 0.7m 内被挡但绕过去就通）
+        # 候选每 5° 扫一圈（防稀疏角度漏掉窄缺口——迷宫段间墙缺口只有 ~10° 宽）
+        # 评分：优先向目标推进（advance 高），推进方向里选距离远；避免选回头路
         candidates = []
-        for deg in [10, 20, 35, 50, 70, 90, 120, 150]:
+        for deg in range(0, 360, 5):
             candidates.append(tgt_yaw + math.radians(deg))
-            candidates.append(tgt_yaw - math.radians(deg))
-        candidates.append(tgt_yaw + math.pi)  # 掉头
-        best_yaw, best_d = None, -1.0
+        best_yaw, best_d, best_score = None, -1.0, -1e9
         for cand in candidates:
             d = self._forward_clear(bx, by, cand)
-            if d > best_d:
-                best_d, best_yaw = d, cand
+            if d < STOP_MARGIN:
+                continue
+            # 推进度：候选方向在目标方向上的投影（1=完全朝目标，-1=完全背离）
+            dot = math.cos(cand - tgt_yaw)
+            # score = 推进度*2 + 距离（推进优先，同推进度比距离）
+            score = dot * 2.0 + min(d, 4.0)
+            if score > best_score:
+                best_score, best_d, best_yaw = score, d, cand
         if best_yaw is not None and best_d >= STOP_MARGIN:
             self.yaw = best_yaw
             self.d.qpos[2] = best_yaw  # 同步物理 yaw，狗身体立即转到新方向
@@ -573,12 +659,15 @@ mv = Mover(m, d)
 step = 0; t0 = time.time()
 last_mx = last_my = 0
 path = None; path_idx = 0; _plan_bounce_base = 0
+gate = None; gates = []
 no_gate_count = 0
 wander = 0; last_dist = 999
 milestones = []
 start_pos = (d.qpos[0], d.qpos[1])
 milestones.append((int(start_pos[0]/VOXEL), int(start_pos[1]/VOXEL)))
 last_mx, last_my = milestones[0]
+back_blacklist = set()  # BACK 过的路标索引（防死循环）
+bad_gates = set()       # bounce 撞墙的门格黑名单（防反复选同一死门）
 
 print(f"=== Firefly v3 headless start: seed={FIXED_SEED} max_steps={args.max_steps} ===", flush=True)
 
@@ -609,18 +698,36 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     # 决策
     # 强制重规划：bounce 过多说明当前路径失效（偏离/被挡），换目标
     if path is not None and mv.bounce - _plan_bounce_base > 8:
+        # 当前门走不通（bounce 多）→ 拉黑，下次换门
+        if gate is not None and len(gates) > 1:
+            bad_gates.add((gate[1], gate[2]))
         path = None; path_idx = 0; wander = 0; last_dist = 999
         _plan_bounce_base = mv.bounce
     if path is None or path_idx >= len(path):
         gates, came_from = find_gates(vx, vy)
-        gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
+        gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0),
+                         robot=(bx, by), fin=FINISH)
         if step % 10000 == 0:
             print(f"    [DECIDE] step={step} gates={len(gates)} gate={'None' if gate is None else f'({gate[1]*VOXEL:.1f},{gate[2]*VOXEL:.1f})'} pos=({bx:.1f},{by:.1f})", flush=True)
         if gate is not None:
-            cg, gx, gy = gate
+            cg, gx, gy, _gsize = gate
             path = fine_path(vx, vy, gx, gy, came_from)
+            # 失败换门：A* 找不到当前门就试下一个（不 bounce，借鉴 frontier rank 机制）
+            try:
+                gidx = gates.index(gate)
+            except ValueError:
+                gidx = -1
+            tries = 0
+            while not path and tries < 3:
+                tries += 1
+                gidx += 1
+                if gidx >= len(gates):
+                    break
+                gate = gates[gidx]
+                cg, gx, gy, _gsize = gate
+                path = fine_path(vx, vy, gx, gy, came_from)
             if not path:
-                # A* 找不到路径：不卡死，bounce 找路（下轮重试）
+                # 所有候选门都不可达：不卡死，bounce 找路（下轮重试）
                 path = None; path_idx = 0; wander = 0; last_dist = 999
                 no_gate_count += 1
                 mv._bounce(60, 120)
@@ -634,12 +741,15 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
                 saved = False
                 for i in range(len(milestones)-2, -1, -1):
+                    if i in back_blacklist:
+                        continue  # 已 BACK 过但没新门，跳过（防死循环）
                     mx, my = milestones[i]
                     bp = astar_to(vx, vy, mx, my)
                     if bp:
                         path = bp; path_idx = 0; wander = 0; last_dist = 999
                         no_gate_count = 0
                         stats["backtracks"] += 1
+                        back_blacklist.add(i)
                         print(f"  [BACK] [{step}] →路标#{i}", flush=True)
                         saved = True
                         break
@@ -690,11 +800,12 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         stats["arrived"] = True
         break
 
-    # 碰撞检测（主人要求碰撞=0）：机器人位置进墙/障碍就算碰撞
-    if blocked(bx, by):
+    # 碰撞检测（主人要求碰撞=0）：真实几何——机器人中心进入障碍安全圈才算碰撞
+    # is_obstacle_world 已含 OBS_CLEAR=0.7（障碍半径0.5+机器人半径0.2），中心<0.7m即碰撞
+    if is_obstacle_world(d.qpos[0], d.qpos[1]):
         stats["collisions"] += 1
         if stats["collisions"] == 1 or stats["collisions"] % 100 == 0:
-            print(f"  ⚠ COLLISION #{stats['collisions']} @({bx:.2f},{by:.2f}) step={step}", flush=True)
+            print(f"  ⚠ COLLISION #{stats['collisions']} @({d.qpos[0]:.2f},{d.qpos[1]:.2f}) step={step}", flush=True)
 
     # 离屏渲染
     if RENDER_OK and args.render_every > 0 and step % args.render_every == 0:
