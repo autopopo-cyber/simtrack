@@ -194,7 +194,9 @@ def scan(bx, by):
                 if gget(prev_vx, prev_vy) == UNKNOWN:
                     gset(prev_vx, prev_vy, FREE)
                 break
-            if gget(vx, vy) == UNKNOWN:
+            # 射线清除：穿过格强制 FREE（旧障碍被"照"掉）。
+            # gset 只写 live 层，static 的墙不受影响。
+            if gget(vx, vy) != FREE:
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
 
