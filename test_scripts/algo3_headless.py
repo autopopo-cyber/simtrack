@@ -90,8 +90,8 @@ ap.add_argument("--timeout", type=float, default=900, help="墙钟超时（秒�
 ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（默认 auto）")
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
-ap.add_argument("--vision", type=int, default=0, help="1=启用视觉地标识别（EGL渲染慢，默认关）")
-ap.add_argument("--landmarks", type=int, default=0, help="1=启用标牌几何（贴墙，不挡路）")
+ap.add_argument("--vision", type=int, default=1, help="视觉识别（hfield降分辨率后223ms/帧，默认开）")
+ap.add_argument("--landmarks", type=int, default=1, help="标牌几何（contype=0零物理开销，默认开）")
 ap.add_argument("--obs-reseed", type=int, default=0, help="运行中障碍变化步数：到该步换新障碍 seed（B阶段）")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
@@ -798,12 +798,14 @@ mv = Mover(m, d)
 if args.load_map:
     load_map(args.load_map)
 
-# 视觉地标识别（前置相机 + ArUco；EGL 渲染 3.5s/帧拖慢导航，默认关闭，--vision 1 开启）
+# 视觉地标识别（前置相机 + 颜色识别；EGL软渲染 223ms/帧(hfield降分辨率后)，--vision 1 开启）
 if args.vision:
     try:
         from test_scripts.vision_landmark import VisionLandmark
-        vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=40)
-        print("  [VISION] 视觉地标识别已启用", flush=True)
+        # detect_every=200：每 200 步(1s物理时间)渲染一帧——机器人 2m/s 走 2m/帧，
+        # 标牌 1m 宽在 10m 外可见，不会漏；渲染开销降到可接受
+        vis = VisionLandmark(m, d, renderer, cam_name="bot_cam", detect_every=200)
+        print("  [VISION] 视觉地标识别已启用 (detect_every=200)", flush=True)
     except Exception as e:
         vis = None
         print(f"  [VISION] 视觉不可用: {e}", flush=True)
