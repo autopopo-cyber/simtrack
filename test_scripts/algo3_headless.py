@@ -89,6 +89,7 @@ ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到�
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
 ap.add_argument("--vision", type=int, default=0, help="1=启用视觉地标识别（EGL渲染慢，默认关）")
 ap.add_argument("--landmarks", type=int, default=0, help="1=启用标牌几何（贴墙，不挡路）")
+ap.add_argument("--obs-reseed", type=int, default=0, help="运行中障碍变化步数：到该步换新障碍 seed（B阶段）")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
 args = ap.parse_args()
@@ -824,6 +825,17 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     if step % LIDAR_TICK == 0:
         scan(bx, by)
+
+    # B阶段：运行中障碍变化（--obs-reseed 指定步数换新障碍 seed）
+    if args.obs_reseed > 0 and step == args.obs_reseed:
+        global obs_world
+        old_obs = list(obs_world)
+        obs_world = gen_obstacles(FIXED_SEED + 777)  # 新障碍位置
+        print(f"  [OBS] step={step} 障碍变化: {len(old_obs)}→{len(obs_world)} 个", flush=True)
+        # 强制重规划（当前路径可能穿过新障碍）
+        path = None; path_idx = 0; wander = 0; last_dist = 999
+        _plan_bounce_base = mv.bounce
+        stats["obs_changes"] = stats.get("obs_changes", 0) + 1
 
     # 视觉地标识别（相机帧 + ArUco；看到标牌记录唯一ID）
     if vis is not None:
