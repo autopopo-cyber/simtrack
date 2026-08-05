@@ -26,7 +26,7 @@ SCAN_STATE = os.path.join(SCAN_DIR, "scan_dict.npz")
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 SCALE = 1.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
-SAFE_R = 0.2; SPEED = 4.0; SPEED_MAX = 4.0; YAW_RATE = 1.0
+SAFE_R = 0.2; SPEED = 2.0; SPEED_MAX = 2.0; YAW_RATE = 1.5
 LIDAR_RANGE = 15.0
 
 VOXEL = 0.1
@@ -43,8 +43,13 @@ WALL_PENALTY = 3
 MAX_GATE_DIST = 3000
 ASTAR_MAX_EXPAND = 30000
 
-MIN_SPEED = 3.0; SPEED_FACTOR = 2.0
-BOUNCE_FORCE_DURATION = 0.3
+MIN_SPEED = 1.0; SPEED_FACTOR = 1.5
+# 运动学约束（主人：现实中不允许碰撞）
+# 限速/限加速度/限减速度 + 前瞻测距 + 制动约束 v≤sqrt(2·A_DECEL·d)，物理上保证碰撞=0
+A_ACCEL = 3.0      # 加速度 (m/s²)：速度爬升上限
+A_DECEL = 5.0      # 减速度 (m/s²)：制动能力，任何速度都能在障碍前停住
+STOP_MARGIN = 0.4  # 停车时距障碍的安全余量 (m)
+LOOKAHEAD = 4.0    # 前瞻测距上限 (m)
 STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
 
 EXPLORE_MODE = "far"
@@ -167,7 +172,9 @@ def scan(bx, by):
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
             if is_obstacle_world(wx, wy):
                 gset(vx, vy, WALL)
-                gset(prev_vx, prev_vy, WALL)
+                # prev 格是墙前可通行格（机器人可能站上面），标 FREE 不标 WALL
+                if gget(prev_vx, prev_vy) == UNKNOWN:
+                    gset(prev_vx, prev_vy, FREE)
                 break
             if gget(vx, vy) == UNKNOWN:
                 gset(vx, vy, FREE)
@@ -230,9 +237,35 @@ def line_clear(vx1, vy1, vx2, vy2):
 # 跳步门查找
 # ═══════════════════════════════════════════
 
+def _nearest_walkable(vx, vy, max_r=8):
+    """墙边脱困：从 (vx,vy) BFS 找最近的 walkable 格（机器人贴墙时跳不出 jump_steps）"""
+    if walkable(vx, vy):
+        return vx, vy
+    seen = {(vx, vy)}
+    q = [(vx, vy, 0)]
+    while q:
+        cx, cy, dist = q.pop(0)
+        if dist >= max_r:
+            continue
+        for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
+            nx, ny = cx+dx, cy+dy
+            if (nx,ny) in seen:
+                continue
+            seen.add((nx,ny))
+            if walkable(nx, ny):
+                return nx, ny
+            q.append((nx, ny, dist+1))
+    return None
+
 def find_gates(fvx, fvy):
-    if not walkable(fvx, fvy):
+    # 起点放宽：机器人物理位置可能贴墙边（wall_dist ≤ ROBOT_R），
+    # 但已实际站在那，必须允许寻路，否则 find_gates 返回空 → 主循环死循环
+    if gget(fvx, fvy) != FREE:
         return [], {}
+    start = _nearest_walkable(fvx, fvy)
+    if start is None:
+        return [], {}
+    fvx, fvy = start
     open_set = [(0, fvx, fvy)]
     came_from = {}; g_score = {(fvx, fvy): 0}
     visited = set()
@@ -283,8 +316,13 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
     return path
 
 def astar_to(fvx, fvy, tfx, tfy):
-    if not (walkable(fvx, fvy) and walkable(tfx, tfy)):
+    # 起点放宽（同上）：机器人物理位置贴墙边也必须能回溯寻路
+    if gget(fvx, fvy) != FREE or not walkable(tfx, tfy):
         return None
+    start = _nearest_walkable(fvx, fvy)
+    if start is None:
+        return None
+    fvx, fvy = start
     open_set = [(math.hypot(tfx-fvx, tfy-fvy), fvx, fvy)]
     came_from = {}; g_score = {(fvx, fvy): 0}
     visited_set = set()
@@ -312,7 +350,7 @@ def astar_to(fvx, fvy, tfx, tfy):
 def build_xml():
     OBS_XML = "".join(
         f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
-        f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9"/></body>'
+        f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
     return f"""<mujoco>
@@ -322,13 +360,18 @@ def build_xml():
   <worldbody>
     <light pos="25 25 80" dir="0 0 -1"/>
     {FINISH_XML}{OBS_XML}
-    <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0"/>
+    <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0" contype="0" conaffinity="0"/>
+    <!-- 方案A：边界几何纯可视化（contype=0），防穿墙靠算法走廊检查 -->
+    <geom type="box" size="1.0 25.0 2.0" pos="-1.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
+    <geom type="box" size="1.0 25.0 2.0" pos="51.0 25 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
+    <geom type="box" size="25.0 1.0 2.0" pos="25 -1.0 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
+    <geom type="box" size="25.0 1.0 2.0" pos="25 51.0 1.0" rgba="0.2 0.2 0.2 0" contype="0" conaffinity="0"/>
     <body name="bot" pos="0 0 0.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
-      <!-- 机器狗：水平圆柱（长轴沿 yaw 方向），0.8m 长 × 0.4m 径，保留物理碰撞防穿墙 -->
-      <geom type="capsule" fromto="0 -0.4 0 0 0.4 0" size="0.2" rgba="1 0.3 0 1" friction="0 0 0"/>
+      <!-- 机器狗：水平圆柱（长轴沿 yaw 方向），0.8m 长 × 0.4m 径，contype=0 纯算法控制 -->
+      <geom type="capsule" fromto="0 -0.4 0 0 0.4 0" size="0.2" rgba="1 0.3 0 1" friction="0 0 0" contype="0" conaffinity="0"/>
     </body>
   </worldbody>
 </mujoco>"""
@@ -336,65 +379,105 @@ def build_xml():
 class Mover:
     def __init__(self, m, d):
         self.m, self.d = m, d
-        self.yaw = 0.0; self.speed = SPEED; self.bounce = 0
-        self.force = 0; self.escaping = False
+        self.yaw = 0.0; self.speed = 0.0; self.bounce = 0
         self.stuck_t = 0; self.stuck_x = 0.0; self.stuck_y = 0.0
+        self.target = (FINISH[0], FINISH[1])  # 当前目标（GATE 方向），bounce 时优先朝向
+
+    def _forward_clear(self, bx, by, yaw_ang):
+        """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。blocked() 已含机器人半径膨胀。"""
+        for k in range(1, int(LOOKAHEAD / 0.05) + 1):
+            px = bx + math.cos(yaw_ang) * 0.05 * k
+            py = by + math.sin(yaw_ang) * 0.05 * k
+            if blocked(px, py):
+                return 0.05 * k
+        return LOOKAHEAD
+
     def step(self, tx, ty, step):
         bx, by = self.d.qpos[0], self.d.qpos[1]
         dt = self.m.opt.timestep
-        if not self.escaping:
-            tgt_yaw = math.atan2(ty-by, tx-bx)
-            err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
-            dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
-            self.yaw += dyaw
-            self.speed = max(MIN_SPEED, min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR))
-        # 同步 yaw joint（qpos[2]），让狗身体实际转向（沿轴向前进，不横着走）
-        self.d.qpos[2] = self.yaw
-        vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
-        nx, ny = bx+vx*dt, by+vy*dt
+        self.target = (tx, ty)  # 记录当前目标，bounce 用
+        if step % 10000 == 0:
+            print(f"    [MOVER] step={step} pos=({bx:.1f},{by:.1f}) target=({tx:.1f},{ty:.1f}) yaw={math.degrees(self.yaw):.0f}° speed={self.speed:.2f}", flush=True)
+        # 转向目标（yaw 转向 + 沿轴向速度）
+        tgt_yaw = math.atan2(ty-by, tx-bx)
+        err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
+        dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
+        self.yaw += dyaw
+        # ── 前瞻测距：沿当前 yaw 方向量到障碍的距离 ──
+        d_clear = self._forward_clear(bx, by, self.yaw)
+        # ── 期望速度（限速）：目标距离速度 vs 制动约束，取小 ──
+        v_des = min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR)
+        # 制动约束：当前速度 v 需满足 v² ≤ 2·A_DECEL·(d_clear-STOP_MARGIN)
+        # → 任何速度下急刹都能在障碍前停住，物理上碰撞=0
+        v_brake = math.sqrt(max(0.0, 2.0*A_DECEL*max(0.0, d_clear-STOP_MARGIN)))
+        v_des = min(v_des, v_brake)
+        # ── 加速度/减速度限制：速度不突变，按 A_ACCEL 爬升、A_DECEL 下降 ──
+        if self.speed < v_des:
+            self.speed = min(v_des, self.speed + A_ACCEL*dt)
+        else:
+            self.speed = max(v_des, self.speed - A_DECEL*dt)
+        # ── 前方被堵且已停住（speed≈0）→ 预判转向，不碰撞 ──
+        if self.speed <= 0.02 and d_clear < STOP_MARGIN + 0.15:
+            _hit_wall = sample_hf(bx, by) != ROAD_PIX
+            _near_obs = any(math.hypot(bx-ox, by-oy) < OBS_CLEAR for ox, oy in obs_world)
+            if self.bounce % 5 == 0:
+                print(f"  [STOP] bounce#{self.bounce} @({bx:.1f},{by:.1f}) d_clear={d_clear:.2f} wall={_hit_wall} obs={_near_obs}", flush=True)
+            self._bounce(45, 120)
+            # 转向后本帧不再移动（下帧从新 yaw 重新测距加速）
+        # 卡死检测
         if step-self.stuck_t > STUCK_TIMEOUT:
             if math.hypot(bx-self.stuck_x, by-self.stuck_y) < STUCK_DIST_THRESH:
                 self._bounce(90, 180)
             self.stuck_t = step; self.stuck_x = bx; self.stuck_y = by
-        if self.force > 0:
-            self.force -= 1; self.d.qvel[0] = vx; self.d.qvel[1] = vy
-            if self.force <= 0:
-                self.escaping = False  # force 耗尽复位
-        elif blocked(nx, ny):
-            # 诊断：区分被墙挡还是被障碍物挡
-            _bx, _by = self.d.qpos[0], self.d.qpos[1]
-            _hit_wall = sample_hf(nx, ny) != 128
-            _near_obs = any(math.hypot(nx-ox, ny-oy) < OBS_CLEAR for ox, oy in obs_world)
-            if self.bounce % 5 == 0:
-                print(f"  [BOUNCE] bounce#{self.bounce} @({_bx:.1f},{_by:.1f})→({nx:.1f},{ny:.1f}) wall={_hit_wall} obs={_near_obs}", flush=True)
-            self._bounce(45, 120)
-        else:
-            self.escaping = False
-            self.d.qvel[0] = vx; self.d.qvel[1] = vy
-        mujoco.mj_step(self.m, self.d); return True
+        # 执行移动（沿轴向速度，物理 yaw 由 hinge 积分）
+        vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
+        self.d.qvel[0] = vx; self.d.qvel[1] = vy; self.d.qvel[2] = 0
+        mujoco.mj_step(self.m, self.d)
+        # 物理积分后同步 yaw（qpos[2] 由 hinge joint 积分，这里读回）
+        self.yaw = self.d.qpos[2]
+        return True
+
     def _bounce(self, lo, hi):
-        if not self.escaping:
-            self.bounce += 1; self.escaping = True
-            if self.bounce % 5 == 0:
-                print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
-        # 随机转向，但检查新方向是否可通行（避免 bounce 后直冲进墙/越界）
+        # 无条件计数+转向（防 escaping 卡死）；转向后 speed 已≈0，由 step() 重新加速
+        self.bounce += 1
+        if self.bounce % 5 == 0:
+            print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
+        # 转向：先试目标方向（当前 GATE）的小角度偏转，再试随机（防墙边死循环）
         bx, by = self.d.qpos[0], self.d.qpos[1]
-        dt = self.m.opt.timestep
-        lookahead = max(1.0, self.speed * dt * 8)
-        for _attempt in range(8):
-            deg = random.uniform(lo, hi) * random.choice([-1, 1])
-            cand = self.yaw + math.radians(deg)
-            cx = bx + math.cos(cand) * lookahead
-            cy = by + math.sin(cand) * lookahead
-            if not blocked(cx, cy):
-                self.yaw = cand
-                self.d.qvel[:] = 0
-                self.force = int(BOUNCE_FORCE_DURATION/(SPEED*self.m.opt.timestep))
-                return
-        # 全方向堵 → 180° 掉头（防死角死循环）
-        self.yaw += math.pi
+        tx, ty = self.target
+        tgt_yaw = math.atan2(ty - by, tx - bx)
+        # 目标方向 ± 角度，全部测距，选能走最远的（斜墙/墙柱前 0.7m 内被挡但绕过去就通）
+        candidates = []
+        for deg in [10, 20, 35, 50, 70, 90, 120, 150]:
+            candidates.append(tgt_yaw + math.radians(deg))
+            candidates.append(tgt_yaw - math.radians(deg))
+        candidates.append(tgt_yaw + math.pi)  # 掉头
+        best_yaw, best_d = None, -1.0
+        for cand in candidates:
+            d = self._forward_clear(bx, by, cand)
+            if d > best_d:
+                best_d, best_yaw = d, cand
+        if best_yaw is not None and best_d >= STOP_MARGIN:
+            self.yaw = best_yaw
+            self.d.qpos[2] = best_yaw  # 同步物理 yaw，狗身体立即转到新方向
+            self.d.qvel[:] = 0
+            self.speed = 0.0
+            return
+        # 全部方向都堵（理论死角）→ 随机试几个方向，选能走最远的（防蹭墙死循环）
+        best_yaw, best_d = None, -1.0
+        for _ in range(12):
+            cand = random.uniform(0, 2*math.pi)
+            d = self._forward_clear(bx, by, cand)
+            if d > best_d:
+                best_d, best_yaw = d, cand
+        if best_yaw is not None and best_d >= STOP_MARGIN:
+            self.yaw = best_yaw
+        else:
+            # 连随机都全堵（不可能，兜底）：原地掉头
+            self.yaw += math.pi
+        self.d.qpos[2] = self.yaw
         self.d.qvel[:] = 0
-        self.force = int(BOUNCE_FORCE_DURATION/(SPEED*self.m.opt.timestep))
+        self.speed = 0.0
 
 # ═══════════════════════════════════════════
 # 文件读写
@@ -430,6 +513,7 @@ stats = {
     "backtracks": 0,
     "lost_rescues": 0,
     "bounces": 0,
+    "collisions": 0,
     "milestones": 0,
     "steps": 0,
     "arrived": False,
@@ -488,7 +572,7 @@ mv = Mover(m, d)
 
 step = 0; t0 = time.time()
 last_mx = last_my = 0
-path = None; path_idx = 0
+path = None; path_idx = 0; _plan_bounce_base = 0
 no_gate_count = 0
 wander = 0; last_dist = 999
 milestones = []
@@ -523,16 +607,28 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         scan(bx, by)
 
     # 决策
+    # 强制重规划：bounce 过多说明当前路径失效（偏离/被挡），换目标
+    if path is not None and mv.bounce - _plan_bounce_base > 8:
+        path = None; path_idx = 0; wander = 0; last_dist = 999
+        _plan_bounce_base = mv.bounce
     if path is None or path_idx >= len(path):
         gates, came_from = find_gates(vx, vy)
         gate = pick_gate(gates, EXPLORE_MODE, stuck=(no_gate_count > 0))
+        if step % 10000 == 0:
+            print(f"    [DECIDE] step={step} gates={len(gates)} gate={'None' if gate is None else f'({gate[1]*VOXEL:.1f},{gate[2]*VOXEL:.1f})'} pos=({bx:.1f},{by:.1f})", flush=True)
         if gate is not None:
             cg, gx, gy = gate
             path = fine_path(vx, vy, gx, gy, came_from)
-            path_idx = 0; wander = 0; last_dist = 999
-            no_gate_count = 0
-            stats["gates_selected"] += 1
-            print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}", flush=True)
+            if not path:
+                # A* 找不到路径：不卡死，bounce 找路（下轮重试）
+                path = None; path_idx = 0; wander = 0; last_dist = 999
+                no_gate_count += 1
+                mv._bounce(60, 120)
+            else:
+                path_idx = 0; wander = 0; last_dist = 999
+                no_gate_count = 0
+                stats["gates_selected"] += 1
+                print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}", flush=True)
         else:
             no_gate_count += 1
             if no_gate_count > MAX_NO_GATE and len(milestones) > 1:
@@ -552,6 +648,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                     else: mv._bounce(150, 210)
 
     # 执行
+    if step % 10000 == 0:
+        print(f"    [EXEC] step={step} path={'None' if path is None else len(path)} idx={path_idx} no_gate={no_gate_count} pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f})", flush=True)
     if path is not None and path_idx < len(path):
         tx, ty = path[path_idx]
         ddist = math.hypot(tx-bx, ty-by)
@@ -580,7 +678,9 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             wander = max(0, wander-1); last_dist = ddist
             mv.step(tx, ty, step)
     else:
-        mv._bounce(90, 180)
+        # path 不可用（find_gates 空/回溯失败）：向终点走，运动学约束自己避障
+        # （不能只 _bounce 不 step——那会原地转向永不移动，stuck 检测也不触发）
+        mv.step(FINISH[0], FINISH[1], step)
 
     step += 1
 
@@ -590,6 +690,12 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         stats["arrived"] = True
         break
 
+    # 碰撞检测（主人要求碰撞=0）：机器人位置进墙/障碍就算碰撞
+    if blocked(bx, by):
+        stats["collisions"] += 1
+        if stats["collisions"] == 1 or stats["collisions"] % 100 == 0:
+            print(f"  ⚠ COLLISION #{stats['collisions']} @({bx:.2f},{by:.2f}) step={step}", flush=True)
+
     # 离屏渲染
     if RENDER_OK and args.render_every > 0 and step % args.render_every == 0:
         render_frame(step)
@@ -597,12 +703,13 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     # 进度日志
     if step % 20000 == 0:
         cov = coverage_pct()
-        print(f"  ... step={step} F={_cnt[FREE]} W={_cnt[WALL]} ms={len(milestones)} cov={cov:.1f}% t={time.time()-t0:.0f}s", flush=True)
+        print(f"  ... step={step} F={_cnt[FREE]} W={_cnt[WALL]} ms={len(milestones)} cov={cov:.1f}% t={time.time()-t0:.0f}s pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f}) yaw={math.degrees(d.qpos[2]):.0f}°", flush=True)
 
 # ── 收尾统计 ──
 stats["steps"] = step
 stats["time_sec"] = round(time.time() - t0, 2)
 stats["bounces"] = mv.bounce
+stats["collisions"] = stats.get("collisions", 0)
 stats["milestones"] = len(milestones)
 stats["final_pos"] = [round(d.qpos[0], 2), round(d.qpos[1], 2)]
 stats["final_coverage"] = round(coverage_pct(), 2)
