@@ -46,7 +46,7 @@ WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
 WALL_PENALTY = 3
 UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
 VORONOI_C = 2.0      # 走中间代价系数：penalty = C/d² (d=离墙格数)，KNOWN_MAP_MODE 下启用
-MAX_GATE_DIST = 3000
+MAX_GATE_DIST = 150  # 门搜索距离上限(格=15m)——找太远的门浪费全图搜索，走过去再找
 ASTAR_MAX_EXPAND = 30000
 
 MIN_SPEED = 1.0; SPEED_FACTOR = 1.5
@@ -331,6 +331,7 @@ def find_gates(fvx, fvy):
     came_from = {}; g_score = {(fvx, fvy): 0}
     visited = set()
     gates = []
+    search_radius = MAX_GATE_DIST  # 门搜索半径（格）：只搜附近，避免全图 BFS 拖慢
     while open_set and len(came_from) < ASTAR_MAX_EXPAND and len(gates) < MAX_GATES:
         _, cx, cy = heapq.heappop(open_set)
         if (cx,cy) in visited: continue
@@ -338,6 +339,9 @@ def find_gates(fvx, fvy):
         cg = g_score.get((cx,cy), 9999)
         if gates and cg > MAX_GATE_DIST:
             break
+        # 距离剪枝：超过搜索半径的格不扩展（远处门走过去再找）
+        if abs(cx-fvx) + abs(cy-fvy) > search_radius:
+            continue
         if gget_plan(cx, cy) == FREE:
             has_unk = any(gget_plan(cx+dx, cy+dy) == UNKNOWN
                           for dy in (-1,0,1) for dx in (-1,0,1))
