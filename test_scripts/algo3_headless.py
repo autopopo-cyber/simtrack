@@ -425,10 +425,8 @@ def pick_gate(gates, mode="score", stuck=False, robot=(0, 0), fin=(0, 0)):
                 adv = ((wx-bx)*(fx-bx) + (wy-by)*(fy-by)) / (denom * max(d, 0.01))
                 advance = max(0.0, min(1.0, adv))
             if not KNOWN_MAP_MODE:
-                # 探索：信息增益 = 门周围 5x5 UNKNOWN 数（新扫面积），加权鼓励去未知多的地方
-                gain = sum(1 for dy in range(-2,3) for dx in range(-2,3)
-                           if gget_plan(gx+dx, gy+dy) == UNKNOWN)
-                score = 0.45 * advance + 0.15 * (1.0/d) + 0.15 * (size / 50.0) + 0.25 * (gain / 25.0)
+                # 探索：终点导向 score（信息增益实验失败——导致反复横跳，回退纯 advance 评分）
+                score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
             else:
                 score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
             if score > best_score:
