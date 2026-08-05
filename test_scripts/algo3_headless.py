@@ -354,7 +354,8 @@ def find_gates(fvx, fvy):
             if KNOWN_MAP_MODE:
                 penalty += VORONOI_C / (max(1, wd) * max(1, wd))
             # UNKNOWN 格可通行但代价高（优先已知路，必要时才穿未知）
-            if gget_plan(nx, ny) == UNKNOWN:
+            # KNOWN_MAP_MODE：穿越未知无惩罚（已知地图模式要快速穿行，执行层实时避障）
+            if gget_plan(nx, ny) == UNKNOWN and not KNOWN_MAP_MODE:
                 penalty += UNKNOWN_PENALTY
             ng = cg + js + penalty
             if (nx,ny) not in g_score or ng < g_score[(nx,ny)]:
@@ -448,7 +449,13 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
 
 def astar_to(fvx, fvy, tfx, tfy):
     # 起点放宽：未知/已知都可起步（WALL 才拒绝），机器人物理位置贴墙边也必须能回溯寻路
-    if gget_plan(fvx, fvy) == WALL or not walkable(tfx, tfy):
+    if gget_plan(fvx, fvy) == WALL:
+        return None
+    # 终点要求：探索模式要 walkable（已确认自由区）；KNOWN_MAP_MODE 放宽到 traversable（未知也可达，执行层实时避障）
+    if KNOWN_MAP_MODE:
+        if not traversable(tfx, tfy):
+            return None
+    elif not walkable(tfx, tfy):
         return None
     start = _nearest_walkable(fvx, fvy)
     if start is None:
@@ -673,15 +680,24 @@ def load_state():
     return loaded, str(data["mode"])
 
 def save_map(path):
-    """保存当前 grid（含墙+障碍）到文件，供阶段2加载为 static_grid"""
+    """保存地图到文件（阶段1→阶段2 传递）。
+    只保存**结构墙**（hfield 墙）——障碍是变化的，不存（live 层射线清除会重新发现）。
+    用 sample_hf 判断结构墙：hfield 非路 = 永久墙。
+    """
     if not grid: return
     xs = sorted(set(k[0] for k in grid)); ys = sorted(set(k[1] for k in grid))
     minx, maxx = xs[0], xs[-1]; miny, maxy = ys[0], ys[-1]
     arr = np.full((maxy-miny+1, maxx-minx+1), UNKNOWN, dtype=np.int8)
     for (vx, vy), val in grid.items():
-        arr[vy-miny, vx-minx] = val
+        wx, wy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
+        if sample_hf(wx, wy) != ROAD_PIX:
+            arr[vy-miny, vx-minx] = WALL   # 结构墙
+        elif val == FREE:
+            arr[vy-miny, vx-minx] = FREE    # 已知路
+        # 障碍 (WALL 但 hfield 是路) 不存 —— 变化的东西
     np.savez(path, grid=arr, offset=(minx, miny), seed=FIXED_SEED)
-    print(f"  [MAP] saved {len(grid)} cells → {path}", flush=True)
+    n_wall = int((arr == WALL).sum()); n_free = int((arr == FREE).sum())
+    print(f"  [MAP] saved {n_free} FREE + {n_wall} WALL(结构墙) → {path}", flush=True)
 
 def load_map(path):
     """加载旧地图为 static_grid，开启 KNOWN_MAP_MODE（阶段2）"""
