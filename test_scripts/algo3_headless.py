@@ -41,7 +41,7 @@ ROBOT_R = max(1, int(SAFE_R / VOXEL))
 CLEARANCE = ROBOT_R
 MILESTONE_STEP = int(3.0 / VOXEL)
 LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)
-LIDAR_RAYS = 120
+LIDAR_RAYS = 360  # 120→360（1°间隔）：15m处射线间距0.26m，覆盖0.1m薄斜墙（120时0.78m漏扫）
 
 MAX_GATES = 200
 WALL_SCAN_RADIUS = 10
@@ -64,7 +64,7 @@ STUCK_TIMEOUT = 300; STUCK_DIST_THRESH = 0.5
 EXPLORE_MODE = "score"
 MIX_THRESHOLD = 50
 INIT_SCAN_STEPS = 200
-LIDAR_TICK = 20; RENDER_SKIP = 20
+LIDAR_TICK = 10; RENDER_SKIP = 20  # LIDAR_TICK 20→10：scan更频繁，减少两次scan间盲区（斜墙漏检）
 ARRIVE_THRESH = 1.0
 WANDER_TIMEOUT = 600; WANDER_DRIFT_RATIO = 1.05
 MAX_NO_GATE = 5
@@ -376,9 +376,13 @@ def find_gates(fvx, fvy):
 def cluster_gates(gates, min_size=8):
     """门格聚类：相邻门格 BFS 聚成 region，取质心+size。借鉴 frontier_exploration。
     gates: [(cg, vx, vy)] → [(cg, cx, cy, size)]，按质心格 cg 升序（近→远）
+    修复（2026-08-06 根因）：探索早期前沿窄，门格 <min_size 被全过滤 → 0 门卡死。
+    min_size 动态化：门少时降低阈值；全过滤时保底返回最近门。
     """
     if not gates:
         return []
+    # 门少时（探索早期窄前沿）降低聚类阈值，避免全过滤
+    dyn_min = min(min_size, max(2, len(gates) // 2))
     cells = [(vx, vy) for _, vx, vy in gates]
     cell_set = set(cells)
     visited = set()
@@ -398,12 +402,16 @@ def cluster_gates(gates, min_size=8):
                 if (nx, ny) in cell_set and (nx, ny) not in visited:
                     visited.add((nx, ny))
                     q.append((nx, ny))
-        if len(cluster) < min_size:
-            continue  # 过滤小区域（噪声/缝隙）
+        if len(cluster) < dyn_min:
+            continue  # 过滤小区域（噪声/缝隙），阈值随门数动态
         sx = sum(c[0] for c in cluster) // len(cluster)
         sy = sum(c[1] for c in cluster) // len(cluster)
         best_cg = min(c for c, x, y in gates if (x, y) in cluster)
         regions.append((best_cg, sx, sy, len(cluster)))
+    if not regions and gates:
+        # 保底：全被过滤（极窄前沿）→ 返回最近门，避免 0 门主循环死循环
+        cg, vx, vy = min(gates)  # cg 最小 = 最近
+        regions.append((cg, vx, vy, 1))
     regions.sort(key=lambda r: r[0])
     return regions
 
