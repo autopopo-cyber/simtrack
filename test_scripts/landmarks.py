@@ -41,60 +41,76 @@ BOT_Z = HF_SURF + 0.5
 WALL_X_OFF = 0.3
 
 def landmark_positions():
-    """返回 20 个标牌的 (idx, ch, side, wx, wy, wz, quat)。
-    布局：10 通道（通道 ch 的 y 范围 [5ch, 5ch+5]，中心 y=5ch+2.5）。
-    每通道 2 个标牌贴两端横墙：
-      side 0 = 起点横墙（x=0.4，法线 +x 面向从 x=50 来的狗）quat 绕 y +90°
-      side 1 = 终点横墙（x=49.6，法线 -x 面向从 x=0 来的狗）quat 绕 y -90°
+    """返回 10 个标牌的 (idx, ch, side, wx, wy, wz, quat)。
+    每通道 1 个标牌，立在**通道中心线**（狗正前方，2m 大码最清晰），
+    贴终点端墙头 x 位置（转弯口前 4m，狗走到尽头转弯前看到）。
+    关键：标牌中心必须在通道中心（y=2.5+ch*5），不能贴分界墙边缘——
+    否则 2m 标牌会嵌进分界墙 box（墙 y=5±0.175），码只显示一半识别失败。
     """
     out = []
     for ch in range(10):
-        y_center = 2.5 + ch * 5.0
-        # 横墙在 x=0.25/49.75（厚 0.35 → 表面 0.425/49.575），标牌凸出墙面 0.5m
-        # （0.3m 基础 + 0.2m 往路中心移动：hfield 转弯处墙面粗糙会遮挡标牌边缘）
-        out.append((ch*2+0, ch, 0, 0.925, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
-        out.append((ch*2+1, ch, 1, 49.075, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+        y_center = 2.5 + ch * 5.0    # 通道中心线
+        if ch % 2 == 0:
+            # 偶通道（朝 +x）：终点 x=50，标牌在 x=45.8，法线 -x
+            out.append((ch, ch, 1, 45.8, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+        else:
+            # 奇通道（朝 -x）：终点 x=0，标牌在 x=4.2，法线 +x
+            out.append((ch, ch, 0, 4.2, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
     return out
 
 def wall_xml():
-    """三面 box 墙（contype=0 纯可视化）：每通道两侧纵墙 + 两端横墙。
-    闭合背景是 ArUco 识别的关键（实测单面墙失败）。
-    关键：box 墙必须**盖住 hfield 悬崖**（通道 128 → 墙 191 的落差面在 y≈0.1~0.3m，
-    陡峭垂直落差在斜光照下呈亮白裂缝）——墙位移到通道边缘内侧 0.25m、厚 0.35m 覆盖过渡带。
+    """分界墙 box（contype=0 纯可视化），必须**留出 U 型转弯口**！
+    迷宫结构（track_clean.png 实测）：蛇形通道，分界墙在 y=5k（k=1..9）。
+    转弯口交替开口：
+      - y=5,15,25,35,45（k 奇数）：x=50 端开口（通道 0→1, 2→3... 在 x=50 转弯）
+      - y=10,20,30,40（k 偶数）：x=0 端开口（通道 1→2, 3→4... 在 x=0 转弯）
+    边界 y=0 / y=50：全封闭。
+    教训：之前侧墙 x∈[0,50] 全程 + 横墙 x=0.25/49.75 堵死了所有 U 型弯（主人指出）。
     """
     walls = []
-    for ch in range(10):
-        y0 = ch * 5.0
-        y1 = y0 + 5.0
-        yc = y0 + 2.5
-        # 两侧纵墙（x 全程 0~50）：移到通道边缘内侧 0.25，厚 0.35 盖悬崖
-        walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y0+0.25} {HF_SURF+1.0}" '
-                     f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y1-0.25} {HF_SURF+1.0}" '
-                     f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        # 两端横墙（x=0.25 和 x=49.75，同样盖悬崖）
-        walls.append(f'<geom type="box" size="0.175 2.5 2.0" pos="0.25 {yc} {HF_SURF+1.0}" '
-                     f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        walls.append(f'<geom type="box" size="0.175 2.5 2.0" pos="49.75 {yc} {HF_SURF+1.0}" '
-                     f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
+    for k in range(11):
+        y = k * 5.0
+        if k == 0 or k == 10:
+            # 地图边界：全墙
+            walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y} {HF_SURF+1.0}" '
+                         f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
+        elif k % 2 == 1:
+            # 奇数分界：x=50 端开口（转弯口），墙只到 x=45.5
+            cx = 22.75   # (0 + 45.5)/2
+            walls.append(f'<geom type="box" size="22.75 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
+                         f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
+        else:
+            # 偶数分界：x=0 端开口（转弯口），墙从 x=4.5 开始
+            cx = 27.25   # (4.5 + 50)/2
+            walls.append(f'<geom type="box" size="22.75 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
+                         f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
     return "\n".join(walls)
 
 def landmark_xml():
-    """生成标牌 XML：贴横墙 plane + emissive 纹理（20 个，256px ArUco，2m×2m）。
-    标牌贴横墙内表面，法线朝通道（绕 y 旋转——MuJoCo 唯一可靠的立放旋转）。
+    """生成标牌 XML：立放 plane + emissive 纹理 + **背景板**。
+    背景板：标牌在转弯口开口区（无闭合墙背景），ArUco 边界分离失败；
+    在码后面 0.6m 加深色 box（2.6m 比标牌大 0.3m/边）提供均匀背景——实测必须。
     """
     assets = []
     world = []
     for idx, ch, side, wx, wy, wz, quat in landmark_positions():
         tex_name = f"lm{idx}"
         mat_name = f"lm_mat{idx}"
+        bg_name = f"lm_bg{idx}"
         assets.append(f'<texture name="{tex_name}" type="2d" file="{LM_DIR}/aruco_{idx:02d}.png"/>')
         assets.append(f'<material name="{mat_name}" texture="{tex_name}" texrepeat="1 1" '
                       f'emission="1.0" specular="0"/>')
+        # 背景板：标牌后面 0.6m（法线 -x 的标牌背景在 +x；法线 +x 的背景在 -x）
+        bg_dir = 0.6 if side == 1 else -0.6
         world.append(
             f'<geom name="lm{idx}" type="plane" size="{LM_HALF} {LM_HALF} 0.01" '
             f'pos="{wx:.2f} {wy:.2f} {wz:.2f}" quat="{quat}" '
             f'material="{mat_name}" contype="0" conaffinity="0"/>'
+        )
+        world.append(
+            f'<geom name="{bg_name}" type="box" size="0.3 {LM_HALF+0.3} {LM_HALF+0.3}" '
+            f'pos="{wx+bg_dir:.2f} {wy:.2f} {wz:.2f}" rgba="0.15 0.15 0.18 1" '
+            f'contype="0" conaffinity="0"/>'
         )
     return "\n".join(assets), "\n".join(world)
 

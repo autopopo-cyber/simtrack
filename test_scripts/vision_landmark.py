@@ -150,5 +150,5 @@ class VisionLandmark:
         return self._pm
 
     def _idx_ch_slot(self, idx):
-        """idx → (ch, side)：idx = ch*2 + side"""
-        return idx // 2, idx % 2
+        """idx → (ch, side)：idx 直接 = 通道号"""
+        return idx, 0

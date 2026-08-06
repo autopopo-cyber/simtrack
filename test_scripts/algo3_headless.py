@@ -1007,7 +1007,7 @@ stats["collisions"] = stats.get("collisions", 0)
 if vis is not None:
     stats["landmarks_seen"] = vis.total_detected
     stats["landmarks_unique"] = len(vis.seen_ids)
-    stats["landmark_channels"] = sorted({idx // 2 for idx in vis.seen_ids})
+    stats["landmark_channels"] = sorted(vis.seen_ids)
 stats["milestones"] = len(milestones)
 stats["final_pos"] = [round(d.qpos[0], 2), round(d.qpos[1], 2)]
 stats["final_coverage"] = round(coverage_pct(), 2)
