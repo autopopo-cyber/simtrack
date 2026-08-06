@@ -50,7 +50,7 @@ WALL_PENALTY = 3
 UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
 VORONOI_C = 2.0      # 走中间代价系数：penalty = C/d² (d=离墙格数)，KNOWN_MAP_MODE 下启用
 MAX_GATE_DIST = 300  # 门搜索距离上限(格=30m)——蛇形通道门常在20-30m外，30m覆盖整通道；避免全图(500格)搜索
-ASTAR_MAX_EXPAND = 30000
+ASTAR_MAX_EXPAND = 250000  # 30000→250000：蛇形迷宫(476m) A* 从起点到终点需扩展远超3万格（BFS全图23.5万格）
 
 MIN_SPEED = 1.0; SPEED_FACTOR = 1.5
 # 运动学约束（主人：现实中不允许碰撞）
