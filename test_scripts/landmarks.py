@@ -50,28 +50,32 @@ def landmark_positions():
     out = []
     for ch in range(10):
         y_center = 2.5 + ch * 5.0
-        out.append((ch*2+0, ch, 0, 0.4, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
-        out.append((ch*2+1, ch, 1, 49.6, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+        # 横墙在 x=0.25/49.75（厚 0.35 → 表面 0.425/49.575），标牌凸出墙面 0.5m
+        # （0.3m 基础 + 0.2m 往路中心移动：hfield 转弯处墙面粗糙会遮挡标牌边缘）
+        out.append((ch*2+0, ch, 0, 0.925, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
+        out.append((ch*2+1, ch, 1, 49.075, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
     return out
 
 def wall_xml():
     """三面 box 墙（contype=0 纯可视化）：每通道两侧纵墙 + 两端横墙。
     闭合背景是 ArUco 识别的关键（实测单面墙失败）。
+    关键：box 墙必须**盖住 hfield 悬崖**（通道 128 → 墙 191 的落差面在 y≈0.1~0.3m，
+    陡峭垂直落差在斜光照下呈亮白裂缝）——墙位移到通道边缘内侧 0.25m、厚 0.35m 覆盖过渡带。
     """
     walls = []
     for ch in range(10):
         y0 = ch * 5.0
         y1 = y0 + 5.0
         yc = y0 + 2.5
-        # 两侧纵墙（x 全程 0~50）
-        walls.append(f'<geom type="box" size="25.0 0.1 2.0" pos="25 {y0} {HF_SURF+1.0}" '
+        # 两侧纵墙（x 全程 0~50）：移到通道边缘内侧 0.25，厚 0.35 盖悬崖
+        walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y0+0.25} {HF_SURF+1.0}" '
                      f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        walls.append(f'<geom type="box" size="25.0 0.1 2.0" pos="25 {y1} {HF_SURF+1.0}" '
+        walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y1-0.25} {HF_SURF+1.0}" '
                      f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        # 两端横墙（x=0 和 x=50）
-        walls.append(f'<geom type="box" size="0.1 2.5 2.0" pos="0 {yc} {HF_SURF+1.0}" '
+        # 两端横墙（x=0.25 和 x=49.75，同样盖悬崖）
+        walls.append(f'<geom type="box" size="0.175 2.5 2.0" pos="0.25 {yc} {HF_SURF+1.0}" '
                      f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
-        walls.append(f'<geom type="box" size="0.1 2.5 2.0" pos="50 {yc} {HF_SURF+1.0}" '
+        walls.append(f'<geom type="box" size="0.175 2.5 2.0" pos="49.75 {yc} {HF_SURF+1.0}" '
                      f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
     return "\n".join(walls)
 

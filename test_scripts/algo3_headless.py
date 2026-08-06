@@ -509,8 +509,9 @@ def build_xml():
     else:
         LM_ASSETS, LM_WORLD, WALL_XML = "", "", ""
     # 机器人前置相机：桅杆 0.5m（世界 HF_SURF+1.0=5.008），平视看墙上标牌
-    # （标牌中心离地 1m = 相机高度 = 视觉中心；MuJoCo euler 是 extrinsic xyz，y -90° 朝前）
-    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 0"/>'
+    # euler="0 -1.5708 -1.5708"（extrinsic xyz）：fwd=+x, up=+z(天空上), right=-y
+    # 注意：只有 euler="0 -1.5708 0" 时 right=+z 天空在水平方向（画面 roll 90°），必须加 z=-90°
+    CAM_XML = '<camera name="bot_cam" pos="0.4 0 0.5" mode="fixed" euler="0 -1.5708 -1.5708"/>'
     return f"""<mujoco>
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
