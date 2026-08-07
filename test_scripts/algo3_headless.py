@@ -1010,7 +1010,10 @@ if args.random_start:
     d.qpos[0] = rs_x; d.qpos[1] = rs_y
     print(f"  [KIDNAP] 随机起点: ({rs_x:.1f}, {rs_y:.1f}) → 目标 {FINISH}", flush=True)
 else:
-    d.qpos[0]=2.5; d.qpos[1]=2.5
+    if args.target == "start":
+        d.qpos[0] = 2.5; d.qpos[1] = 47.5   # 反向：起点=出口端，目标=入口端
+    else:
+        d.qpos[0]=2.5; d.qpos[1]=2.5
 mujoco.mj_forward(m,d)
 
 # EGL 离屏渲染
