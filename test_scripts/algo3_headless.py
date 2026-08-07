@@ -376,12 +376,13 @@ else:
     obs_world = gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
-def is_obstacle_world(wx, wy):
+def is_obstacle_world(wx, wy, inflation=0.0):
     if sample_hf(wx, wy) != ROAD_PIX: return True
     # 物理碰撞边界固定 0.7m（障碍半径0.5+狗半径0.2）——动态安全距离不由这里实现，
     # 由 v_brake 制动约束自动实现：接近障碍 → d_clear 短 → 限速 → 低速挤过窄缝（主人指令 08-07）
+    # inflation：DWA 判定用膨胀半径（补偿障碍 1m/s 移动，见 DWA blocked_fn）
     for ox, oy in obs_world:
-        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR: return True
+        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR + inflation: return True
     return False
 
 # ═══════════════════════════════════════════
@@ -407,13 +408,13 @@ def scan(bx, by):
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
 
-def blocked(wx, wy):
+def blocked(wx, wy, inflation=0.0):
     # 越界保护：赛道外直接视为 blocked（防穿墙跑出地图）
     if not (0.0 <= wx <= 50.0 and 0.0 <= wy <= 50.0):
         return True
     # 精确圆判定：狗中心距障碍 < 0.7m（物理边界）→ blocked
     # 旧版 5×5 邻域格判定过保守（+0.283m）→ 窄缝挤不过；圆判定能贴 0.7m 物理边界
-    return is_obstacle_world(wx, wy)
+    return is_obstacle_world(wx, wy, inflation)
 
 # ── 三级跳A* ──
 
@@ -1153,8 +1154,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     if path is None or path_idx >= len(path) or (mv.need_replan and mv.escape_steps == 0):
         if mv.need_replan and mv.escape_steps == 0:
-            if patrol_paths:
-                # ── 巡逻障碍：只写 live WALL（当前格，scan 射线自动清除旧位置），不写 static 不重建 ──
+            if patrol_paths or random_field is not None:
+                # ── 移动障碍（巡逻/随机反弹）：只写 live WALL（当前格，scan 射线自动清除旧位置），不写 static 不重建 ──
                 # 障碍 1m/s 移动，static 圈会残留误导 HPA；live WALL 让 wall_fn 实时看到当前位置绕行
                 for ox, oy in obs_world:
                     if math.hypot(bx-ox, by-oy) < OBS_CLEAR + 0.8:
@@ -1164,7 +1165,7 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             else:
                 # 固定障碍：写 static 安全圈 + 重建 HPA（见下）
                 pass
-        if mv.need_replan and mv.escape_steps == 0 and not patrol_paths:
+        if mv.need_replan and mv.escape_steps == 0 and not patrol_paths and random_field is None:
             # 狗已 escape 走远（≥2m）——现在写障碍安全圈 + 重规划绕行
             # 注意：①写圈不按距离过滤（escape 可能走 8m 远，距狗>2m 会漏写 → 路径又穿障碍）
             #      ②写 static_grid 不写 live grid——scan() 射线清除会把 live WALL 擦成 FREE → 反复写圈死循环
@@ -1311,11 +1312,15 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         if look_target is not None:
             tx, ty = look_target
         # DWA 决策：每 LIDAR_TICK 步，用 lookahead 目标
+        # obstacles_motion：随机障碍带速度向量，DWA 模拟时用未来位置判定（运动预测，
+        # 替代盲目膨胀——障碍朝狗移动则提前避让，远离则不误判）
         if mv.dwa is not None and step % LIDAR_TICK == 0:
             mv.dwa_target = mv.dwa.choose_velocity(
                 robot_pos=(bx, by), yaw=mv.yaw,
                 v_now=mv.speed, w_now=mv.omega,
-                target=(tx, ty), blocked_fn=lambda pt: blocked(pt[0], pt[1]))
+                target=(tx, ty),
+                blocked_fn=lambda pt: blocked(pt[0], pt[1]),
+                obstacles_motion=random_field.velocities if random_field is not None else None)
         ddist = math.hypot(tx-bx, ty-by)
         if ddist < ARRIVE_THRESH:
             path_idx += 1

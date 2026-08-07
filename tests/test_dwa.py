@@ -87,3 +87,20 @@ def test_full_speed_near_obstacle_can_slow():
     v, w = result
     assert v < 3.6, f"应选低速轨迹(窗口含0), v={v}"
     assert v >= 0.0
+
+
+def test_obstacle_motion_prediction():
+    """障碍朝狗移动（静止判定乐观）→ 运动预测必须提前避让——回归：不做预测撞向移动障碍"""
+    def blocked_none(pt):
+        return False   # 静态判定无墙无静态障碍（障碍只通过 obstacles_motion 传入）
+    dwa = DWAAlgorithm()
+    # 障碍在正前方 3m，朝狗移动 1m/s；狗全速 4.0 直行 1.5s 会撞上（4.5m > 3-0.7=2.3m）
+    # 运动预测应让 DWA 选减速或转向轨迹
+    result = dwa.choose_velocity(
+        robot_pos=(0.0, 0.0), yaw=0.0, v_now=4.0, w_now=0.0,
+        target=(10.0, 0.0), blocked_fn=blocked_none,
+        obstacles_motion=[(3.0, 0.0, -1.0, 0.0, 0.5)])   # 障碍朝 -x（狗）移动
+    assert result is not None, "运动预测必须能找到安全轨迹"
+    v, w = result
+    # 直行 1.5s 会撞（障碍未来位置 1.5m 处 vs 狗轨迹 6m 处）→ 必须减速或转向
+    assert v < 3.0 or abs(w) > 0.05, f"障碍朝狗移动必须减速/转向, v={v}, w={w}"

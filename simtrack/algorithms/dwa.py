@@ -49,7 +49,8 @@ class DWAAlgorithm:
         self.clearance_max = clearance_max
         self.stop_margin = stop_margin
 
-    def choose_velocity(self, robot_pos, yaw, v_now, w_now, target, blocked_fn):
+    def choose_velocity(self, robot_pos, yaw, v_now, w_now, target, blocked_fn,
+                        obstacles_motion=None):
         """返回最优 (v*, ω*)；全部轨迹碰撞 → None。
 
         Args:
@@ -58,7 +59,9 @@ class DWAAlgorithm:
             v_now:     当前线速度 (m/s)
             w_now:     当前角速度 (rad/s)
             target:    (tx, ty) lookahead 目标
-            blocked_fn: callable(point) -> bool，判定点是否被堵（复用现有 blocked()）
+            blocked_fn: callable(point) -> bool，判定点是否被堵（静态：墙 + 障碍当前位置）
+            obstacles_motion: 可选 [(ox, oy, vx, vy, r), ...] 移动障碍（速度向量 + 半径），
+                轨迹模拟时用障碍**未来位置**判定——补偿 1m/s 障碍运动，不做盲目膨胀
         """
         # ① 动态窗口
         # v_lo 强制为 0：全速接近障碍时必须能选低速/停车轨迹（否则窗口全高速 → 全碰撞）
@@ -82,8 +85,8 @@ class DWAAlgorithm:
             for w in ws:
                 # ③ 轨迹模拟
                 traj = self._simulate(robot_pos, yaw, v, w)
-                # 碰撞检测 + 最近障碍距离
-                hit, min_clear = self._check_collision(traj, blocked_fn)
+                # 碰撞检测 + 最近障碍距离（静态 blocked_fn + 移动障碍未来位置）
+                hit, min_clear = self._check_collision(traj, blocked_fn, obstacles_motion)
                 if hit or min_clear < self.stop_margin:
                     continue
                 # ④ 评分
@@ -106,18 +109,34 @@ class DWAAlgorithm:
             pts.append((x, y))
         return pts
 
-    def _check_collision(self, traj, blocked_fn):
-        """返回 (hit, min_clear)。采样点之间插值细化检测（0.1m 子步长）。"""
+    def _check_collision(self, traj, blocked_fn, obstacles_motion=None):
+        """返回 (hit, min_clear)。采样点之间插值细化检测（0.1m 子步长）。
+
+        obstacles_motion: [(ox, oy, vx, vy, r), ...]——模拟时障碍按速度线性外推，
+        在 t 时刻用 (ox+vx·t, oy+vy·t) 判定，狗半径 0.2m 计入。
+        """
         min_clear = 1e18
         prev = None
-        for pt in traj:
+        for i, pt in enumerate(traj):
+            t = (i + 1) * self.dt_sample
             if blocked_fn(pt):
                 return True, min_clear
+            if obstacles_motion:
+                for ox, oy, vx, vy, r in obstacles_motion:
+                    ex, ey = ox + vx * t, oy + vy * t   # 障碍未来位置
+                    if math.hypot(pt[0]-ex, pt[1]-ey) < r + 0.2:   # 障碍半径 + 狗半径
+                        return True, min_clear
             if prev is not None:
-                for t in np.linspace(0.05, 1.0, 5):
-                    ip = (prev[0] + (pt[0]-prev[0])*t, prev[1] + (pt[1]-prev[1])*t)
+                for t2 in np.linspace(0.05, 1.0, 5):
+                    ip = (prev[0] + (pt[0]-prev[0])*t2, prev[1] + (pt[1]-prev[1])*t2)
                     if blocked_fn(ip):
                         return True, min_clear
+                    if obstacles_motion:
+                        tt = t - self.dt_sample * (1.0 - t2)
+                        for ox, oy, vx, vy, r in obstacles_motion:
+                            ex, ey = ox + vx * tt, oy + vy * tt
+                            if math.hypot(ip[0]-ex, ip[1]-ey) < r + 0.2:
+                                return True, min_clear
             prev = pt
         if traj:
             min_clear = self.horizon

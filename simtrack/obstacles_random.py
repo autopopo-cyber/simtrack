@@ -83,3 +83,10 @@ class RandomObstacleField:
     def positions(self):
         """[(x, y), ...] 供 obs_world 同步（兼容现有 blocked()）"""
         return [tuple(obs.pos) for obs in self.obstacles]
+
+    @property
+    def velocities(self):
+        """[(ox, oy, vx, vy, r), ...] 供 DWA 障碍运动预测"""
+        return [(obs.pos[0], obs.pos[1],
+                 math.cos(obs.dir) * obs.speed, math.sin(obs.dir) * obs.speed,
+                 obs.radius) for obs in self.obstacles]
