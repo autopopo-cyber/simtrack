@@ -19,6 +19,7 @@ import mujoco
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml
 from simtrack.obstacles_random import RandomObstacleField
+from simtrack.algorithms.dwa import DWAAlgorithm
 
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
@@ -727,6 +728,9 @@ class Mover:
         self.escape_steps = 0   # bounce 逃生冷却：沿 escape_yaw 强制走 N 步（绕出墙角再回归路径）
         self.escape_yaw = 0.0
         self.need_replan = False  # 撞到新障碍（不在当前路径规划里）→ 主循环强制重规划
+        self.dwa = None          # DWAAlgorithm 实例（args.obs_random>0 时创建）
+        self.dwa_target = None   # DWA 决策结果 (v*, ω*)；None = 全碰撞 → 走原逻辑
+        self.omega = 0.0         # 当前角速度（DWA 动态窗口用）
 
     def _forward_clear(self, bx, by, yaw_ang):
         """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。blocked() 已含机器人半径膨胀。"""
@@ -749,19 +753,32 @@ class Mover:
         if step % 10000 == 0:
             print(f"    [MOVER] step={step} pos=({bx:.1f},{by:.1f}) target=({tx:.1f},{ty:.1f}) yaw={math.degrees(self.yaw):.0f}° speed={self.speed:.2f}", flush=True)
         # 转向目标（yaw 转向 + 沿轴向速度）
-        tgt_yaw = math.atan2(ty-by, tx-bx)
-        err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
-        dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
-        self.yaw += dyaw
+        # DWA 决策结果存在 → 用 ω* 转向（替代原 err 转向）
+        err = 0.0   # 非 DWA 分支才计算（turn_limited 判定用）
+        if self.dwa is not None and self.dwa_target is not None:
+            self.yaw += self.dwa_target[1] * dt
+        else:
+            tgt_yaw = math.atan2(ty-by, tx-bx)
+            err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
+            dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
+            self.yaw += dyaw
+        self.omega = self.dwa_target[1] if (self.dwa is not None and self.dwa_target is not None) else 0.0
         # ── 大转向限速（DWA 思想：曲率越大速度越低）──
         # 目标方向偏离当前朝向 >57° 时限速 1.0——先转身再加速，防止直冲偏离（绑架随机起点 yaw=0 但目标在背后 170°）
         turn_limited = False
-        if abs(err) > 1.0:
+        if self.dwa is not None and self.dwa_target is not None:
+            if abs(self.dwa_target[1]) > 1.0:   # DWA 模式：按 ω* 判断
+                turn_limited = True
+        elif abs(err) > 1.0:
             turn_limited = True
         # ── 前瞻测距：沿当前 yaw 方向量到障碍的距离 ──
         d_clear = self._forward_clear(bx, by, self.yaw)
         # ── 期望速度（限速）：目标距离速度 vs 制动约束，取小 ──
-        v_des = min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR)
+        # DWA 给的 v* 优先（已在速度空间采样里考虑障碍/目标），否则原目标距离速度
+        if self.dwa is not None and self.dwa_target is not None:
+            v_des = self.dwa_target[0]
+        else:
+            v_des = min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR)
         if turn_limited:
             v_des = min(v_des, 1.0)
         # 近墙限速：前方空间小（<2m）时降速，窄连接段/迷宫缺口慢速通过防过冲
@@ -776,8 +793,9 @@ class Mover:
             self.speed = min(v_des, self.speed + A_ACCEL*dt)
         else:
             self.speed = max(v_des, self.speed - A_DECEL*dt)
-        # ── 前方被堵且已停住（speed≈0）→ 预判转向，不碰撞 ──
-        if self.speed <= 0.05 and d_clear < STOP_MARGIN + 0.15:
+        # ── 前方被堵且已停住 / DWA 全碰撞 → 预判转向，不碰撞 ──
+        if (self.speed <= 0.05 and d_clear < STOP_MARGIN + 0.15) or (
+                self.dwa is not None and self.dwa_target is None):
             _hit_wall = sample_hf(bx, by) != ROAD_PIX
             # 被挡时前方 1.5m 内是否有障碍（放宽：狗在障碍 0.7m 外就会被 blocked 挡住，但距离判定>0.7 会漏）
             _near_obs = any(math.hypot(bx-ox, by-oy) < OBS_CLEAR + 0.8 for ox, oy in obs_world)
@@ -1020,6 +1038,10 @@ def render_frame(step):
         pass  # 渲染失败不阻塞主循环
 
 mv = Mover(m, d)
+if args.obs_random > 0:
+    mv.dwa = DWAAlgorithm(v_max=SPEED_MAX, w_max=YAW_RATE,
+                          a_accel=A_ACCEL, a_decel=A_DECEL)
+    print("  [DWA] 局部规划器已启用", flush=True)
 
 # 阶段2：加载旧地图为 static_grid（已知地图快速寻路）
 if args.load_map:
@@ -1288,6 +1310,12 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                 break
         if look_target is not None:
             tx, ty = look_target
+        # DWA 决策：每 LIDAR_TICK 步，用 lookahead 目标
+        if mv.dwa is not None and step % LIDAR_TICK == 0:
+            mv.dwa_target = mv.dwa.choose_velocity(
+                robot_pos=(bx, by), yaw=mv.yaw,
+                v_now=mv.speed, w_now=mv.omega,
+                target=(tx, ty), blocked_fn=lambda pt: blocked(pt[0], pt[1]))
         ddist = math.hypot(tx-bx, ty-by)
         if ddist < ARRIVE_THRESH:
             path_idx += 1
