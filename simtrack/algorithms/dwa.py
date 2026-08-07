@@ -31,6 +31,8 @@ class DWAAlgorithm:
         w_smooth: float = 0.05,
         clearance_max: float = 2.0,  # 归一化上限 (m)
         stop_margin: float = 0.4,    # 停车安全余量（低于此距离的轨迹直接排除）
+        pred_t: float = 0.5,         # 障碍运动预测时间上限 (s)：障碍每 1s 20% 变向+撞墙反弹，
+                                     # 长期预测不可靠——只外推 0.5s（决策周期+反应时间）
     ):
         self.v_max = v_max
         self.w_max = w_max
@@ -48,6 +50,7 @@ class DWAAlgorithm:
         self.w_smooth = w_smooth
         self.clearance_max = clearance_max
         self.stop_margin = stop_margin
+        self.pred_t = pred_t
 
     def choose_velocity(self, robot_pos, yaw, v_now, w_now, target, blocked_fn,
                         obstacles_motion=None):
@@ -113,17 +116,19 @@ class DWAAlgorithm:
         """返回 (hit, min_clear)。采样点之间插值细化检测（0.1m 子步长）。
 
         obstacles_motion: [(ox, oy, vx, vy, r), ...]——模拟时障碍按速度线性外推，
-        在 t 时刻用 (ox+vx·t, oy+vy·t) 判定，狗半径 0.2m 计入。
+        在 t 时刻用 (ox+vx·min(t,pred_t), oy+vy·min(t,pred_t)) 判定（pred_t 截断：
+        障碍会变向/反弹，长期预测不可靠），狗半径 0.2m 计入。
         """
         min_clear = 1e18
         prev = None
         for i, pt in enumerate(traj):
             t = (i + 1) * self.dt_sample
+            tp = min(t, self.pred_t)   # 预测截断
             if blocked_fn(pt):
                 return True, min_clear
             if obstacles_motion:
                 for ox, oy, vx, vy, r in obstacles_motion:
-                    ex, ey = ox + vx * t, oy + vy * t   # 障碍未来位置
+                    ex, ey = ox + vx * tp, oy + vy * tp   # 障碍未来位置（截断）
                     if math.hypot(pt[0]-ex, pt[1]-ey) < r + 0.2:   # 障碍半径 + 狗半径
                         return True, min_clear
             if prev is not None:
@@ -132,7 +137,7 @@ class DWAAlgorithm:
                     if blocked_fn(ip):
                         return True, min_clear
                     if obstacles_motion:
-                        tt = t - self.dt_sample * (1.0 - t2)
+                        tt = min(t - self.dt_sample * (1.0 - t2), self.pred_t)
                         for ox, oy, vx, vy, r in obstacles_motion:
                             ex, ey = ox + vx * tt, oy + vy * tt
                             if math.hypot(ip[0]-ex, ip[1]-ey) < r + 0.2:
