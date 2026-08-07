@@ -86,7 +86,7 @@ class DWAAlgorithm:
                 if hit or min_clear < self.stop_margin:
                     continue
                 # ④ 评分
-                score = self._score(traj, v, w, target_angle, min_clear, v_now, w_now)
+                score = self._score(traj, robot_pos, v, w, target_angle, min_clear, v_now, w_now)
                 if score > best_score:
                     best_score = score
                     best = (float(v), float(w))
@@ -122,11 +122,11 @@ class DWAAlgorithm:
             min_clear = self.horizon
         return False, min_clear
 
-    def _score(self, traj, v, w, target_angle, min_clear, v_now, w_now):
+    def _score(self, traj, robot_pos, v, w, target_angle, min_clear, v_now, w_now):
         """加权评分。返回值越大越好。"""
-        # heading：轨迹终点方向 vs 目标方向（cos 相似度 → [-1,1]）
+        # heading：轨迹终点方向（相对机器人）vs 目标方向（cos 相似度 → [-1,1]）
         end = traj[-1]
-        end_angle = math.atan2(end[1], end[0]) if traj else 0.0
+        end_angle = math.atan2(end[1] - robot_pos[1], end[0] - robot_pos[0]) if traj else 0.0
         heading = math.cos(end_angle - target_angle)
         # clearance：归一化 [0,1]
         clearance = min(min_clear / self.clearance_max, 1.0)

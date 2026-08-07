@@ -58,3 +58,18 @@ def test_smoothness_penalty():
         target=(10.0, 0.0), blocked_fn=_blocked_none)
     assert 0.0 <= v <= dwa.v_max + 1e-6
     assert abs(w) < 1e-6
+
+
+def test_heading_relative_to_robot_pos():
+    """heading 必须相对机器人位置（不在原点时目标方向仍正确）——回归：世界原点参照系 bug"""
+    dwa = DWAAlgorithm()
+    # 机器人在 (45, 8)，目标在正前方 (50, 8) → 应选正前方向（ω≈0）
+    v, w = dwa.choose_velocity(
+        robot_pos=(45.0, 8.0), yaw=0.0, v_now=2.0, w_now=0.0,
+        target=(50.0, 8.0), blocked_fn=_blocked_none)
+    assert abs(w) < 1e-6, f"目标在正前方应直行, w={w}"
+    # 机器人在 (45, 8)，目标在左后方 (42, 7.6) → 应转向（ω≠0）
+    v2, w2 = dwa.choose_velocity(
+        robot_pos=(45.0, 8.0), yaw=0.0, v_now=2.0, w_now=0.0,
+        target=(42.0, 7.6), blocked_fn=_blocked_none)
+    assert abs(w2) > 1e-4, f"目标在左后方应转向, w2={w2}"
