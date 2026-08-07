@@ -104,6 +104,7 @@ ap.add_argument("--target", type=str, default="finish", help="目标: start|fini
 ap.add_argument("--obs-straight", type=int, default=0, help="每段直道障碍数（渐进：1→N。0=用默认密度生成）")
 ap.add_argument("--obs-turn", type=int, default=0, help="每段弯道障碍数（渐进：1→N。0=不加）")
 ap.add_argument("--obs-min-dist", type=float, default=6.0, help="直道障碍距通道两端转弯口的最小距离（m），避免堵死转弯")
+ap.add_argument("--obs-patrol", type=int, default=0, help="巡逻障碍数：沿两直道+一弯道蛇形路径往返走（1m/s，~50m）")
 args = ap.parse_args()
 
 if args.seed is not None:
@@ -251,6 +252,70 @@ def gen_obstacles_progressive(seed):
                         out.append((ox, oy)); break
     return out
 
+# ═══════════════════════════════════════════
+# 巡逻障碍（主人指令 08-07：两直道+一弯道，1m/s，~50m 往返）
+# ═══════════════════════════════════════════
+PATROL_SPEED = 1.0        # m/s（主人指定）
+patrol_paths = []         # 每条路径 = [(x,y),...] 折线点（世界坐标）
+patrol_phase = []         # 每个障碍沿路径的累计弧长 (m)
+patrol_dir = []           # 1=正向 -1=反向
+
+def gen_patrol_path(ch_a, ch_b):
+    """巡逻路径：通道A中点 → 右端U型弯 → 通道B中点（蛇形，~50m）。
+    ch_a < ch_b，两通道相邻（如 2→3）。折线点含转弯口内弧，全程在路内。"""
+    yc_a = 2.5 + ch_a * 5.0
+    yc_b = 2.5 + ch_b * 5.0
+    # U 型弯：右端 x=47 区域（y=15 分界墙开口在 x>45）
+    return [(25.0, yc_a), (47.0, yc_a), (47.0, yc_b), (25.0, yc_b)]
+
+def patrol_total_len(path):
+    return sum(math.hypot(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1])
+               for i in range(len(path)-1))
+
+def patrol_pos(path, s):
+    """沿折线路径走弧长 s（m），返回 (x, y)。s 超长则循环往返。"""
+    n = len(path)
+    total = patrol_total_len(path)
+    # 往返：正向走 0~total，反向走 total~2total
+    s = s % (2 * total)
+    if s > total:
+        s = 2 * total - s   # 反向
+        pts = list(reversed(path))
+    else:
+        pts = path
+    acc = 0.0
+    for i in range(len(pts)-1):
+        x1, y1 = pts[i]; x2, y2 = pts[i+1]
+        seg = math.hypot(x2-x1, y2-y1)
+        if acc + seg >= s:
+            t = (s - acc) / seg if seg > 0 else 0
+            return (x1 + (x2-x1)*t, y1 + (y2-y1)*t)
+        acc += seg
+    return pts[-1]
+
+def init_patrol_obstacles():
+    """生成巡逻障碍：--obs-patrol N 个，分布在不同通道对（2-3, 6-7, ...）。"""
+    global patrol_paths, patrol_phase, patrol_dir, obs_world
+    patrol_paths = []
+    patrol_phase = []
+    patrol_dir = []
+    pairs = [(2,3), (6,7)]          # 已排好的通道对（相邻，U型弯在右端）
+    for i in range(args.obs_patrol):
+        ch_a, ch_b = pairs[i % len(pairs)]
+        path = gen_patrol_path(ch_a, ch_b)
+        patrol_paths.append(path)
+        patrol_phase.append(0.0 + i * 15.0)   # 错开相位（间隔 15m），两障碍不同步
+        patrol_dir.append(1)
+        obs_world.append(path[0])    # 初始位置 = 通道A中点
+    print(f"  [CFG] 巡逻障碍 {args.obs_patrol} 个 (1m/s, ~50m 蛇形往返)", flush=True)
+
+def update_patrol(dt):
+    """每 tick 更新巡逻障碍位置（沿路径匀速走）。dt = 物理步长。"""
+    global obs_world
+    for i in range(len(patrol_paths)):
+        patrol_phase[i] += PATROL_SPEED * dt * patrol_dir[i]
+        obs_world[i] = patrol_pos(patrol_paths[i], patrol_phase[i])
+
 def _obs_hits_wall(ox, oy, r):
     """检查以 (ox,oy) 为中心 r 半径的圆是否碰到墙（确保障碍不嵌墙）"""
     steps = 12
@@ -279,6 +344,9 @@ def random_road_pos(seed, min_dist_from=5.0, from_pos=(2.5, 2.5)):
 
 if args.no_obs:
     obs_world = []
+elif args.obs_patrol > 0:
+    obs_world = []
+    init_patrol_obstacles()          # 巡逻障碍独立于固定障碍（obs_world[0:N] 是巡逻）
 elif args.obs_straight > 0 or args.obs_turn > 0:
     obs_world = gen_obstacles_progressive(FIXED_SEED)
     print(f"  [CFG] 渐进障碍：直道{args.obs_straight}/段 + 弯道{args.obs_turn}/段 → 共 {len(obs_world)} 个", flush=True)
@@ -1008,6 +1076,10 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if gget(vx, vy) == UNKNOWN:
         gset(vx, vy, FREE)
 
+    # 巡逻障碍移动（每 tick 更新位置，1m/s 沿蛇形路径往返）
+    if patrol_paths:
+        update_patrol(m.opt.timestep)
+
     # 路标放置
     if abs(vx-last_mx)+abs(vy-last_my) >= MILESTONE_STEP:
         if wall_dist(vx, vy) > CLEARANCE:
@@ -1034,6 +1106,18 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     if path is None or path_idx >= len(path) or (mv.need_replan and mv.escape_steps == 0):
         if mv.need_replan and mv.escape_steps == 0:
+            if patrol_paths:
+                # ── 巡逻障碍：只写 live WALL（当前格，scan 射线自动清除旧位置），不写 static 不重建 ──
+                # 障碍 1m/s 移动，static 圈会残留误导 HPA；live WALL 让 wall_fn 实时看到当前位置绕行
+                for ox, oy in obs_world:
+                    if math.hypot(bx-ox, by-oy) < OBS_CLEAR + 0.8:
+                        gset(int(round(ox/VOXEL)), int(round(oy/VOXEL)), WALL)
+                path = None; path_idx = 0; wander = 0; last_dist = 999
+                mv.need_replan = False
+            else:
+                # 固定障碍：写 static 安全圈 + 重建 HPA（见下）
+                pass
+        if mv.need_replan and mv.escape_steps == 0 and not patrol_paths:
             # 狗已 escape 走远（≥2m）——现在写障碍安全圈 + 重规划绕行
             # 注意：①写圈不按距离过滤（escape 可能走 8m 远，距狗>2m 会漏写 → 路径又穿障碍）
             #      ②写 static_grid 不写 live grid——scan() 射线清除会把 live WALL 擦成 FREE → 反复写圈死循环
