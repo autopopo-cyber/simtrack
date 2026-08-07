@@ -61,7 +61,8 @@ class DWAAlgorithm:
             blocked_fn: callable(point) -> bool，判定点是否被堵（复用现有 blocked()）
         """
         # ① 动态窗口
-        v_lo = max(0.0, v_now - self.a_decel * self.T)
+        # v_lo 强制为 0：全速接近障碍时必须能选低速/停车轨迹（否则窗口全高速 → 全碰撞）
+        v_lo = 0.0
         v_hi = min(self.v_max, v_now + self.a_accel * self.T)
         w_lo = max(-self.w_max, w_now - self.a_w * self.T)
         w_hi = min(self.w_max, w_now + self.a_w * self.T)

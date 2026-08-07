@@ -19,7 +19,7 @@ def test_no_obstacle_goes_fast_forward():
 
 
 def test_obstacle_in_front_avoid():
-    """正前方 3m 障碍 → 选非零角速度（绕行）"""
+    """正前方 3m 障碍 → 转向绕行或停车避让（都算避障）"""
     def blocked(pt):
         # 半径 0.7 的圆形障碍（中心 3,0）
         return math.hypot(pt[0]-3.0, pt[1]-0.0) < 0.7
@@ -27,7 +27,8 @@ def test_obstacle_in_front_avoid():
     v, w = dwa.choose_velocity(
         robot_pos=(0.0, 0.0), yaw=0.0, v_now=2.0, w_now=0.0,
         target=(10.0, 0.0), blocked_fn=blocked)
-    assert w != pytest.approx(0.0, abs=1e-6)   # 有转向
+    assert (w != pytest.approx(0.0, abs=1e-6)) or (v < 0.5), \
+        f"应转向绕行或停车避让, v={v}, w={w}"
 
 
 def test_all_collision_returns_none():
@@ -73,3 +74,17 @@ def test_heading_relative_to_robot_pos():
         robot_pos=(45.0, 8.0), yaw=0.0, v_now=2.0, w_now=0.0,
         target=(42.0, 7.6), blocked_fn=_blocked_none)
     assert abs(w2) > 1e-4, f"目标在左后方应转向, w2={w2}"
+
+
+def test_full_speed_near_obstacle_can_slow():
+    """全速(4.0)接近正前方 1m 障碍 → 必须能选低速轨迹（v_lo=0）——回归：窗口全高速全碰撞 bug"""
+    def blocked(pt):
+        return math.hypot(pt[0]-1.0, pt[1]-0.0) < 0.7   # 正前方 1m 障碍
+    dwa = DWAAlgorithm()
+    result = dwa.choose_velocity(
+        robot_pos=(0.0, 0.0), yaw=0.0, v_now=4.0, w_now=0.0,
+        target=(10.0, 0.0), blocked_fn=blocked)
+    assert result is not None, "全速接近障碍必须能选低速/停车，不能全碰撞"
+    v, w = result
+    assert v < 3.6, f"应选低速轨迹(窗口含0), v={v}"
+    assert v >= 0.0
