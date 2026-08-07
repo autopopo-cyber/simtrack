@@ -101,6 +101,9 @@ ap.add_argument("--lidar-tick", type=int, default=0, help="雷达扫描间隔步
 ap.add_argument("--trail-every", type=int, default=0, help="轨迹记录间隔（步，0=关）。存 scans/trail_*.npz")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
+ap.add_argument("--obs-straight", type=int, default=0, help="每段直道障碍数（渐进：1→N。0=用默认密度生成）")
+ap.add_argument("--obs-turn", type=int, default=0, help="每段弯道障碍数（渐进：1→N。0=不加）")
+ap.add_argument("--obs-min-dist", type=float, default=6.0, help="直道障碍距通道两端转弯口的最小距离（m），避免堵死转弯")
 args = ap.parse_args()
 
 if args.seed is not None:
@@ -210,6 +213,44 @@ def gen_obstacles(seed):
         idx += rng.randint(12, 32)
     return [(x,y) for x,y in obs_world if math.hypot(x-6,y-6)>5.0]
 
+def gen_obstacles_progressive(seed):
+    """渐进式障碍（主人方案）：每段直道 N 个 + 每段弯道 N 个。
+    - 直道障碍：通道中心线 ±1.5m 随机，距两端转弯口 >= --obs-min-dist（默认 6m，不堵转弯）
+    - 弯道障碍：放转弯口道路内（U 型转弯段），偏离转弯中心线但留足够通道
+    返回世界坐标列表。种子固定可复现。
+    """
+    rng = random.Random(seed)
+    out = []
+    obs_r = 0.5          # OBS_R（定义在下方，这里用字面量避免初始化顺序问题）
+    obs_clear = obs_r + SAFE_R
+    # 每通道中心线 y（世界坐标）
+    for ch in range(10):
+        yc = 2.5 + ch * 5.0
+        # ── 直道障碍：x 在 [min_dist, 50-min_dist] 内均匀随机 ──
+        for i in range(args.obs_straight):
+            for _try in range(200):
+                ox = rng.uniform(args.obs_min_dist, 50.0 - args.obs_min_dist)
+                oy = yc + rng.uniform(-1.5, 1.5)
+                if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, obs_r):
+                    # 不与其他障碍重叠
+                    if all(math.hypot(ox-a, oy-b) > obs_clear + 0.3 for a, b in out):
+                        out.append((ox, oy)); break
+        # ── 弯道障碍：放 U 型转弯段内部（偶通道右端 x>46，奇通道左端 x<4）──
+        # 关键：转弯段 y 在分界墙两侧（通道中心 ±2.0m 靠近墙），避开直道末端转弯入口——
+        # 放直道末端(x=44-46)会堵死转弯路径（狗正撞上）；放转弯段内部狗绕行空间大
+        for i in range(args.obs_turn):
+            for _try in range(200):
+                if ch % 2 == 0:
+                    ox = rng.uniform(46.5, 49.0)     # 右端转弯段内部（x 大端，通道4→5 U 型弯中）
+                    oy = yc + rng.uniform(-2.2, 2.2)
+                else:
+                    ox = rng.uniform(1.0, 3.5)       # 左端转弯段内部
+                    oy = yc + rng.uniform(-2.2, 2.2)
+                if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, obs_r):
+                    if all(math.hypot(ox-a, oy-b) > obs_clear + 0.3 for a, b in out):
+                        out.append((ox, oy)); break
+    return out
+
 def _obs_hits_wall(ox, oy, r):
     """检查以 (ox,oy) 为中心 r 半径的圆是否碰到墙（确保障碍不嵌墙）"""
     steps = 12
@@ -236,7 +277,13 @@ def random_road_pos(seed, min_dist_from=5.0, from_pos=(2.5, 2.5)):
         return wx, wy
     return 25.0, 25.0  # fallback 中心（大概率是路）
 
-obs_world = [] if args.no_obs else gen_obstacles(FIXED_SEED)
+if args.no_obs:
+    obs_world = []
+elif args.obs_straight > 0 or args.obs_turn > 0:
+    obs_world = gen_obstacles_progressive(FIXED_SEED)
+    print(f"  [CFG] 渐进障碍：直道{args.obs_straight}/段 + 弯道{args.obs_turn}/段 → 共 {len(obs_world)} 个", flush=True)
+else:
+    obs_world = gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
 def is_obstacle_world(wx, wy):
@@ -593,6 +640,7 @@ class Mover:
         self.target = (FINISH[0], FINISH[1])  # 当前目标（GATE 方向），bounce 时优先朝向
         self.escape_steps = 0   # bounce 逃生冷却：沿 escape_yaw 强制走 N 步（绕出墙角再回归路径）
         self.escape_yaw = 0.0
+        self.need_replan = False  # 撞到新障碍（不在当前路径规划里）→ 主循环强制重规划
 
     def _forward_clear(self, bx, by, yaw_ang):
         """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。blocked() 已含机器人半径膨胀。"""
@@ -645,11 +693,33 @@ class Mover:
         # ── 前方被堵且已停住（speed≈0）→ 预判转向，不碰撞 ──
         if self.speed <= 0.05 and d_clear < STOP_MARGIN + 0.15:
             _hit_wall = sample_hf(bx, by) != ROAD_PIX
-            _near_obs = any(math.hypot(bx-ox, by-oy) < OBS_CLEAR for ox, oy in obs_world)
+            # 被挡时前方 1.5m 内是否有障碍（放宽：狗在障碍 0.7m 外就会被 blocked 挡住，但距离判定>0.7 会漏）
+            _near_obs = any(math.hypot(bx-ox, by-oy) < OBS_CLEAR + 0.8 for ox, oy in obs_world)
             if self.bounce % 5 == 0:
                 print(f"  [STOP] bounce#{self.bounce} @({bx:.1f},{by:.1f}) d_clear={d_clear:.2f} wall={_hit_wall} obs={_near_obs}", flush=True)
+            if _near_obs:
+                # 撞到障碍（不在 HPA static 距离场里）→ 先 escape 走远离开障碍区（~2m），
+                # escape 结束后主循环写安全圈 + 强制重规划绕行
+                # （写圈时机：狗在圈外才有效——狗在圈内时身边格被排除，路径仍贴障碍 → 死循环）
+                self.need_replan = True
+                if self.bounce % 10 == 0:
+                    print(f"  [OBS-ESC] @({bx:.1f},{by:.1f}) 距障碍{min(math.hypot(bx-ox,by-oy) for ox,oy in obs_world):.2f}m esc={self.escape_steps}", flush=True)
             self._bounce(45, 120)
-            # 转向后本帧不再移动（下帧从新 yaw 重新测距加速）
+            if _near_obs:
+                # escape 方向 = 可走距离最大方向（全向扫描 d_clear 最大）——不是盲目远离障碍：
+                # 远离方向可能 1m 就撞墙（如 y=5 分界墙）→ escape 撞墙 bounce 死循环。
+                # 走最远方向逃出障碍区，重规划后回归路径。
+                best_esc_yaw, best_esc_d = None, -1.0
+                for _deg in range(0, 360, 10):
+                    _cand = math.radians(_deg)
+                    _d = self._forward_clear(bx, by, _cand)
+                    if _d > best_esc_d:
+                        best_esc_d, best_esc_yaw = _d, _cand
+                if best_esc_yaw is not None and best_esc_d > 0.5:
+                    self.escape_yaw = best_esc_yaw
+                    self.escape_steps = 150   # 0.75s 走 ~2m 离开障碍区
+                if self.bounce % 10 == 0:
+                    print(f"  [OBS-ESC2] esc_yaw={math.degrees(self.escape_yaw):.0f}° d={best_esc_d:.1f}m", flush=True)
         # 卡死检测
         if step-self.stuck_t > STUCK_TIMEOUT:
             if math.hypot(bx-self.stuck_x, by-self.stuck_y) < STUCK_DIST_THRESH:
@@ -707,8 +777,12 @@ class Mover:
             self.d.qpos[2] = best_yaw  # 同步物理 yaw，狗身体立即转到新方向
             self.d.qvel[:] = 0
             self.speed = 0.0
-            # 逃生冷却：沿刚选的方向强制走 120 步（防 step() 又转向被挡目标 → bounce 死循环）
-            self.escape_steps = 120
+            # 逃生冷却：沿刚选的方向强制走 N 步（防 step() 又转向被挡目标 → bounce 死循环）
+            # 撞障碍（need_replan 挂起）时保持 200（1s~2-3m）——走太长会撞别的墙
+            if self.need_replan:
+                self.escape_steps = max(self.escape_steps, 200)
+            else:
+                self.escape_steps = 120
             self.escape_yaw = best_yaw
             return
         # 全部方向都堵（理论死角）→ 随机试几个方向，选能走最远的（防蹭墙死循环）
@@ -961,7 +1035,29 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if vis is not None:
         vis.scan_once(step)
 
-    if path is None or path_idx >= len(path):
+    if path is None or path_idx >= len(path) or (mv.need_replan and mv.escape_steps == 0):
+        if mv.need_replan and mv.escape_steps == 0:
+            # 狗已 escape 走远（≥2m）——现在写障碍安全圈 + 重规划绕行
+            # 注意：①写圈不按距离过滤（escape 可能走 8m 远，距狗>2m 会漏写 → 路径又穿障碍）
+            #      ②写 static_grid 不写 live grid——scan() 射线清除会把 live WALL 擦成 FREE → 反复写圈死循环
+            obs_r_grid = int(math.ceil((OBS_CLEAR + 0.5) / VOXEL))   # 1.2m=12 格扫描范围
+            _written = 0
+            for ox, oy in obs_world:
+                cx0, cy0 = int(round(ox/VOXEL)), int(round(oy/VOXEL))   # round 防浮点 8.2/0.1=81.9999
+                for dy in range(-obs_r_grid, obs_r_grid+1):
+                    for dx in range(-obs_r_grid, obs_r_grid+1):
+                        # 世界坐标判定：格中心距障碍 < 1.0m → WALL（执行层安全余量：路径须 ≥1m 离障碍）
+                        wx2, wy2 = (cx0+dx+0.5)*VOXEL, (cy0+dy+0.5)*VOXEL
+                        if math.hypot(wx2-ox, wy2-oy) < 1.0:
+                            if static_grid.get((cx0+dx, cy0+dy)) != WALL:
+                                static_grid[(cx0+dx, cy0+dy)] = WALL
+                                _written += 1
+            if _written:
+                print(f"  [OBS-WALL] 写安全圈 {_written} 格 (狗已逃到 ({bx:.1f},{by:.1f}))", flush=True)
+                # 不重建 HPA：安全圈 1.0m 已够（路径 ≥1m 离障碍，执行层邻域 ≥0.72m > 0.7 安全）。
+                # 重建会让 dist 含障碍 → 叠加 0.4m 膨胀 → 5m 通道空隙 0.7m < 狗 0.8m → 死路 bounce 1741
+            path = None; path_idx = 0; wander = 0; last_dist = 999
+            mv.need_replan = False   # 撞障碍重规划：HPA wall_fn 已看到 WALL，新路径绕行
         if KNOWN_MAP_MODE:
             # KNOWN_MAP_MODE：地图已知，HPA* 分层规划到终点（成熟算法，长距离规划消失）
             if hpa is not None:
@@ -970,6 +1066,15 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                 dt_plan = time.time() - t_plan0
                 stats["hpa_plan_ms"] = stats.get("hpa_plan_ms", 0) + dt_plan
                 stats["hpa_plans"] = stats.get("hpa_plans", 0) + 1
+                # 调试：检查新路径是否离障碍太近（穿安全圈）
+                if gp:
+                    _min_obs_d = 1e9
+                    for _px, _py in gp:
+                        for _ox, _oy in obs_world:
+                            _d = math.hypot((_px+0.5)*VOXEL-_ox, (_py+0.5)*VOXEL-_oy)
+                            if _d < _min_obs_d: _min_obs_d = _d
+                    if step % 1000 == 0 or _min_obs_d < 0.8:
+                        print(f"    [PATH] plan#{stats['hpa_plans']} len={len(gp)} min_obs_dist={_min_obs_d:.2f} pos=({bx:.1f},{by:.1f})", flush=True)
                 path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp] if gp else None
             else:
                 path = astar_to(vx, vy, int(FINISH[0]/VOXEL), int(FINISH[1]/VOXEL))

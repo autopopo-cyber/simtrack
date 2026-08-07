@@ -168,6 +168,9 @@ class HPAStar:
             for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
                 nx, ny = cx+dx, cy+dy
                 if not (0 <= nx < self.S and 0 <= ny < self.S): continue
+                # 实时障碍检查：wall_fn（含 live grid 障碍，SLAM/bounce 写回后可见）
+                # —— 障碍不在 static 距离场里，必须查 wall_fn 才能绕过！
+                if self.wall(nx, ny): continue
                 # 膨胀约束：距墙 <ROBOT_DIA 格禁行（机器人半径 0.2m，ROS costmap inflation）
                 if self.dist[ny, nx] < ROBOT_DIA: continue
                 ng = gs.get((cx, cy), 9999) + 1.0
