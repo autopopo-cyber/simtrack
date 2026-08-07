@@ -18,6 +18,7 @@ import mujoco
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml
+from simtrack.obstacles_random import RandomObstacleField
 
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
@@ -105,6 +106,8 @@ ap.add_argument("--obs-straight", type=int, default=0, help="每段直道障碍�
 ap.add_argument("--obs-turn", type=int, default=0, help="每段弯道障碍数（渐进：1→N。0=不加）")
 ap.add_argument("--obs-min-dist", type=float, default=6.0, help="直道障碍距通道两端转弯口的最小距离（m），避免堵死转弯")
 ap.add_argument("--obs-patrol", type=int, default=0, help="巡逻障碍数：沿两直道+一弯道蛇形路径往返走（1m/s，~50m）")
+ap.add_argument("--obs-random", type=int, default=0, help="随机反弹障碍数(2-4)：每段20m×5m, 1m/s, 20%/s变向, 撞墙/虚拟墙反弹")
+ap.add_argument("--obs-random-ch", type=str, default="1,4,6,8", help="反弹区段通道列表(逗号分隔)")
 args = ap.parse_args()
 
 if args.seed is not None:
@@ -316,6 +319,21 @@ def update_patrol(dt):
         patrol_phase[i] += PATROL_SPEED * dt * patrol_dir[i]
         obs_world[i] = patrol_pos(patrol_paths[i], patrol_phase[i])
 
+# ── 随机反弹障碍（主人指令 08-07：20m×5m 段, 1m/s, 20%/s 变向, 弹性反弹）──
+random_field = None   # RandomObstacleField 实例
+
+def init_random_obstacles():
+    global random_field, obs_world
+    chs = [int(c) for c in args.obs_random_ch.split(",")][:args.obs_random]
+    random_field = RandomObstacleField(channels=chs, seed=FIXED_SEED)
+    obs_world = random_field.positions
+    print(f"  [CFG] 随机反弹障碍 {len(obs_world)} 个 @通道{chs} (1m/s, 20%/s变向)", flush=True)
+
+def update_random(dt):
+    global obs_world
+    random_field.update(dt)
+    obs_world = random_field.positions   # blocked()/DWA 自动感知新位置
+
 def _obs_hits_wall(ox, oy, r):
     """检查以 (ox,oy) 为中心 r 半径的圆是否碰到墙（确保障碍不嵌墙）"""
     steps = 12
@@ -344,6 +362,9 @@ def random_road_pos(seed, min_dist_from=5.0, from_pos=(2.5, 2.5)):
 
 if args.no_obs:
     obs_world = []
+elif args.obs_random > 0:
+    obs_world = []
+    init_random_obstacles()          # 随机反弹障碍（obs_world[0:N] 是随机障碍）
 elif args.obs_patrol > 0:
     obs_world = []
     init_patrol_obstacles()          # 巡逻障碍独立于固定障碍（obs_world[0:N] 是巡逻）
@@ -1079,6 +1100,10 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     # 巡逻障碍移动（每 tick 更新位置，1m/s 沿蛇形路径往返）
     if patrol_paths:
         update_patrol(m.opt.timestep)
+
+    # 随机反弹障碍移动（每 tick 更新，1m/s 弹性反弹）
+    if random_field is not None:
+        update_random(m.opt.timestep)
 
     # 路标放置
     if abs(vx-last_mx)+abs(vy-last_my) >= MILESTONE_STEP:
