@@ -288,6 +288,8 @@ OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
 def is_obstacle_world(wx, wy):
     if sample_hf(wx, wy) != ROAD_PIX: return True
+    # 物理碰撞边界固定 0.7m（障碍半径0.5+狗半径0.2）——动态安全距离不由这里实现，
+    # 由 v_brake 制动约束自动实现：接近障碍 → d_clear 短 → 限速 → 低速挤过窄缝（主人指令 08-07）
     for ox, oy in obs_world:
         if math.hypot(wx-ox, wy-oy) < OBS_CLEAR: return True
     return False
@@ -319,14 +321,9 @@ def blocked(wx, wy):
     # 越界保护：赛道外直接视为 blocked（防穿墙跑出地图）
     if not (0.0 <= wx <= 50.0 and 0.0 <= wy <= 50.0):
         return True
-    vx, vy = int(wx/VOXEL), int(wy/VOXEL)
-    for dy in range(-ROBOT_R, ROBOT_R+1):
-        for dx in range(-ROBOT_R, ROBOT_R+1):
-            if dx*dx+dy*dy <= ROBOT_R*ROBOT_R:
-                nx, ny = vx+dx, vy+dy
-                if is_obstacle_world((nx+0.5)*VOXEL, (ny+0.5)*VOXEL):
-                    return True
-    return False
+    # 精确圆判定：狗中心距障碍 < 0.7m（物理边界）→ blocked
+    # 旧版 5×5 邻域格判定过保守（+0.283m）→ 窄缝挤不过；圆判定能贴 0.7m 物理边界
+    return is_obstacle_world(wx, wy)
 
 # ── 三级跳A* ──
 
@@ -1040,22 +1037,33 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             # 狗已 escape 走远（≥2m）——现在写障碍安全圈 + 重规划绕行
             # 注意：①写圈不按距离过滤（escape 可能走 8m 远，距狗>2m 会漏写 → 路径又穿障碍）
             #      ②写 static_grid 不写 live grid——scan() 射线清除会把 live WALL 擦成 FREE → 反复写圈死循环
-            obs_r_grid = int(math.ceil((OBS_CLEAR + 0.5) / VOXEL))   # 1.2m=12 格扫描范围
+            #      ③半径 0.8m：精确圆判定后无 0.283 冗余，物理边界 0.7 + 格偏移 0.1 即可——
+            #        1.0m 太宽 → 5m 通道缝 1.1m < 执行层需求 1.6m → 挤不过死循环
+            obs_r_grid = int(math.ceil((OBS_CLEAR + 0.2) / VOXEL))   # 0.9m=9 格扫描范围
             _written = 0
             for ox, oy in obs_world:
                 cx0, cy0 = int(round(ox/VOXEL)), int(round(oy/VOXEL))   # round 防浮点 8.2/0.1=81.9999
                 for dy in range(-obs_r_grid, obs_r_grid+1):
                     for dx in range(-obs_r_grid, obs_r_grid+1):
-                        # 世界坐标判定：格中心距障碍 < 1.0m → WALL（执行层安全余量：路径须 ≥1m 离障碍）
+                        # 世界坐标判定：格中心距障碍 < 0.8m → WALL（执行层物理边界 0.7 + 格偏移 0.1）
                         wx2, wy2 = (cx0+dx+0.5)*VOXEL, (cy0+dy+0.5)*VOXEL
-                        if math.hypot(wx2-ox, wy2-oy) < 1.0:
+                        if math.hypot(wx2-ox, wy2-oy) < 0.8:
                             if static_grid.get((cx0+dx, cy0+dy)) != WALL:
                                 static_grid[(cx0+dx, cy0+dy)] = WALL
                                 _written += 1
             if _written:
                 print(f"  [OBS-WALL] 写安全圈 {_written} 格 (狗已逃到 ({bx:.1f},{by:.1f}))", flush=True)
-                # 不重建 HPA：安全圈 1.0m 已够（路径 ≥1m 离障碍，执行层邻域 ≥0.72m > 0.7 安全）。
-                # 重建会让 dist 含障碍 → 叠加 0.4m 膨胀 → 5m 通道空隙 0.7m < 狗 0.8m → 死路 bounce 1741
+                # 重建 HPA：门网络/距离场是构建时的 static 快照（不含障碍圈）——
+                # 不重建则粗层门可能被圈堵住 → plan 返回 None → 死循环。
+                # 0.8m 圈 + 精确圆判定后重建可行（1.0m 圈 + 5×5 过保守时重建会把缝堵死 bounce 1741）
+                if KNOWN_MAP_MODE and 'HPAStar' in dir():
+                    try:
+                        t_re = time.time()
+                        hpa = HPAStar(_hpa_wall, verbose=False)
+                        print(f"  [HPA] 重建 {time.time()-t_re:.1f}s ({_written} 格安全圈)", flush=True)
+                    except Exception as e:
+                        hpa = None
+                        print(f"  [HPA] 重建失败: {e}", flush=True)
             path = None; path_idx = 0; wander = 0; last_dist = 999
             mv.need_replan = False   # 撞障碍重规划：HPA wall_fn 已看到 WALL，新路径绕行
         if KNOWN_MAP_MODE:
