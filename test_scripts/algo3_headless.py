@@ -34,7 +34,7 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 
 SCALE = 1.0; HF_RES = 2000; PIX_PER_M = 40; ROAD_PIX = 128
 SAFE_R = 0.2; SPEED = 4.0; SPEED_MAX = 4.0; YAW_RATE = 1.5
-LIDAR_RANGE = 15.0
+LIDAR_RANGE = 30.0  # 15→30m（主人指令 2026-08-06）：真实狗雷达10万点/s覆盖前半球，30m 探测更远
 
 VOXEL = 0.1
 ROBOT_R = max(1, int(SAFE_R / VOXEL))
@@ -44,7 +44,7 @@ LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)
 LIDAR_RAYS = 360  # 120→360（1°间隔）：15m处射线间距0.26m，覆盖0.1m薄斜墙（120时0.78m漏扫）
 
 MAX_GATES = 200
-WALL_SCAN_RADIUS = 10
+WALL_SCAN_RADIUS = 20  # 10→20：配合 JUMP_1M=20，wall_dist 能分辨 2m 空旷
 WALL_BUFFER_M = 2.0; WALL_BUFFER_CELLS = int(WALL_BUFFER_M / VOXEL)
 WALL_PENALTY = 3
 UNKNOWN_PENALTY = 8  # 未知格可通行但代价高（探索规划，优先已知路）
@@ -66,6 +66,7 @@ MIX_THRESHOLD = 50
 INIT_SCAN_STEPS = 200
 LIDAR_TICK = 10; RENDER_SKIP = 20  # LIDAR_TICK 20→10：scan更频繁，减少两次scan间盲区（斜墙漏检）
 ARRIVE_THRESH = 1.0
+PATH_LOOKAHEAD = 3.0  # pure pursuit 前瞻：目标=路径上直线距离≥此值的点（直道满速，接近自动减速）
 WANDER_TIMEOUT = 600; WANDER_DRIFT_RATIO = 1.05
 MAX_NO_GATE = 5
 RESCUE_MS_COUNT = 5
@@ -90,9 +91,14 @@ ap.add_argument("--timeout", type=float, default=900, help="墙钟超时（秒�
 ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（默认 auto）")
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
+ap.add_argument("--known-raw", type=int, default=1, help="KNOWN_MAP 用原始 track_clean 地图（sample_hf 判定，与物理一致）")
 ap.add_argument("--vision", type=int, default=1, help="视觉识别（hfield降分辨率后223ms/帧，默认开）")
 ap.add_argument("--landmarks", type=int, default=1, help="标牌几何（contype=0零物理开销，默认开）")
 ap.add_argument("--obs-reseed", type=int, default=0, help="运行中障碍变化步数：到该步换新障碍 seed（B阶段）")
+ap.add_argument("--no-obs", type=int, default=0, help="1=纯墙版（去掉所有障碍，只留 hfield 墙）")
+ap.add_argument("--lidar-rays", type=int, default=0, help="雷达射线数（0=用代码默认360）。真实狗~1万点/帧前半球")
+ap.add_argument("--lidar-tick", type=int, default=0, help="雷达扫描间隔步数（0=用代码默认10）。真实狗10Hz")
+ap.add_argument("--trail-every", type=int, default=0, help="轨迹记录间隔（步，0=关）。存 scans/trail_*.npz")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
 args = ap.parse_args()
@@ -100,11 +106,37 @@ args = ap.parse_args()
 if args.seed is not None:
     FIXED_SEED = args.seed
 
-# 目标动态设置（--target start|finish）
+# 雷达参数可调（实验：点云密度/频率是不是瓶颈）
+if args.lidar_rays > 0:
+    LIDAR_RAYS = args.lidar_rays
+if args.lidar_tick > 0:
+    LIDAR_TICK = args.lidar_tick
+
+# 纯墙版：去掉所有障碍（只留 hfield 墙）
+if args.no_obs:
+    obs_world = []
+    print("  [CFG] 纯墙版：障碍已清空（--no-obs）", flush=True)
+
+# 目标动态设置（--target start|finish|ch<N>|任意坐标）
 if args.target == "start":
     FINISH = (2.5, 2.5)
 elif args.target == "finish":
     FINISH = (2.5, 47.5)
+elif args.target.startswith("ch"):
+    # 任意通道二维码：每通道 1 个标牌（landmark_positions() 已含全部通道位置）
+    ch = int(args.target[2:])
+    _lps = landmark_positions()
+    if 0 <= ch < len(_lps):
+        idx, cnum, side, lx, ly, wz, quat = _lps[ch]
+        FINISH = (float(lx), float(ly))
+        print(f"  [ARG] 目标=通道{ch} 二维码 ({lx:.1f},{ly:.1f})", flush=True)
+    else:
+        print(f"  [ARG] 通道{ch} 超出范围(0~{len(_lps)-1})，用 finish", flush=True)
+        FINISH = (2.5, 47.5)
+elif args.target.startswith("("):
+    import ast
+    FINISH = ast.literal_eval(args.target)
+    print(f"  [ARG] 目标=自定义坐标 {FINISH}", flush=True)
 else:
     print(f"  [ARG] 未知目标: {args.target}，用 finish", flush=True)
     FINISH = (2.5, 47.5)
@@ -204,7 +236,7 @@ def random_road_pos(seed, min_dist_from=5.0, from_pos=(2.5, 2.5)):
         return wx, wy
     return 25.0, 25.0  # fallback 中心（大概率是路）
 
-obs_world = gen_obstacles(FIXED_SEED)
+obs_world = [] if args.no_obs else gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
 def is_obstacle_world(wx, wy):
@@ -251,9 +283,10 @@ def blocked(wx, wy):
 
 # ── 三级跳A* ──
 
-JUMP_1M = 10
-JUMP_03 = 3
-JUMP_NEAR = 1
+# 跨步尺寸（主人指令 2026-08-06：雷达 30m 后跨步可扩展减少计算）
+JUMP_1M = 20   # 10→20：空旷区 1m→2m 一跳（离墙≥2m 时）
+JUMP_03 = 6    # 3→6：离墙≥0.6m 时
+JUMP_NEAR = 1  # 贴墙保持 0.1m
 
 def jump_steps(vx, vy, dx, dy):
     wd = wall_dist(vx, vy)
@@ -462,7 +495,11 @@ def fine_path(sx, sy, gx, gy, came_from, to_world=True):
         return [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in path]
     return path
 
+ASTAR_CALLS = [0]
 def astar_to(fvx, fvy, tfx, tfy):
+    ASTAR_CALLS[0] += 1
+    if ASTAR_CALLS[0] % 100 == 1:
+        print(f"  [A*] call#{ASTAR_CALLS[0]} from=({fvx},{fvy}) to=({tfx},{tfy})", flush=True)
     # 起点放宽：未知/已知都可起步（WALL 才拒绝），机器人物理位置贴墙边也必须能回溯寻路
     if gget_plan(fvx, fvy) == WALL:
         return None
@@ -554,6 +591,8 @@ class Mover:
         self.yaw = 0.0; self.speed = 0.0; self.bounce = 0
         self.stuck_t = 0; self.stuck_x = 0.0; self.stuck_y = 0.0
         self.target = (FINISH[0], FINISH[1])  # 当前目标（GATE 方向），bounce 时优先朝向
+        self.escape_steps = 0   # bounce 逃生冷却：沿 escape_yaw 强制走 N 步（绕出墙角再回归路径）
+        self.escape_yaw = 0.0
 
     def _forward_clear(self, bx, by, yaw_ang):
         """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。blocked() 已含机器人半径膨胀。"""
@@ -567,6 +606,11 @@ class Mover:
     def step(self, tx, ty, step):
         bx, by = self.d.qpos[0], self.d.qpos[1]
         dt = self.m.opt.timestep
+        # bounce 逃生冷却：沿 escape_yaw 方向走（目标=前方 2m 点），绕出墙角再回归
+        if self.escape_steps > 0:
+            self.escape_steps -= 1
+            tx = bx + math.cos(self.escape_yaw) * 2.0
+            ty = by + math.sin(self.escape_yaw) * 2.0
         self.target = (tx, ty)  # 记录当前目标，bounce 用
         if step % 10000 == 0:
             print(f"    [MOVER] step={step} pos=({bx:.1f},{by:.1f}) target=({tx:.1f},{ty:.1f}) yaw={math.degrees(self.yaw):.0f}° speed={self.speed:.2f}", flush=True)
@@ -575,10 +619,17 @@ class Mover:
         err = (tgt_yaw-self.yaw+math.pi)%(2*math.pi)-math.pi
         dyaw = max(-YAW_RATE*dt, min(YAW_RATE*dt, err))
         self.yaw += dyaw
+        # ── 大转向限速（DWA 思想：曲率越大速度越低）──
+        # 目标方向偏离当前朝向 >57° 时限速 1.0——先转身再加速，防止直冲偏离（绑架随机起点 yaw=0 但目标在背后 170°）
+        turn_limited = False
+        if abs(err) > 1.0:
+            turn_limited = True
         # ── 前瞻测距：沿当前 yaw 方向量到障碍的距离 ──
         d_clear = self._forward_clear(bx, by, self.yaw)
         # ── 期望速度（限速）：目标距离速度 vs 制动约束，取小 ──
         v_des = min(SPEED_MAX, math.hypot(tx-bx, ty-by)*SPEED_FACTOR)
+        if turn_limited:
+            v_des = min(v_des, 1.0)
         # 近墙限速：前方空间小（<2m）时降速，窄连接段/迷宫缺口慢速通过防过冲
         if d_clear < 2.0:
             v_des = min(v_des, 1.5)
@@ -618,23 +669,24 @@ class Mover:
                 gset(gvx, gvy, WALL)
         else:
             self.d.qvel[0] = vx; self.d.qvel[1] = vy; self.d.qvel[2] = 0
+            self.d.qpos[2] = self.yaw  # 控制 yaw 直接写回物理（滑动模型 friction=0，mj_step 保持）
         mujoco.mj_step(self.m, self.d)
-        # 物理积分后同步 yaw（qpos[2] 由 hinge joint 积分，这里读回）
-        self.yaw = self.d.qpos[2]
+        # 不再读回 qpos[2] 覆盖 self.yaw——yaw 是控制变量（旧代码读回导致每步转向被重置为初始 0）
         return True
 
     def _bounce(self, lo, hi):
         # 无条件计数+转向（防 escaping 卡死）；转向后 speed 已≈0，由 step() 重新加速
         self.bounce += 1
+        if args.trail_every > 0:
+            bounce_pts.append([round(self.d.qpos[0], 3), round(self.d.qpos[1], 3), self.bounce])
         if self.bounce % 5 == 0:
             print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
         # 转向：先试目标方向（当前 GATE）的小角度偏转，再试随机（防墙边死循环）
         bx, by = self.d.qpos[0], self.d.qpos[1]
         tx, ty = self.target
         tgt_yaw = math.atan2(ty - by, tx - bx)
-        # 目标方向 ± 角度，全部测距，选能走最远的（斜墙/墙柱前 0.7m 内被挡但绕过去就通）
-        # 候选每 5° 扫一圈（防稀疏角度漏掉窄缺口——迷宫段间墙缺口只有 ~10° 宽）
-        # 评分：优先向目标推进（advance 高），推进方向里选距离远；避免选回头路
+        # 全向每 5° 扫（防稀疏角度漏掉窄缺口——迷宫段间墙缺口只有 ~10° 宽）
+        # 评分：推进优先，但推进度差距小(<0.15)时距离只做轻 tie-break（防 Z 字斜穿震荡）
         candidates = []
         for deg in range(0, 360, 5):
             candidates.append(tgt_yaw + math.radians(deg))
@@ -643,10 +695,11 @@ class Mover:
             d = self._forward_clear(bx, by, cand)
             if d < STOP_MARGIN:
                 continue
-            # 推进度：候选方向在目标方向上的投影（1=完全朝目标，-1=完全背离）
             dot = math.cos(cand - tgt_yaw)
-            # score = 推进度*2 + 距离（推进优先，同推进度比距离）
-            score = dot * 2.0 + min(d, 4.0)
+            # 混合评分：推进优先但保留逃逸能力——dot*4 + 距离(截断2)
+            # 平衡点：正前方被挡(d 小)时，侧向 dot=0.7 且 d=3m → 2.8+2=4.8 > 正前方 4+0.5=4.5
+            # 但斜穿对面墙 dot=0.3,d=5 → 1.2+2=3.2 < 侧向贴墙走 dot=0.9,d=2 → 3.6+2=5.6
+            score = dot * 4.0 + min(d, 2.0)
             if score > best_score:
                 best_score, best_d, best_yaw = score, d, cand
         if best_yaw is not None and best_d >= STOP_MARGIN:
@@ -654,6 +707,9 @@ class Mover:
             self.d.qpos[2] = best_yaw  # 同步物理 yaw，狗身体立即转到新方向
             self.d.qvel[:] = 0
             self.speed = 0.0
+            # 逃生冷却：沿刚选的方向强制走 120 步（防 step() 又转向被挡目标 → bounce 死循环）
+            self.escape_steps = 120
+            self.escape_yaw = best_yaw
             return
         # 全部方向都堵（理论死角）→ 随机试几个方向，选能走最远的（防蹭墙死循环）
         best_yaw, best_d = None, -1.0
@@ -808,6 +864,34 @@ mv = Mover(m, d)
 # 阶段2：加载旧地图为 static_grid（已知地图快速寻路）
 if args.load_map:
     load_map(args.load_map)
+# --known-raw：KNOWN_MAP 直接用原始 track_clean 地图（不依赖 npz 生成，与物理 sample_hf 判定完全一致）
+# 区域判定：格覆盖 4×4 像素任一为墙 → WALL（单点采样会漏薄分界墙，如 y=30 row798-801 但中心采样 py=797）
+if args.known_raw and not args.load_map:
+    KNOWN_MAP_MODE = True
+    bin_wall = (hf != ROAD_PIX).astype(np.int8)
+    arr_wall = bin_wall.reshape(500, 4, 500, 4).max(axis=(1, 3))
+    # MAX-pool 行块 = 图像行（row0=y=50m 顶部），格坐标 gy=0 是 y=0m → 必须 flip 对齐世界坐标！
+    arr_wall = arr_wall[::-1, :]
+    for vy in range(500):
+        for vx in range(500):
+            if arr_wall[vy, vx]:
+                static_grid[(vx, vy)] = WALL
+    print(f"  [MAP] 原始 track_clean 地图就绪 (KNOWN_MAP_MODE, {len(static_grid)} 墙格, MAX-pool 区域判定)", flush=True)
+
+# HPA* 分层规划器（KNOWN_MAP 用；成熟算法替代全程 A*，构建~1.5s）
+hpa = None
+if KNOWN_MAP_MODE:
+    try:
+        sys.path.insert(0, os.path.join(PROJ, "scripts"))
+        from hpa_star import HPAStar, CELL_M as HPA_CELL_M
+        # wall_fn 用 live 视图（static 墙 + 实时障碍），距离场用 static 墙
+        def _hpa_wall(vx, vy):
+            return gget_plan(vx, vy) == WALL
+        hpa = HPAStar(_hpa_wall, verbose=False)
+        print(f"  [HPA] 分层规划器就绪 (cell={HPA_CELL_M}m)", flush=True)
+    except Exception as e:
+        hpa = None
+        print(f"  [HPA] 不可用: {e}（回退全程 A*）", flush=True)
 
 # 视觉地标识别（前置相机 + 颜色识别；GPU渲染 32ms/帧，--vision 1 开启）
 if args.vision:
@@ -845,6 +929,8 @@ for _ in range(INIT_SCAN_STEPS):
 print(f"  [OK] FREE={_cnt[FREE]} WALL={_cnt[WALL]}", flush=True)
 
 frame_idx = 0
+trail = []          # 轨迹记录：每 trail-every 步存 (step, x, y, yaw, bounce)
+bounce_pts = []     # bounce 位置（分析卡点用）
 while step < args.max_steps and time.time() - t0 < args.timeout:
     bx, by = d.qpos[0], d.qpos[1]
     vx, vy = int(bx/VOXEL), int(by/VOXEL)
@@ -877,15 +963,23 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     if path is None or path_idx >= len(path):
         if KNOWN_MAP_MODE:
-            # KNOWN_MAP_MODE：地图已知，直接 A* 到终点（不找门——地图无 UNKNOWN 前沿）
-            path = astar_to(vx, vy, int(FINISH[0]/VOXEL), int(FINISH[1]/VOXEL))
+            # KNOWN_MAP_MODE：地图已知，HPA* 分层规划到终点（成熟算法，长距离规划消失）
+            if hpa is not None:
+                t_plan0 = time.time()
+                gp = hpa.plan(vx, vy, int(FINISH[0]/VOXEL), int(FINISH[1]/VOXEL))
+                dt_plan = time.time() - t_plan0
+                stats["hpa_plan_ms"] = stats.get("hpa_plan_ms", 0) + dt_plan
+                stats["hpa_plans"] = stats.get("hpa_plans", 0) + 1
+                path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp] if gp else None
+            else:
+                path = astar_to(vx, vy, int(FINISH[0]/VOXEL), int(FINISH[1]/VOXEL))
             if path:
                 path_idx = 0; wander = 0; last_dist = 999; no_gate_count = 0
                 stats["gates_selected"] += 1
                 if step % 10000 == 0:
                     print(f"    [DECIDE] KNOWN_MAP path={len(path)} →{FINISH} pos=({bx:.1f},{by:.1f})", flush=True)
             else:
-                # A* 失败（新障碍挡住旧地图路径）→ 先避障，下轮重规划
+                # 规划失败（新障碍挡住旧地图路径）→ 先避障，下轮重规划
                 path = None; path_idx = 0; no_gate_count += 1
                 mv._bounce(60, 120)
         else:
@@ -952,7 +1046,26 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if step % 10000 == 0:
         print(f"    [EXEC] step={step} path={'None' if path is None else len(path)} idx={path_idx} no_gate={no_gate_count} pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f})", flush=True)
     if path is not None and path_idx < len(path):
+        # pure pursuit：找路径上最近点 → 目标 = 其前方 PATH_LOOKAHEAD 处的点
+        # path_idx 持续推进（上次最近点索引），避免 bounce 后目标跳回起点
+        best_i, best_d = path_idx, 1e18
+        for _i in range(path_idx, min(path_idx + 400, len(path))):
+            lx, ly = path[_i]
+            dd = (lx-bx)*(lx-bx) + (ly-by)*(ly-by)
+            if dd < best_d:
+                best_d = dd; best_i = _i
+        if best_i > path_idx:
+            path_idx = best_i  # 推进：已走过的路径段不再回头
+        # 目标 = best_i 之后第一个 ≥ PATH_LOOKAHEAD 的点
         tx, ty = path[path_idx]
+        look_target = None
+        for _i in range(path_idx, len(path)):
+            lx, ly = path[_i]
+            if math.hypot(lx-bx, ly-by) >= PATH_LOOKAHEAD:
+                look_target = (lx, ly)
+                break
+        if look_target is not None:
+            tx, ty = look_target
         ddist = math.hypot(tx-bx, ty-by)
         if ddist < ARRIVE_THRESH:
             path_idx += 1
@@ -984,9 +1097,22 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         mv.step(FINISH[0], FINISH[1], step)
 
     step += 1
+    if step <= 50 or step % 200 == 0:
+        import time as _t
+        _now = _t.time()
+        if step <= 50:
+            _perf = getattr(__import__('__main__', fromlist=['x']), '_perf', None)
+        else:
+            _perf = None
+        print(f"  [PERF] step={step} t={_now - t0:.1f}s rate={step/(_now - t0):.0f}步/s", flush=True)
 
-    # 终点检测
-    if math.hypot(bx-FINISH[0], by-FINISH[1]) < 3.0:
+    # 轨迹记录（分析行为用）
+    if args.trail_every > 0 and step % args.trail_every == 0:
+        trail.append([step, round(d.qpos[0], 3), round(d.qpos[1], 3),
+                      round(math.degrees(d.qpos[2]), 1), mv.bounce])
+
+    # 终点检测（3.5m：二维码在通道尽头转弯口前，够近即可；3.0 在斜墙边会差 7mm 判不到）
+    if math.hypot(bx-FINISH[0], by-FINISH[1]) < 3.5:
         print(f"\n  ★ ARRIVED! @({bx:.1f},{by:.1f}) step={step} ms={len(milestones)}", flush=True)
         stats["arrived"] = True
         break
@@ -1032,6 +1158,18 @@ save_state()
 # 阶段1：保存地图供后续阶段2加载
 if args.save_map:
     save_map(args.save_map)
+
+# 轨迹保存（分析行为用）
+if args.trail_every > 0 and trail:
+    import numpy as _np
+    trail_path = os.path.join(SCAN_DIR, f"trail_seed{FIXED_SEED}_steps{step}_b{len(bounce_pts)}.npz")
+    _np.savez(trail_path,
+              trail=_np.array(trail, dtype=float),
+              bounce_pts=_np.array(bounce_pts, dtype=float) if bounce_pts else _np.zeros((0, 3)),
+              seed=FIXED_SEED, mode=EXPLORE_MODE,
+              lidar_rays=LIDAR_RAYS, lidar_tick=LIDAR_TICK,
+              no_obs=args.no_obs, obs_reseed=args.obs_reseed)
+    print(f"\n[TRAIL] {trail_path} trail={len(trail)} bounce_pts={len(bounce_pts)}", flush=True)
 
 # 成绩单
 if args.save_name:
