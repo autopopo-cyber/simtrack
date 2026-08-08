@@ -234,10 +234,12 @@ def gen_obstacles_progressive(seed):
     for ch in range(10):
         yc = 2.5 + ch * 5.0
         # ── 直道障碍：x 在 [min_dist, 50-min_dist] 内均匀随机 ──
+        # 2026-08-08 收窄横向偏移 ±1.5→±1.0：墙边禁入区(0.1) + 碰撞(0.7) 后缝隙 0.2m 卡死；
+        # 距墙 ≥1.5m → 缝隙 ≥0.7m 狗轻松穿（主人预期"各种障碍都能穿过去"）
         for i in range(args.obs_straight):
             for _try in range(200):
                 ox = rng.uniform(args.obs_min_dist, 50.0 - args.obs_min_dist)
-                oy = yc + rng.uniform(-1.5, 1.5)
+                oy = yc + rng.uniform(-1.0, 1.0)
                 if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, obs_r):
                     # 不与其他障碍重叠
                     if all(math.hypot(ox-a, oy-b) > obs_clear + 0.3 for a, b in out):
@@ -245,14 +247,15 @@ def gen_obstacles_progressive(seed):
         # ── 弯道障碍：放 U 型转弯段内部（偶通道右端 x>46，奇通道左端 x<4）──
         # 关键：转弯段 y 在分界墙两侧（通道中心 ±2.0m 靠近墙），避开直道末端转弯入口——
         # 放直道末端(x=44-46)会堵死转弯路径（狗正撞上）；放转弯段内部狗绕行空间大
+        # 2026-08-08 偏移 ±2.2→±1.2（同上：禁入区+碰撞缝隙保障）
         for i in range(args.obs_turn):
             for _try in range(200):
                 if ch % 2 == 0:
                     ox = rng.uniform(46.5, 49.0)     # 右端转弯段内部（x 大端，通道4→5 U 型弯中）
-                    oy = yc + rng.uniform(-2.2, 2.2)
+                    oy = yc + rng.uniform(-1.2, 1.2)
                 else:
                     ox = rng.uniform(1.0, 3.5)       # 左端转弯段内部
-                    oy = yc + rng.uniform(-2.2, 2.2)
+                    oy = yc + rng.uniform(-1.2, 1.2)
                 if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, obs_r):
                     if all(math.hypot(ox-a, oy-b) > obs_clear + 0.3 for a, b in out):
                         out.append((ox, oy)); break
@@ -398,12 +401,6 @@ def scan(bx, by):
         for step_i in range(1, LIDAR_STEPS+1):
             wx, wy = bx + cos_a*step_i*VOXEL, by + sin_a*step_i*VOXEL
             vx, vy = int(wx/VOXEL), int(wy/VOXEL)
-            # 墙边禁入区：距墙 <0.2m 标 WALL（A*/find_gates 看到即避开，与 blocked 一致）
-            if in_keepout(wx, wy):
-                gset(vx, vy, WALL)
-                if gget(prev_vx, prev_vy) == UNKNOWN:
-                    gset(prev_vx, prev_vy, FREE)
-                break
             if is_obstacle_world(wx, wy):
                 gset(vx, vy, WALL)
                 # prev 格是墙前可通行格（机器人可能站上面），标 FREE 不标 WALL
@@ -416,52 +413,34 @@ def scan(bx, by):
                 gset(vx, vy, FREE)
             prev_vx, prev_vy = vx, vy
 
-# ── 墙边禁入区（主人指令 2026-08-08：墙边 0.2m 禁止进入）──
-# 用距墙距离判定（sample_hf 邻域 0.2m 内有无墙），转弯口自然适用（开口处不是墙 → 可通行）
-# 性能：预计算 500×500 布尔掩码（启动一次性 ~1s），运行时 O(1) 查表
-KEEP_MARGIN = 0.2   # 距墙禁入距离 (m)
-KEEP_MASK = None    # 500×500 bool: True=禁入（格中心判定）
+# ── 墙边禁入区（主人指令 2026-08-08：墙边 10cm 禁止进入）──
+# ⚠️ 不许作弊：禁入区基于**雷达感知**的墙（grid WALL），不是真值地图 track_clean！
+# 现实狗看不到真实坐标，只能靠激光雷达扫到的墙。没扫到的墙不禁入（敢走，撞了才知道=现实）。
+# 实现：blocked() 里检查周围 KEEP_CELLS 格内是否有感知 WALL。
+# 2026-08-08 调优：20cm(2格) 障碍+禁入区双压缩缝隙卡死 → 改 10cm(1格)（主人授权）
+KEEP_CELLS = 1   # 感知墙外禁入格数（1格 = 10cm）
 
-def _in_keepout_slow(wx, wy):
-    """距墙 < KEEP_MARGIN → True。9 点采样（十字 0.2m + 对角 0.14*√2≈0.2m）。"""
-    for dx, dy in [(0,0), (0.2,0), (-0.2,0), (0,0.2), (0,-0.2),
-                   (0.14,0.14), (0.14,-0.14), (-0.14,0.14), (-0.14,-0.14)]:
-        if sample_hf(wx + dx, wy + dy) != ROAD_PIX:
-            return True
+def in_keepout(vx, vy):
+    """距感知墙 < KEEP_CELLS 格 → True（禁入）。基于 grid/static WALL（雷达感知）。"""
+    for dy in range(-KEEP_CELLS, KEEP_CELLS+1):
+        for dx in range(-KEEP_CELLS, KEEP_CELLS+1):
+            if dx*dx + dy*dy > KEEP_CELLS*KEEP_CELLS:
+                continue
+            if gget_plan(vx+dx, vy+dy) == WALL:
+                return True
     return False
-
-def init_keepout_mask():
-    """预计算禁入掩码（500×500，格中心判定）"""
-    global KEEP_MASK
-    if KEEP_MASK is not None:
-        return
-    KEEP_MASK = np.zeros((500, 500), dtype=bool)
-    for vy in range(500):
-        wy = (vy + 0.5) * VOXEL
-        for vx in range(500):
-            wx = (vx + 0.5) * VOXEL
-            if _in_keepout_slow(wx, wy):
-                KEEP_MASK[vy, vx] = True
-
-def in_keepout(wx, wy):
-    """距墙 < KEEP_MARGIN → True（O(1) 查表）"""
-    if KEEP_MASK is None:
-        return _in_keepout_slow(wx, wy)
-    vx = int(wx / VOXEL)
-    vy = int(wy / VOXEL)
-    if 0 <= vx < 500 and 0 <= vy < 500:
-        return KEEP_MASK[vy, vx]
-    return True   # 越界视为禁入
 
 def blocked(wx, wy, inflation=0.0):
     # 越界保护：赛道外直接视为 blocked（防穿墙跑出地图）
     if not (0.0 <= wx <= 50.0 and 0.0 <= wy <= 50.0):
         return True
-    # 墙边禁入区：距墙 < 0.2m → blocked（狗永不贴墙，视觉上始终在路中间）
-    if in_keepout(wx, wy):
+    # 墙边禁入区（感知版）：雷达扫到的墙边 0.2m 禁入——狗永不贴墙，视觉上始终在路中间
+    if in_keepout(int(wx/VOXEL), int(wy/VOXEL)):
         return True
-    # 精确圆判定：狗中心距障碍 < 0.7m（物理边界）→ blocked
-    # 旧版 5×5 邻域格判定过保守（+0.283m）→ 窄缝挤不过；圆判定能贴 0.7m 物理边界
+    # 感知墙判定：grid/static WALL（雷达扫到的墙），不是真值 sample_hf（不许作弊）
+    if gget_plan(int(wx/VOXEL), int(wy/VOXEL)) == WALL:
+        return True
+    # 障碍圆判定：狗中心距障碍 < 0.7m（物理边界）→ blocked
     return is_obstacle_world(wx, wy, inflation)
 
 # ── 三级跳A* ──
@@ -495,7 +474,8 @@ def wall_dist(vx, vy):
     return best
 
 def walkable(vx, vy):
-    return gget_plan(vx, vy) == FREE and wall_dist(vx, vy) > ROBOT_R
+    # 距感知墙 > KEEP_CELLS(0.2m)：A* 规划避开墙边禁入区（与 blocked 的 in_keepout 一致）
+    return gget_plan(vx, vy) == FREE and wall_dist(vx, vy) > KEEP_CELLS
 
 def traversable(vx, vy):
     """探索可通行：FREE 或 UNKNOWN 都行（WALL 不行）。
@@ -1055,9 +1035,6 @@ def coverage_pct():
 
 print(f"━━━ 萤火 Firefly v3 SLAM headless ━━━ {VOXEL}m 三级跳A* 模式={EXPLORE_MODE} seed={FIXED_SEED} ━━━", flush=True)
 
-# 墙边禁入区掩码预计算（启动一次性，O(1) 查表）
-init_keepout_mask()
-print(f"  [KEEP] 墙边禁入区 {KEEP_MARGIN}m 掩码就绪 ({int(KEEP_MASK.sum())} 格禁入)", flush=True)
 
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
@@ -1129,14 +1106,9 @@ if args.known_raw and not args.load_map:
     arr_wall = arr_wall[::-1, :]
     for vy in range(500):
         for vx in range(500):
-            # 墙边禁入区：距墙 <0.2m 直接标 WALL（狗只能在路中间走）
-            wx_c = (vx + 0.5) * VOXEL
-            wy_c = (vy + 0.5) * VOXEL
-            if in_keepout(wx_c, wy_c):
+            if arr_wall[vy, vx]:
                 static_grid[(vx, vy)] = WALL
-            elif arr_wall[vy, vx]:
-                static_grid[(vx, vy)] = WALL
-    print(f"  [MAP] 原始 track_clean 地图就绪 (KNOWN_MAP_MODE, {len(static_grid)} 墙格, MAX-pool 区域判定 + 墙边禁入区{KEEP_MARGIN}m)", flush=True)
+    print(f"  [MAP] 原始 track_clean 地图就绪 (KNOWN_MAP_MODE, {len(static_grid)} 墙格, MAX-pool 区域判定)", flush=True)
 
 # HPA* 分层规划器（KNOWN_MAP 用；成熟算法替代全程 A*，构建~1.5s）
 hpa = None
