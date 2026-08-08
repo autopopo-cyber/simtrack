@@ -29,7 +29,9 @@ PROJ = os.path.expanduser("~/workspace/simtrack")
 MAP = os.path.join(PROJ, "confirmed/track_clean.png")
 # 渲染用降分辨率 hfield（2000→500）：EGL/OSMesa 软渲染下 2000x2000 高度图 2.7s/帧，
 # 500x500 只要 223ms（快12倍）。sample_hf 碰撞检测仍用原图 MAP，精度不降。
-RENDER_MAP = os.path.join(PROJ, "confirmed/track_500.png")
+# 2026-08-08 修正：track_500_bin.png 是从 clean 块判定生成的无抗锯齿二值图——
+# 抗锯齿版 track_500.png 的墙边界有 0.3m 斜坡（狗贴墙走渲染时踩斜坡上 = 视觉上墙）
+RENDER_MAP = os.path.join(PROJ, "confirmed/track_500_bin.png")
 SCAN_DIR = os.path.join(PROJ, "scans")
 SCAN_STATE = os.path.join(SCAN_DIR, "scan_dict.npz")
 os.makedirs(SCAN_DIR, exist_ok=True)
