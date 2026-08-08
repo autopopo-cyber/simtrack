@@ -16,7 +16,8 @@ import numpy as np
 VOXEL = 0.1
 CELL_M = 5.0
 CELL = int(CELL_M / VOXEL)   # 50 格 = 5m
-ROBOT_DIA = 4                # 0.4m 机器人直径（格）
+ROBOT_DIA = 6                # 0.6m 膨胀（格）：必须 > 执行层 STOP_MARGIN(0.4)+0.15=0.55m，
+                             # 否则 HPA 路径贴墙（dist=4）时前方测距 d_clear=0.4 < 0.55 → 每步 STOP → 卡死
 INF = 10**6
 
 class HPAStar:
@@ -182,6 +183,20 @@ class HPAStar:
                     gs[(nx, ny)] = ng
                     came[(nx, ny)] = (cx, cy)
                     heapq.heappush(open_set, (ng + math.hypot(gx-nx, gy-ny), nx, ny))
+        print(f"  [HPA-DBG] A*失败: ({sx},{sy})→({gx},{gy}) expanded={len(gs)} max={max_expand} dist_s={self.dist[sy,sx]:.1f} dist_g={self.dist[gy,gx]:.1f}")
+        for _dy in range(3, -4, -1):
+            _row = ""
+            for _dx in range(-4, 5):
+                _wx, _wy = gx+_dx, gy+_dy
+                if not (0 <= _wx < self.S and 0 <= _wy < self.S):
+                    _row += "?"
+                elif self.wall(_wx, _wy):
+                    _row += "W"
+                elif self.dist[_wy, _wx] < ROBOT_DIA:
+                    _row += "d"
+                else:
+                    _row += "."
+            print(f"    [HPA-DBG] 终点周围 y={gy+_dy}: [{_row}]")
         return None
 
     def plan(self, sx, sy, gx, gy, max_expand=30000, voronoi=True):
@@ -196,7 +211,9 @@ class HPAStar:
             return min(gs, key=lambda g: math.hypot(g[0]-px, g[1]-py))
         start_g = nearest_gate(scx, scy, sx, sy)
         goal_g = nearest_gate(gcx, gcy, gx, gy)
-        if start_g is None or goal_g is None: return None
+        if start_g is None or goal_g is None:
+            print(f"  [HPA-DBG] gate None: sc=({scx},{scy}) gc=({gcx},{gcy}) gates_s={len(self.gates.get((scx,scy),[]))} gates_g={len(self.gates.get((gcx,gcy),[]))}")
+            return None
         sid = self.gate_id[(scx, scy, start_g[0], start_g[1])]
         gid = self.gate_id[(gcx, gcy, goal_g[0], goal_g[1])]
         if sid == gid:
@@ -219,7 +236,9 @@ class HPAStar:
                     gs[nid] = ng
                     came[nid] = cid
                     heapq.heappush(open_set, (ng + 1.0, nid))
-        if found is None: return None
+        if found is None:
+            print(f"  [HPA-DBG] 粗层不连通: sid={sid} gid={gid} gates={len(self.gates)}")
+            return None
         # 细层：起→门1→门2→...→终
         full = []
         cur = (sx, sy)
@@ -229,11 +248,15 @@ class HPAStar:
             if not uniq or g != uniq[-1]: uniq.append(g)
         for g in uniq:
             seg = self._astar(cur[0], cur[1], g[0], g[1], max_expand, voronoi)
-            if seg is None: return None
+            if seg is None:
+                print(f"  [HPA-DBG] 细层A*失败: ({cur[0]},{cur[1]})→({g[0]},{g[1]}) dist_s={self.dist[cur[1],cur[0]]:.1f} dist_g={self.dist[g[1],g[0]]:.1f}")
+                return None
             full.extend(seg[:-1])
             cur = g
         seg = self._astar(cur[0], cur[1], gx, gy, max_expand, voronoi)
-        if seg is None: return None
+        if seg is None:
+            print(f"  [HPA-DBG] 细层A*失败: ({cur[0]},{cur[1]})→({gx},{gy}) dist_s={self.dist[cur[1],cur[0]]:.1f} dist_g={self.dist[gy,gx]:.1f}")
+            return None
         full.extend(seg)
         return full
 
