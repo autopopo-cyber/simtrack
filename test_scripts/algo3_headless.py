@@ -102,6 +102,8 @@ ap.add_argument("--obs-reseed", type=int, default=0, help="运行中障碍变化
 ap.add_argument("--no-obs", type=int, default=0, help="1=纯墙版（去掉所有障碍，只留 hfield 墙）")
 ap.add_argument("--lidar-rays", type=int, default=0, help="雷达射线数（0=用代码默认360）。真实狗~1万点/帧前半球")
 ap.add_argument("--lidar-tick", type=int, default=0, help="雷达扫描间隔步数（0=用代码默认10）。真实狗10Hz")
+ap.add_argument("--lidar-fov", type=float, default=180.0, help="雷达水平视场角(度)：180=前方半圆(相对狗yaw, 无特权), 360=全向(作弊)")
+ap.add_argument("--lidar-lines", type=int, default=1, help="雷达线数：1=单线水平扫描, 3/10=多俯仰角(2D取最近,冗余确认)")
 ap.add_argument("--trail-every", type=int, default=0, help="轨迹记录间隔（步，0=关）。存 scans/trail_*.npz")
 ap.add_argument("--random-start", type=int, default=0, help="1=从随机位置(避开墙/障碍)出发")
 ap.add_argument("--target", type=str, default="finish", help="目标: start|finish")
@@ -415,24 +417,33 @@ def is_obstacle_world(wx, wy, inflation=0.0):
 # 扫描 + 碰撞检测
 # ═══════════════════════════════════════════
 
-def scan(bx, by):
-    for a in np.linspace(0, 2*math.pi, LIDAR_RAYS):
-        cos_a, sin_a = math.cos(a), math.sin(a)
-        prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
-        for step_i in range(1, LIDAR_STEPS+1):
-            wx, wy = bx + cos_a*step_i*VOXEL, by + sin_a*step_i*VOXEL
-            vx, vy = int(wx/VOXEL), int(wy/VOXEL)
-            if is_obstacle_world(wx, wy):
-                gset(vx, vy, WALL)
-                # prev 格是墙前可通行格（机器人可能站上面），标 FREE 不标 WALL
-                if gget(prev_vx, prev_vy) == UNKNOWN:
-                    gset(prev_vx, prev_vy, FREE)
-                break
-            # 射线清除：穿过格强制 FREE（旧障碍被"照"掉）。
-            # gset 只写 live 层，static 的墙不受影响。
-            if gget(vx, vy) != FREE:
-                gset(vx, vy, FREE)
-            prev_vx, prev_vy = vx, vy
+def scan(bx, by, yaw_ang):
+    """前方 FOV 扇形扫描（相对狗 yaw）——无特权：只感知狗能看到的物理真实。
+    多线（--lidar-lines N）：不同俯仰角的线，2D 导航取最近（任一线命中=检测到，冗余确认）。
+    """
+    fov_rad = math.radians(args.lidar_fov)
+    n_lines = max(1, args.lidar_lines)
+    # 2D 简化：多线 = 同 FOV 的多条水平线（不同俯仰角扫不同高度，2D 判定等价；
+    # 真实多线雷达主要价值是 3D 感知/鲁棒性，导航 2D 下取最近点）
+    # 每条线独立扫描（n_lines 倍计算，默认 1 线不额外开销）
+    for _line in range(n_lines):
+        for a in np.linspace(yaw_ang - fov_rad/2, yaw_ang + fov_rad/2, LIDAR_RAYS):
+            cos_a, sin_a = math.cos(a), math.sin(a)
+            prev_vx, prev_vy = int(bx/VOXEL), int(by/VOXEL)
+            for step_i in range(1, LIDAR_STEPS+1):
+                wx, wy = bx + cos_a*step_i*VOXEL, by + sin_a*step_i*VOXEL
+                vx, vy = int(wx/VOXEL), int(wy/VOXEL)
+                if is_obstacle_world(wx, wy):
+                    gset(vx, vy, WALL)
+                    # prev 格是墙前可通行格（机器人可能站上面），标 FREE 不标 WALL
+                    if gget(prev_vx, prev_vy) == UNKNOWN:
+                        gset(prev_vx, prev_vy, FREE)
+                    break
+                # 射线清除：穿过格强制 FREE（旧障碍被"照"掉）。
+                # gset 只写 live 层，static 的墙不受影响。
+                if gget(vx, vy) != FREE:
+                    gset(vx, vy, FREE)
+                prev_vx, prev_vy = vx, vy
 
 # ── 墙边禁入区（主人指令 2026-08-08：墙边 10cm 禁止进入）──
 # ⚠️ 不许作弊：禁入区基于**雷达感知**的墙（grid WALL），不是真值地图 track_clean！
@@ -1177,7 +1188,7 @@ print(f"=== Firefly v3 headless start: seed={FIXED_SEED} max_steps={args.max_ste
 # 初始扫描
 for _ in range(INIT_SCAN_STEPS):
     bx, by = d.qpos[0], d.qpos[1]
-    if _ % LIDAR_TICK == 0: scan(bx, by)
+    if _ % LIDAR_TICK == 0: scan(bx, by, d.qpos[2])
     mujoco.mj_step(m, d)
 print(f"  [OK] FREE={_cnt[FREE]} WALL={_cnt[WALL]}", flush=True)
 
@@ -1206,7 +1217,7 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             save_state()
 
     if step % LIDAR_TICK == 0:
-        scan(bx, by)
+        scan(bx, by, d.qpos[2])
 
     # B阶段：运行中障碍变化（--obs-reseed 指定步数换新障碍 seed）
     if args.obs_reseed > 0 and step == args.obs_reseed:
