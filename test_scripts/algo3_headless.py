@@ -466,14 +466,13 @@ def blocked(wx, wy, inflation=0.0):
     # 越界保护：赛道外直接视为 blocked（防穿墙跑出地图）
     if not (0.0 <= wx <= 50.0 and 0.0 <= wy <= 50.0):
         return True
-    # 墙边禁入区（感知版）：雷达扫到的墙边 0.2m 禁入——狗永不贴墙，视觉上始终在路中间
+    # 墙边禁入区（感知版）：雷达扫到的墙边禁入——狗永不贴墙，视觉上始终在路中间
     if in_keepout(int(wx/VOXEL), int(wy/VOXEL)):
         return True
-    # 感知墙判定：grid/static WALL（雷达扫到的墙），不是真值 sample_hf（不许作弊）
-    if gget_plan(int(wx/VOXEL), int(wy/VOXEL)) == WALL:
-        return True
-    # 障碍圆判定：狗中心距障碍 < 0.7m（物理边界）→ blocked
-    return is_obstacle_world(wx, wy, inflation)
+    # 仅感知：grid/static WALL（雷达扫到的墙+障碍）。
+    # ⚠️ 不用 is_obstacle_world（真值墙+真值障碍）——不许作弊：
+    #   狗只知道雷达前方 180° 扫到的物理真实，墙后/死角/未扫描区域 = 不知道
+    return gget_plan(int(wx/VOXEL), int(wy/VOXEL)) == WALL
 
 # ── 三级跳A* ──
 
