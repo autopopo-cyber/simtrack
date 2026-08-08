@@ -381,14 +381,35 @@ else:
     obs_world = gen_obstacles(FIXED_SEED)
 OBS_R = 0.5; OBS_CLEAR = OBS_R + SAFE_R
 
+# 障碍格预计算（性能：is_obstacle_world 从 20 次 hypot 循环 → set 查 O(1)）
+# profile 显示 scan 占 99.5% 时间，其中 is_obstacle_world 663 万次 × 20 障碍 hypot = 1.15 亿次
+OBS_CELLS = set()
+OBS_CELLS_VALID = False
+
+def rebuild_obs_cells():
+    """预计算固定障碍 0.7m 范围内的所有格（set 查表）"""
+    global OBS_CELLS, OBS_CELLS_VALID
+    OBS_CELLS = set()
+    r_grid = int(math.ceil(OBS_CLEAR / VOXEL)) + 1
+    for ox, oy in obs_world:
+        cx, cy = int(round(ox/VOXEL)), int(round(oy/VOXEL))
+        for dy in range(-r_grid, r_grid+1):
+            for dx in range(-r_grid, r_grid+1):
+                if dx*dx + dy*dy <= r_grid*r_grid:
+                    OBS_CELLS.add((cx+dx, cy+dy))
+    OBS_CELLS_VALID = True
+
 def is_obstacle_world(wx, wy, inflation=0.0):
     if sample_hf(wx, wy) != ROAD_PIX: return True
-    # 物理碰撞边界固定 0.7m（障碍半径0.5+狗半径0.2）——动态安全距离不由这里实现，
-    # 由 v_brake 制动约束自动实现：接近障碍 → d_clear 短 → 限速 → 低速挤过窄缝（主人指令 08-07）
-    # inflation：DWA 判定用膨胀半径（补偿障碍 1m/s 移动，见 DWA blocked_fn）
-    for ox, oy in obs_world:
-        if math.hypot(wx-ox, wy-oy) < OBS_CLEAR + inflation: return True
-    return False
+    # 移动障碍（巡逻/随机）：数量少（≤4）直接循环
+    if random_field is not None or patrol_paths:
+        for ox, oy in obs_world:
+            if math.hypot(wx-ox, wy-oy) < OBS_CLEAR + inflation: return True
+        return False
+    # 固定障碍：预计算格查表 O(1)
+    if not OBS_CELLS_VALID:
+        rebuild_obs_cells()
+    return (int(wx/VOXEL), int(wy/VOXEL)) in OBS_CELLS
 
 # ═══════════════════════════════════════════
 # 扫描 + 碰撞检测
@@ -1191,6 +1212,7 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if args.obs_reseed > 0 and step == args.obs_reseed:
         old_obs = list(obs_world)
         obs_world = gen_obstacles(FIXED_SEED + 777)  # 新障碍位置（顶层代码直接赋值，全局生效）
+        OBS_CELLS_VALID = False   # 障碍变了 → 重建格查表（懒加载）
         print(f"  [OBS] step={step} 障碍变化: {len(old_obs)}→{len(obs_world)} 个", flush=True)
         # 强制重规划（当前路径可能穿过新障碍）
         path = None; path_idx = 0; wander = 0; last_dist = 999
