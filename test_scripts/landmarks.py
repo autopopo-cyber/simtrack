@@ -28,7 +28,10 @@ LM_DIR = os.path.join(PROJ, "assets/landmarks")
 ARUCO_DICT = "DICT_7X7_1000"
 
 # hfield 表面高度（通道 128 灰度）：关键世界修正
-HF_SURF = 4.008
+# 2026-08-07 修正：旧值 4.008 是按未归一化 128/255 假设算的错值（整套 z 悬空 2m）。
+# 实测 track_500.png（渲染图，抗锯齿 121-199）归一化后路像素 0.0897 →
+# 表面 = zoffset 2.0 + zscale 4.0 * 0.0897 = 2.36m。（碰撞图 track_clean.png 路 2.0m 不变）
+HF_SURF = 2.36
 
 # 标牌几何：2m×2m plane（size 是半尺寸 1.0），中心离地 1m = 相机高度
 LM_HALF = 1.0

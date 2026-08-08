@@ -17,7 +17,7 @@ import mujoco
 
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml
+from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml, HF_SURF
 from simtrack.obstacles_random import RandomObstacleField
 from simtrack.algorithms.dwa import DWAAlgorithm
 
@@ -677,11 +677,12 @@ def astar_to(fvx, fvy, tfx, tfy):
 # ═══════════════════════════════════════════
 
 def build_xml():
+    # 障碍红色圆柱贴路面（中心 z = HF_SURF+半高1.0；旧硬编码 2.0 埋地里）
     OBS_XML = "".join(
-        f'<body name="obs{i}" pos="{x:.1f} {y:.1f} 2.0">'
+        f'<body name="obs{i}" pos="{x:.1f} {y:.1f} {HF_SURF + 1.0:.2f}">'
         f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
-    FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} 2"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
+    FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} {HF_SURF + 1.5:.2f}"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
     # 地标标牌（贴墙方案，--landmarks 1 启用；导航测试默认关避免干扰）
     if args.landmarks:
         LM_ASSETS, LM_WORLD = landmark_xml()
@@ -696,12 +697,15 @@ def build_xml():
   <compiler angle="radian"/><option timestep="0.005"/>
   <visual><global offwidth="1280" offheight="720"/></visual>
   <asset><hfield name="track" size="25.0 25.0 4.0 2.0" file="{RENDER_MAP}"/>
+    <material name="dog_mat" rgba="1 0.9 0.1 1" emission="1"/>
     {LM_ASSETS}
   </asset>
   <worldbody>
-    <light pos="25 25 80" dir="0 0 -1"/>
+    <light pos="25 25 80" dir="0 0 -1" ambient="0.5 0.5 0.55" diffuse="0.9 0.9 0.95"/>
+    <light pos="0 25 30" dir="0.3 0 -0.8" diffuse="0.3 0.3 0.35"/>
+    <light pos="50 25 30" dir="-0.3 0 -0.8" diffuse="0.3 0.3 0.35"/>
     {FINISH_XML}{OBS_XML}
-    <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.25 0.30 0.35 1.0" friction="0 0 0" contype="0" conaffinity="0"/>
+    <geom type="hfield" hfield="track" pos="25 25 0.0" rgba="0.55 0.6 0.65 1.0" friction="0 0 0" contype="0" conaffinity="0"/>
     {WALL_XML}
     {LM_WORLD}
     <!-- 方案A：边界几何纯可视化（contype=0），防穿墙靠算法走廊检查 -->
@@ -713,8 +717,9 @@ def build_xml():
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
-      <!-- 机器狗：水平圆柱（长轴沿 yaw 方向），0.8m 长 × 0.4m 径，contype=0 纯算法控制 -->
-      <geom type="capsule" fromto="0 -0.4 0 0 0.4 0" size="0.2" rgba="1 0.3 0 1" friction="0 0 0" contype="0" conaffinity="0"/>
+      <!-- 机器狗：水平胶囊（长轴沿局部 x = 前进方向 yaw），0.8m 长 × 0.4m 径，contype=0 纯算法控制 -->
+      <!-- 亮黄 emissive：俯视视频清晰可见（emission=1 自发光不受光照影响） -->
+      <geom type="capsule" fromto="-0.4 0 0 0.4 0 0" size="0.2" material="dog_mat" friction="0 0 0" contype="0" conaffinity="0"/>
       {CAM_XML}
     </body>
   </worldbody>
@@ -1030,16 +1035,28 @@ except Exception as e:
     RENDER_OK = False
     print(f"  [RENDER] 离屏渲染不可用: {e}", flush=True)
 
+# 俯视相机（--cam-elevation 控制俯角；MuJoCo elevation 负值=俯视，-60 = 上方60°）
+_cam = None
+CAM_ELEVATION = -60.0
+
 def render_frame(step):
-    """离屏渲染当前帧保存 PNG"""
+    """离屏渲染当前帧保存 PNG（俯视 60° 跟随狗）"""
     if renderer is None:
         return
+    global _cam
     try:
-        renderer.update_scene(d, camera=-1)
+        if _cam is None:
+            _cam = mujoco.MjvCamera()
+            _cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            _cam.azimuth = 0.0
+            _cam.distance = 22.0
+        _cam.elevation = CAM_ELEVATION
+        _cam.lookat[:] = np.array([d.qpos[0], d.qpos[1], 1.0], dtype=np.float64)
+        renderer.update_scene(d, _cam)
         img = renderer.render()
         Image.fromarray(img).save(os.path.join(args.out_dir, f"frame_{step:06d}.png"))
     except Exception as e:
-        pass  # 渲染失败不阻塞主循环
+        print(f"  [RENDER-ERR] {e}", flush=True)  # 不静默吞渲染失败
 
 mv = Mover(m, d)
 if args.obs_random > 0:
