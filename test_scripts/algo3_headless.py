@@ -95,7 +95,7 @@ ap.add_argument("--timeout", type=float, default=900, help="墙钟超时（秒�
 ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（默认 auto）")
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
 ap.add_argument("--load-map", type=str, default="", help="加载旧地图为 static_grid (npz)")
-ap.add_argument("--known-raw", type=int, default=1, help="KNOWN_MAP 用原始 track_clean 地图（sample_hf 判定，与物理一致）")
+ap.add_argument("--known-raw", type=int, default=0, help="⚠️测试作弊: KNOWN_MAP 直接读 track_clean 真值(非感知, 仅调试用, 真实流程用 save_map/load_map)")
 ap.add_argument("--vision", type=int, default=1, help="视觉识别（hfield降分辨率后223ms/帧，默认开）")
 ap.add_argument("--landmarks", type=int, default=1, help="标牌几何（contype=0零物理开销，默认开）")
 ap.add_argument("--obs-reseed", type=int, default=0, help="运行中障碍变化步数：到该步换新障碍 seed（B阶段）")
@@ -997,24 +997,20 @@ def load_state():
     return loaded, str(data["mode"])
 
 def save_map(path):
-    """保存地图到文件（阶段1→阶段2 传递）。
-    只保存**结构墙**（hfield 墙）——障碍是变化的，不存（live 层射线清除会重新发现）。
-    用 sample_hf 判断结构墙：hfield 非路 = 永久墙。
+    """保存地图到文件（感知版，不许作弊）。
+    只存 grid 雷达扫到的值（WALL/FREE）——不用 sample_hf 真值判结构墙。
+    障碍残影：障碍格也会存为 WALL，KNOWN_MAP 阶段 scan 射线清除 live 层修正（感知建图的真实代价）。
     """
     if not grid: return
     xs = sorted(set(k[0] for k in grid)); ys = sorted(set(k[1] for k in grid))
     minx, maxx = xs[0], xs[-1]; miny, maxy = ys[0], ys[-1]
     arr = np.full((maxy-miny+1, maxx-minx+1), UNKNOWN, dtype=np.int8)
     for (vx, vy), val in grid.items():
-        wx, wy = (vx+0.5)*VOXEL, (vy+0.5)*VOXEL
-        if sample_hf(wx, wy) != ROAD_PIX:
-            arr[vy-miny, vx-minx] = WALL   # 结构墙
-        elif val == FREE:
-            arr[vy-miny, vx-minx] = FREE    # 已知路
-        # 障碍 (WALL 但 hfield 是路) 不存 —— 变化的东西
+        if val != UNKNOWN:
+            arr[vy-miny, vx-minx] = val   # 感知值（WALL/FREE），非真值
     np.savez(path, grid=arr, offset=(minx, miny), seed=FIXED_SEED)
     n_wall = int((arr == WALL).sum()); n_free = int((arr == FREE).sum())
-    print(f"  [MAP] saved {n_free} FREE + {n_wall} WALL(结构墙) → {path}", flush=True)
+    print(f"  [MAP] saved {n_free} FREE + {n_wall} WALL(感知) → {path}", flush=True)
 
 def load_map(path):
     """加载旧地图为 static_grid，开启 KNOWN_MAP_MODE（阶段2）"""
