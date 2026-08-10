@@ -5,12 +5,15 @@ from simtrack.obstacles_random import RandomObstacle, RandomObstacleField
 
 
 def test_initial_position():
-    """初始位置 = 段中央"""
+    """初始位置 = 段内随机（2026-08-10 主人观察：全在 x=25 段中央一列齐排太假），种子可复现"""
     field = RandomObstacleField(channels=[1], seed=42)
     obs = field.obstacles[0]
     assert obs.ch == 1
-    assert abs(obs.pos[0] - 25.0) < 1e-6      # x 段中央
-    assert abs(obs.pos[1] - (2.5 + 1*5.0)) < 1e-6  # y 通道中心
+    assert obs.wall_x0 + 0.5 - 1e-9 <= obs.pos[0] <= obs.wall_x1 - 0.5 + 1e-9   # x 段内（含余量）
+    assert obs.y_lo + 1.0 - 1e-9 <= obs.pos[1] <= obs.y_hi - 1.0 + 1e-9        # y 通道内（含余量）
+    # 同种子同位置（可复现）
+    obs2 = RandomObstacleField(channels=[1], seed=42).obstacles[0]
+    assert obs.pos == obs2.pos and obs.dir == obs2.dir
 
 
 def test_seed_reproducibility():
