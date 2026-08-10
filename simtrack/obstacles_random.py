@@ -69,11 +69,14 @@ class RandomObstacle:
 
 
 class RandomObstacleField:
-    """管理多个反弹区段（每段 1 个随机障碍）。"""
+    """管理多个反弹区段（每段 1 个随机障碍）。
 
-    def __init__(self, channels=(1, 4, 6, 8), seed=None):
+    x0/x1：每段的 x 向活动范围（虚拟墙）。2026-08-09 混合场：直道障碍 x∈[4.5,45]
+    （不超出本通道直道段，不进转弯开口）。"""
+
+    def __init__(self, channels=(1, 4, 6, 8), seed=None, x0=15.0, x1=35.0):
         self._rng = random.Random(seed)
-        self.obstacles = [RandomObstacle(ch, rng=self._rng) for ch in channels]
+        self.obstacles = [RandomObstacle(ch, x0=x0, x1=x1, rng=self._rng) for ch in channels]
 
     def update(self, dt):
         for obs in self.obstacles:

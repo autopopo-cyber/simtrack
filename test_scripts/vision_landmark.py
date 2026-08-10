@@ -32,12 +32,27 @@ def _load_landmarks():
         return None
 
 class VisionLandmark:
-    def __init__(self, m, d, renderer, cam_name="bot_cam", detect_every=40):
+    def __init__(self, m, d, renderer, cam_name="bot_cam", detect_every=40, aruco=True, aruco_every=3):
         self.m, self.d, self.renderer = m, d, renderer
         self.cam_name = cam_name
         self.detect_every = detect_every
+        self.aruco = aruco   # 场景里没放标牌时关掉 ArUco 金字塔（省 CPU），终点球检测不受影响
+        # 2026-08-09 性能：ArUco 每 aruco_every 帧才跑一次（终点球检测仍每帧）。
+        # profile：金字塔全尺度 detectMarkers 是视觉最大头（450 次/4000 步=11s）。
+        # 40×3=120 步=0.6s 物理一检，通道识别/里程计修正灵敏度足够
+        self.aruco_every = max(1, aruco_every)
+        self._frame_no = 0
         self.step_count = 0
         self.LM = _load_landmarks()
+        # 终点发现（无特权）：每帧检测绿色终点球 → (bearing, dist, step)
+        self.finish_obs = None
+        # 标牌几何观测：[(step, idx, dist, bearing)]——里程计绝对修正用
+        self.geo_obs = []
+        try:
+            from test_scripts.finish_detect import detect_finish
+            self._detect_finish = detect_finish
+        except Exception:
+            self._detect_finish = None
         # ArUco 检测器（DICT_7X7_1000）
         if CV2_OK and self.LM is not None:
             dict_name = getattr(self.LM, "ARUCO_DICT", "DICT_7X7_1000")
@@ -47,9 +62,11 @@ class VisionLandmark:
         else:
             self.detector = None
         # 图像金字塔尺度（主人指令：多尺度避免只拍局部）
-        # 码太小（远处）→ 放大 (2x,3x)；码太大（近处，占满视野）→ 缩小 (0.25x,0.5x)
+        # 码太小（远处）→ 放大 (2x)；码太大（近处，占满视野）→ 缩小 (0.5x)
         # 实测：狗 2m 看 1.5m 标牌时 scale=0.5 识别成功（原图码太大检测器失败）
-        self.pyramid_scales = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0]  # 远小码→近大码
+        # 2026-08-09 性能：6 尺度→3 尺度。2m 宽标牌在 1280×720 下 25m 处仍有 ~70px 边长，
+        # 1.0 尺度即可检；3x 放大到 4K 的 detectMarkers 是单帧最大开销（~60ms），实际无增益
+        self.pyramid_scales = [0.5, 1.0, 2.0]
         # 统计
         self.total_detected = 0
         self.seen_ids = set()
@@ -69,6 +86,8 @@ class VisionLandmark:
         self.step_count += 1
         if self.step_count % self.detect_every != 0:
             return []
+        self._frame_no += 1
+        _run_aruco = self.aruco and (self._frame_no % self.aruco_every == 0)
         try:
             yaw_bob, pitch_bob = self._apply_bob(step)
             orig_mat = self.m.cam_mat0[0].copy()
@@ -86,7 +105,20 @@ class VisionLandmark:
             self.m.cam_mat0[0] = orig_mat
         except Exception:
             return []
-        if not CV2_OK:
+        # 终点发现：绿色终点球（无特权，狗亲眼看到才知终点在哪）→ (bearing, dist, area, step)
+        if self._detect_finish is not None:
+            try:
+                fov = float(self.m.cam_fovy[0]) if hasattr(self.m, "cam_fovy") else 45.0
+                obs = self._detect_finish(img, fovy_deg=fov)
+                if obs is not None:
+                    # 面积归一化到 720p 等效（algo3 到达阈值 12000/25000 是 720p 标定）：
+                    # 640×360 渲染下像素面积是 720p 的 1/4，不归一则到达判定偏远 ~2 倍
+                    _h = img.shape[0]
+                    _area720 = obs[2] * (720.0 / _h) ** 2
+                    self.finish_obs = (obs[0], obs[1], _area720, obs[3], step)
+            except Exception:
+                pass
+        if not CV2_OK or self.detector is None or not _run_aruco:
             return []
         return self._detect_pyramid(img, step)
 
@@ -134,6 +166,20 @@ class VisionLandmark:
                 step_ids.add(idx)
                 ch, slot = self._idx_ch_slot(idx)
                 self.total_detected += 1
+                # 标牌几何（里程计修正用）：角点换回原始分辨率 → 边长 px → 距离，中心 x → 方位
+                # 标牌真实尺寸 2m×2m（landmarks.LM_HALF=1.0 半尺寸）
+                try:
+                    import math as _m
+                    pts = corners[i].reshape(-1, 2) / scale   # 原始图像素坐标
+                    side_px = float(np.mean([np.hypot(pts[(j+1) % 4][0]-pts[j][0],
+                                                      pts[(j+1) % 4][1]-pts[j][1]) for j in range(4)]))
+                    h0, w0 = img.shape[:2]
+                    _fy = (h0 / 2.0) / _m.tan(_m.radians(float(self.m.cam_fovy[0])) / 2.0)
+                    _dist = 2.0 * _fy / max(side_px, 1.0)
+                    _bearing = _m.atan((float(pts[:, 0].mean()) - w0 / 2.0) / _fy)
+                    self.geo_obs.append((step, idx, _dist, _bearing))
+                except Exception:
+                    pass
                 self.seen_ids.add(idx)
                 self.detections.append((step, idx, ch, slot))
                 results.append((step, idx, ch, slot, scale))

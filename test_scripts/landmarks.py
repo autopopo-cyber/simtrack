@@ -46,28 +46,33 @@ WALL_X_OFF = 0.3
 
 def landmark_positions():
     """返回 10 个标牌的 (idx, ch, side, wx, wy, wz, quat)。
-    每通道 1 个标牌，立在**通道中心线**（狗正前方，2m 大码最清晰），
-    贴终点端墙头 x 位置（转弯口前 4m，狗走到尽头转弯前看到）。
-    关键：标牌中心必须在通道中心（y=2.5+ch*5），不能贴分界墙边缘——
-    否则 2m 标牌会嵌进分界墙 box（墙 y=5±0.175），码只显示一半识别失败。
+    2026-08-09 贴墙版（主人指令）：标牌贴**端头边界墙**（x≈0/50），法线沿通道，
+    狗从通道另一端 40m 外正对可见；不再立在路中间（旧版 x=45.8/4.2 悬在通道中心，
+    虽然 contype=0 不挡路，但碍眼且 ch9 背景板曾挡终点球视线）。
+    配合方角弯道地图（scripts/gen_square_maze.py）：转弯区无斜墙遮挡，
+    贴墙标牌全程视线通畅。y 保持通道中心线（2m 码不能贴 y 向分界墙——会嵌墙只显示一半）。
     """
     out = []
     for ch in range(10):
         y_center = 2.5 + ch * 5.0    # 通道中心线
-        if ch % 2 == 0:
-            # 偶通道（朝 +x）：终点 x=50，标牌在 x=45.8，法线 -x
-            out.append((ch, ch, 1, 45.8, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+        if ch == 9:
+            # 特例：ch9 终点球 (2.5,47.5) 与左墙标牌共线——球 R=1.5 在任何距离都完全
+            # 遮挡 2m 标牌（球更近，角直径恒大）→ 左墙标牌永远看不到。
+            # 改贴右墙 x=49.85（法线 -x）：狗在 ch8 直行 (+x) 时标牌在前方偏左
+            # 18-30° 可见（水平半 FOV 36°），ch8 全程 15-30m 距离稳定识别。
+            out.append((ch, ch, 1, 49.85, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+        elif ch % 2 == 0:
+            # 偶通道（朝 +x）：终点 x=50，标牌贴右端墙 x=49.85，法线 -x
+            out.append((ch, ch, 1, 49.85, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
         else:
-            # 奇通道（朝 -x）：终点 x=0，标牌在 x=4.2，法线 +x
-            out.append((ch, ch, 0, 4.2, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
+            # 奇通道（朝 -x）：终点 x=0，标牌贴左端墙 x=0.15，法线 +x
+            out.append((ch, ch, 0, 0.15, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
     return out
 
 def wall_xml():
-    """分界墙 box（contype=0 纯可视化），必须**留出 U 型转弯口**！
-    迷宫结构（track_clean.png 实测）：蛇形通道，分界墙在 y=5k（k=1..9）。
-    转弯口交替开口：
-      - y=5,15,25,35,45（k 奇数）：x=50 端开口（通道 0→1, 2→3... 在 x=50 转弯）
-      - y=10,20,30,40（k 偶数）：x=0 端开口（通道 1→2, 3→4... 在 x=0 转弯）
+    """分界墙 box（contype=0 纯可视化），与方角地图（scripts/gen_square_maze.py）一致：
+    分隔墙 y=5k（k=1..9）：k 奇数右端开口（墙 x∈[0,45]，x=50 转弯）；
+    k 偶数左端开口（墙 x∈[5,50]，x=0 转弯）。转弯区方角 `[ ---` 形，无斜墙。
     边界 y=0 / y=50：全封闭。
     教训：之前侧墙 x∈[0,50] 全程 + 横墙 x=0.25/49.75 堵死了所有 U 型弯（主人指出）。
     """
@@ -79,21 +84,22 @@ def wall_xml():
             walls.append(f'<geom type="box" size="25.0 0.175 2.0" pos="25 {y} {HF_SURF+1.0}" '
                          f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
         elif k % 2 == 1:
-            # 奇数分界：x=50 端开口（转弯口），墙只到 x=45.5
-            cx = 22.75   # (0 + 45.5)/2
-            walls.append(f'<geom type="box" size="22.75 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
+            # 奇数分界：x=50 端开口（转弯口），墙 x∈[0,45]
+            cx = 22.5   # (0 + 45)/2
+            walls.append(f'<geom type="box" size="22.5 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
                          f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
         else:
-            # 偶数分界：x=0 端开口（转弯口），墙从 x=4.5 开始
-            cx = 27.25   # (4.5 + 50)/2
-            walls.append(f'<geom type="box" size="22.75 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
+            # 偶数分界：x=0 端开口（转弯口），墙 x∈[5,50]
+            cx = 27.5   # (5 + 50)/2
+            walls.append(f'<geom type="box" size="22.5 0.175 2.0" pos="{cx} {y} {HF_SURF+1.0}" '
                          f'rgba="0.5 0.5 0.55 1" contype="0" conaffinity="0"/>')
     return "\n".join(walls)
 
 def landmark_xml():
     """生成标牌 XML：立放 plane + emissive 纹理 + **背景板**。
-    背景板：标牌在转弯口开口区（无闭合墙背景），ArUco 边界分离失败；
-    在码后面 0.6m 加深色 box（2.6m 比标牌大 0.3m/边）提供均匀背景——实测必须。
+    背景板：深色 box 提供均匀背景（ArUco 边界分离必须）。
+    2026-08-09 贴墙版：标牌贴端头边界墙（x≈0/50），背景板改薄（0.06m）贴标牌身后
+    与墙面齐平——旧版在路中间凸出 0.6m，贴墙后不再凸进通道。
     """
     assets = []
     world = []
@@ -104,15 +110,15 @@ def landmark_xml():
         assets.append(f'<texture name="{tex_name}" type="2d" file="{LM_DIR}/aruco_{idx:02d}.png"/>')
         assets.append(f'<material name="{mat_name}" texture="{tex_name}" texrepeat="1 1" '
                       f'emission="1.0" specular="0"/>')
-        # 背景板：标牌后面 0.6m（法线 -x 的标牌背景在 +x；法线 +x 的背景在 -x）
-        bg_dir = 0.6 if side == 1 else -0.6
+        # 背景板：标牌后面 0.04m、厚 0.06m（法线 -x 的标牌背景在 +x；法线 +x 的背景在 -x）
+        bg_dir = 0.04 if side == 1 else -0.04
         world.append(
             f'<geom name="lm{idx}" type="plane" size="{LM_HALF} {LM_HALF} 0.01" '
             f'pos="{wx:.2f} {wy:.2f} {wz:.2f}" quat="{quat}" '
             f'material="{mat_name}" contype="0" conaffinity="0"/>'
         )
         world.append(
-            f'<geom name="{bg_name}" type="box" size="0.3 {LM_HALF+0.3} {LM_HALF+0.3}" '
+            f'<geom name="{bg_name}" type="box" size="0.03 {LM_HALF+0.3} {LM_HALF+0.3}" '
             f'pos="{wx+bg_dir:.2f} {wy:.2f} {wz:.2f}" rgba="0.15 0.15 0.18 1" '
             f'contype="0" conaffinity="0"/>'
         )
