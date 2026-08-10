@@ -1063,6 +1063,9 @@ def pick_gate(gates, mode="score", stuck=False, robot=(0, 0), fin=None, heading=
                 # 朝向保持：沿当前航向的门优先（走廊直行，减少横跳）
                 adv = ((wx-bx)*hx + (wy-by)*hy) / max(d, 0.01)
                 advance = max(0.0, min(1.0, adv))
+            # （2026-08-10 实测回退：曾加 0.18 净空权重想让狗优先宽门避开边界缝探测——
+            # 结果门选择系统性变差：seed7 28% 覆盖卡死未到达、seed23 碰撞 238。
+            # 边界缝探测成本（每弯 1-2 次 ~10s）接受，记录于 square-maze 文档第九节）
             score = 0.55 * advance + 0.25 * (1.0/d) + 0.20 * (size / 50.0)
             if score > best_score:
                 best_score = score; best = g
@@ -2119,6 +2122,9 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                             _gate_stall = 0
                         _last_gate_key = gkey; _last_gate_dist = gd
                         if _gate_stall > 8:
+                            # 阈值 8（曾试 3 实测回退）：3 时移动障碍临时挡路也被误判"假门"
+                            # → 好门被拉黑 → 狗乱闯遭遇战（碰撞 195/14）。探测成本主要靠
+                            # pick_gate 净空加权前置避免（宽门优先），stall 只做兜底。
                             bad_add_counted(_gate_cluster_cells.get(gkey, [gkey]), gkey)
                             _gate_stall = 0
                             print(f"  [GATE-STALL] gate=({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) 无进展 → 门格集合黑名单(计数)", flush=True)
