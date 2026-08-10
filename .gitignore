@@ -5,3 +5,6 @@ dist/
 .pytest_cache/
 *.log
 /tmp/
+scans/
+*.npz
+.venv/
