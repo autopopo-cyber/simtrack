@@ -12,6 +12,7 @@
 
 import sys, os, math, time, random, heapq, json, argparse
 import numpy as np
+import cv2
 from PIL import Image
 import mujoco
 
@@ -44,6 +45,14 @@ LIDAR_RANGE = 30.0  # 15→30m（主人指令 2026-08-06）：真实狗雷达10�
 VOXEL = 0.1
 ROBOT_R = max(1, int(SAFE_R / VOXEL))
 CLEARANCE = ROBOT_R
+# ── 门宽度判断（主人 2026-08-10 指令）：窄缝/栅栏陷阱识别 ──
+# 现实有大量"能透过激光但狗过不去"的窄缝。识别手段=规划层净空场 PASS（ROS costmap
+# inflation 思想）：地图本身保持精确边缘（KEEP_M=0.05 不动），通行性判断放规划层。
+# PASS_CLEAR=0.6m = 狗半径 0.2 + 执行余量 0.4，对齐 HPA 细层 ROBOT_DIA=6 既有标准
+# （已知地图模式 bounce 0 实测验证）——通行宽 <2×0.6=1.2m 的缝不存在可规划中线 →
+# 对规划自动封闭（不是门也不是路径），狗不会被引进 STOP/bounce 陷阱。
+PASS_CLEAR_M = 0.6
+PASS_CLEAR = PASS_CLEAR_M / VOXEL   # 格（EDT 精确欧氏距离，浮点比较）
 MILESTONE_STEP = int(3.0 / VOXEL)
 LIDAR_STEPS = int(LIDAR_RANGE / VOXEL)
 LIDAR_RAYS = 360  # 120→360（1°间隔）：15m处射线间距0.26m，覆盖0.1m薄斜墙（120时0.78m漏扫）
@@ -116,7 +125,12 @@ ap.add_argument("--obs-random-ch", type=str, default="1,4,6,8", help="反弹区�
 ap.add_argument("--obs-mix", type=int, default=0, help="混合场：每拐弯处1个固定障碍(9个U型弯)+每直道1个随机反弹障碍(1m/s, x∈[4.5,45]不出本通道)")
 ap.add_argument("--odom", type=int, default=0, help="1=里程计模式：决策/建图只用带噪里程计位姿（不用 d.qpos 真值），二维码标牌做绝对修正")
 ap.add_argument("--odom-noise", type=float, default=0.02, help="里程计线速度比例噪声（0.02=2%）")
+ap.add_argument("--pass-clear", type=float, default=-1, help="规划净空(m)：通行宽<2×此值的窄缝封闭（默认用 PASS_CLEAR_M=0.6；0=关闭门宽度判断，回退旧行为做 A/B）")
 args = ap.parse_args()
+
+if args.pass_clear >= 0:
+    PASS_CLEAR_M = args.pass_clear
+    PASS_CLEAR = PASS_CLEAR_M / VOXEL
 
 if args.seed is not None:
     FIXED_SEED = args.seed
@@ -211,6 +225,23 @@ def _pg_ensure():
 
 def _pg_touch():
     _pg_dirty[0] = True
+    _dist_dirty[0] = True
+
+# ── 净空场（门宽度判断的数据核心）──
+# DIST：各格到最近感知墙的精确欧氏距离（格，cv2 EDT，500×500 ~2ms）；
+# PASS：规划可通行布尔场 = 非墙 且 净空≥PASS_CLEAR。WALL 格 DIST=0 天然排除。
+# PG 任何变更经 _pg_touch 置脏；规划器首次使用时重建（不是每次 scan 都算——规划才付账）。
+DIST = np.zeros((GRID_N, GRID_N), dtype=np.float32)
+PASS = np.zeros((GRID_N, GRID_N), dtype=bool)
+_dist_dirty = [True]
+_NARROW_REJ = [0]   # 窄缝门拒绝计数（能透过激光但 <2×PASS_CLEAR 过不去的前沿门——诊断用）
+
+def _dist_ensure():
+    if not _dist_dirty[0]: return
+    _pg_ensure()
+    DIST[:] = cv2.distanceTransform((PG != WALL).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    PASS[:] = DIST >= PASS_CLEAR
+    _dist_dirty[0] = False
 
 def _count(val):
     """live 层某值格数（原 _cnt 计数器，数组化后按需 count_nonzero，500×500 ~0.2ms）"""
@@ -686,7 +717,7 @@ JUMP_1M = 20   # 10→20：空旷区 1m→2m 一跳（离墙≥2m 时）
 JUMP_03 = 6    # 3→6：离墙≥0.6m 时
 JUMP_NEAR = 1  # 贴墙保持 0.1m
 
-def jump_steps(vx, vy, dx, dy):
+def jump_steps(vx, vy, dx, dy, tfx=None, tfy=None):
     wd = wall_dist(vx, vy)
     if wd >= JUMP_1M:   max_jump = JUMP_1M
     elif wd >= JUMP_03: max_jump = JUMP_03
@@ -696,8 +727,14 @@ def jump_steps(vx, vy, dx, dy):
         # 地图边界外视为不可通行（与 blocked() 一致）——否则 BFS 会探索地图外的虚空
         if not (0 <= nx < 500 and 0 <= ny < 500):
             return step - 1
-        if not traversable(nx, ny):
+        if not plan_clear(nx, ny):   # 门宽度判断：低净空格（窄缝内部）不可规划穿越
             return step - 1
+        # 目标对齐吸附（2026-08-10 修跳步粒度奇偶 bug）：开放区跳步恒取上限（2m），
+        # 目标格不在跳步格点上永远落不上去 → A* 扩满 25 万格返回 None → 终点直奔瘫痪
+        # （实测：看到球后 beeline 全失败，狗在门口风暴到超时）。走查跨过目标行/列时
+        # 收步落在目标坐标上——先落目标行/列，再沿行/列落到目标格，A* 可精确到达。
+        if tfx is not None and (nx == tfx or ny == tfy):
+            return step
     return max_jump
 
 _MAN5 = np.array([[abs(i-2)+abs(j-2) for j in range(5)] for i in range(5)], dtype=np.int8)
@@ -741,6 +778,24 @@ def traversable(vx, vy):
     """
     return gget_plan(vx, vy) != WALL
 
+def plan_clear(vx, vy):
+    """规划可通行（门宽度判断核心）：非墙 且 到最近感知墙净空 ≥PASS_CLEAR。
+    UNKNOWN 乐观——只对**已知**墙量净空，未知区域仍可规划穿越（探索语义不变）；
+    窄缝（宽 <2×PASS_CLEAR=1.2m）内没有任何格满足 → 对规划自动封闭。
+    PASS_CLEAR=0 时退化为 traversable（A/B 开关）。"""
+    if PASS_CLEAR <= 0:
+        return gget_plan(vx, vy) != WALL
+    if _dist_dirty[0]: _dist_ensure()
+    return 0 <= vx < GRID_N and 0 <= vy < GRID_N and PASS[vx, vy]
+
+def clear_ok(vx, vy):
+    """门格净空判定：PASS_CLEAR>0 用净空场（≥0.6m，含旧 wall_dist>ROBOT_R=0.2m 语义）；
+    =0 回退旧过滤（A/B 对照）。"""
+    if PASS_CLEAR <= 0:
+        return wall_dist(vx, vy) > ROBOT_R
+    if _dist_dirty[0]: _dist_ensure()
+    return 0 <= vx < GRID_N and 0 <= vy < GRID_N and PASS[vx, vy]
+
 def line_clear(vx1, vy1, vx2, vy2):
     steps = max(abs(vx2-vx1), abs(vy2-vy1))
     if steps == 0: return True
@@ -756,23 +811,40 @@ def line_clear(vx1, vy1, vx2, vy2):
 def _nearest_walkable(vx, vy, max_r=8, min_dist=0):
     """墙边脱困：从 (vx,vy) BFS 找最近的 walkable 格（机器人贴墙时跳不出 jump_steps）
     放宽到 traversable：机器人位置贴墙边但前方可能是未知区域，也能起步
-    min_dist>0：要求距感知墙 ≥min_dist 格（HPA 起点需要 dist≥ROBOT_DIA=4，否则细层 A* 邻居全禁行）"""
-    if traversable(vx, vy) and (min_dist == 0 or wall_dist(vx, vy) >= min_dist):
-        return vx, vy
-    seen = {(vx, vy)}
-    q = [(vx, vy, 0)]
-    while q:
-        cx, cy, dist = q.pop(0)
-        if dist >= max_r:
-            continue
-        for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
-            nx, ny = cx+dx, cy+dy
-            if (nx,ny) in seen:
+    min_dist>0：要求距感知墙 ≥min_dist 格（HPA 起点需要 dist≥ROBOT_DIA=4，否则细层 A* 邻居全禁行）
+    2026-08-10 门宽度判断：优先找满足规划净空（PASS）的格；找不到回退 traversable——
+    狗被瞬态障碍标记围进低净空区时保证永远能起步（旧行为兜底，防起步死锁）。
+    min_dist 判定改用 DIST 精确场（旧 wall_dist 5×5 窗口只能验证 ≤2 格，≥3 靠截断值 21 蒙混）。"""
+    def _ok(nx, ny, strict):
+        if strict:
+            if _dist_dirty[0]: _dist_ensure()
+            if not (0 <= nx < GRID_N and 0 <= ny < GRID_N) or not PASS[nx, ny]:
+                return False
+        elif not traversable(nx, ny):
+            return False
+        if min_dist == 0:
+            return True
+        if PASS_CLEAR > 0:
+            if _dist_dirty[0]: _dist_ensure()
+            return 0 <= nx < GRID_N and 0 <= ny < GRID_N and DIST[nx, ny] >= min_dist
+        return wall_dist(nx, ny) >= min_dist
+    for strict in ([True, False] if PASS_CLEAR > 0 else [False]):
+        if _ok(vx, vy, strict):
+            return vx, vy
+        seen = {(vx, vy)}
+        q = [(vx, vy, 0)]
+        while q:
+            cx, cy, dist = q.pop(0)
+            if dist >= max_r:
                 continue
-            seen.add((nx,ny))
-            if traversable(nx, ny) and (min_dist == 0 or wall_dist(nx, ny) >= min_dist):
-                return nx, ny
-            q.append((nx, ny, dist+1))
+            for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
+                nx, ny = cx+dx, cy+dy
+                if (nx,ny) in seen:
+                    continue
+                seen.add((nx,ny))
+                if _ok(nx, ny, strict):
+                    return nx, ny
+                q.append((nx, ny, dist+1))
     return None
 
 def _open_frontier(fx, fy):
@@ -795,6 +867,7 @@ def find_gates(fvx, fvy):
     # 起点放宽：机器人物理位置可能是 UNKNOWN（刚起步未扫描）或贴墙边，
     # 但已实际站在那，必须允许寻路，否则 find_gates 返回空 → 主循环死循环
     _pg_ensure()   # BFS 全程 PG 直读（2026-08-09 性能：原每格多次 gget_plan 函数调用）
+    if PASS_CLEAR > 0: _dist_ensure()   # BFS/门验收全程 PASS 直读（门宽度判断）
     if not (0 <= fvx < GRID_N and 0 <= fvy < GRID_N) or PG[fvx, fvy] == WALL:
         return [], {}
     start = _nearest_walkable(fvx, fvy)
@@ -820,12 +893,16 @@ def find_gates(fvx, fvy):
         if PG[cx, cy] == FREE:
             # 门=未知前沿（只认开阔前沿，墙缝/墙根未知不算——那是陷阱）。
             # 黑名单门（bounce 撞墙的）跳过
-            # wall_dist 过滤：>ROBOT_R(2格=0.2m) 才够狗站——0.1m 级窄缝（障碍圈↔边界的
-            # 0.5m 缝感知后只剩 0.2-0.3m）不是狗能过的门（实测缝门把狗吸进死角风暴；
-            # 2026-08-09 收窄到 >1 的 A/B 实验：bounce 93→1830 恶化 20 倍，余量是门质量的承重墙，回退）
+            # 门宽度判断（2026-08-10 主人指令）：clear_ok = 净空场 ≥PASS_CLEAR(0.6m)——
+            # 窄缝（障碍↔墙 <1.2m）里的前沿格没有足够净空 → 识别为"过不去的缝"拒绝计数，
+            # 不再是门（旧 wall_dist>ROBOT_R=0.2m 太弱：0.5m 级缝门把狗吸进 STOP/bounce 风暴）。
             # (cx,cy)!=(vx,vy)：起点自身格邻接未知不算门（否则 path=空 → bounce 死循环）
-            if (cx, cy) != (vx, vy) and wall_dist(cx, cy) > ROBOT_R and (cx, cy) not in bad_gates and (cx, cy) not in dead_gates and _open_frontier(cx, cy):
-                gates.append((cg, cx, cy))
+            if ((cx, cy) != (vx, vy) and (cx, cy) not in bad_gates and (cx, cy) not in dead_gates
+                    and _open_frontier(cx, cy)):
+                if clear_ok(cx, cy):
+                    gates.append((cg, cx, cy))
+                else:
+                    _NARROW_REJ[0] += 1   # 窄缝门：能透过激光看到，但太窄过不去——识别并拒绝
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             # 内联跳步走查：逐格前进，同时捕捉 FREE→UNKNOWN 过渡格——
             # 2m 大跳会飞越前沿格（中间格不进 visited，永远评不到门），
@@ -843,16 +920,22 @@ def find_gates(fvx, fvy):
                 v = PG[mx, my]
                 if v == WALL:
                     break
+                # 门宽度判断：低净空格（窄缝内部/贴墙根）不走——缝后的区域再宽也不经此缝规划
+                if PASS_CLEAR > 0 and not PASS[mx, my]:
+                    break
                 if v == UNKNOWN:
                     if prev_free is not None:
                         _fx, _fy, _fs = prev_free
                         if ((_fx, _fy) != (vx, vy) and (_fx, _fy) not in bad_gates and (_fx, _fy) not in dead_gates
-                                and wall_dist(_fx, _fy) > ROBOT_R and _open_frontier(_fx, _fy)):
-                            gates.append((cg + _fs, _fx, _fy))
-                            # 过渡格不在 visited/堆里，came_from 必须补录父节点——
-                            # 否则 fine_path 回溯断链，路径只剩 1 格直冲穿墙（实测卡死根因）
-                            if (_fx, _fy) not in came_from:
-                                came_from[(_fx, _fy)] = (cx, cy)
+                                and _open_frontier(_fx, _fy)):
+                            if clear_ok(_fx, _fy):
+                                gates.append((cg + _fs, _fx, _fy))
+                                # 过渡格不在 visited/堆里，came_from 必须补录父节点——
+                                # 否则 fine_path 回溯断链，路径只剩 1 格直冲穿墙（实测卡死根因）
+                                if (_fx, _fy) not in came_from:
+                                    came_from[(_fx, _fy)] = (cx, cy)
+                            else:
+                                _NARROW_REJ[0] += 1   # 窄缝过渡门——识别并拒绝
                         prev_free = None
                 elif v == FREE:
                     prev_free = (mx, my, s)
@@ -1015,7 +1098,7 @@ def astar_to(fvx, fvy, tfx, tfy, goal_relax=False):
         visited_set.add((cx,cy))
         if (cx,cy) == (tfx,tfy): break
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
-            js = jump_steps(cx, cy, dx, dy)
+            js = jump_steps(cx, cy, dx, dy, tfx, tfy)
             if js < 1: continue
             nx, ny = cx + dx*js, cy + dy*js
             ng = g_score.get((cx,cy), 999) + js
@@ -2002,7 +2085,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                             bad_add_counted(_gate_cluster_cells.get(gkey, [gkey]), gkey)
                             _gate_stall = 0
                             print(f"  [GATE-STALL] gate=({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) 无进展 → 门格集合黑名单(计数)", flush=True)
-                        print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}", flush=True)
+                        _nj = f" 窄缝拒×{_NARROW_REJ[0]}" if _NARROW_REJ[0] else ""
+                        print(f"  [GATE] [{step}] →({(gx+0.5)*VOXEL:.1f},{(gy+0.5)*VOXEL:.1f}) path={len(path)} gates={len(gates)}{_nj}", flush=True)
                 else:
                     no_gate_count += 1
                     # BACK 限流：每个路标一次全程 A*（25 万扩展上限），无路标可达时会烧穿计算
@@ -2226,6 +2310,8 @@ stats["steps"] = step
 stats["time_sec"] = round(time.time() - t0, 2)
 stats["bounces"] = mv.bounce
 stats["collisions"] = stats.get("collisions", 0)
+stats["narrow_rej"] = _NARROW_REJ[0]   # 门宽度判断：被拒绝的窄缝门计数（<2×PASS_CLEAR）
+stats["pass_clear_m"] = PASS_CLEAR_M
 if vis is not None:
     stats["landmarks_seen"] = vis.total_detected
     stats["landmarks_unique"] = len(vis.seen_ids)
