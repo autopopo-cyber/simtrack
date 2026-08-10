@@ -16,7 +16,7 @@ from PIL import Image
 
 VOXEL = 0.1
 GRID_N = 500
-PASS_CLEAR = 6.0          # 格 = 0.6m（与 algo3_headless.PASS_CLEAR_M 对齐）
+PASS_CLEAR = float(sys.argv[1]) if len(sys.argv) > 1 else 6.0   # 格 = 0.1m/格（默认 0.6m，与 algo3_headless.PASS_CLEAR_M 对齐）
 ROAD_PIX = 128
 
 # ── 真值地图 → 0.1m 栅格（4×4 MAX-pool：任一真值像素是墙则格为墙）──
@@ -86,6 +86,8 @@ for name, Gx in (("真值", G), ("感知(+2格墙厚先验)", G_perc)):
     if not ok: fails.append(f"{name}: 连通性")
 
     # ② 窄缝封闭：每个弯道障碍与外墙的 1.0m 缝（x∈[49,50] 或 [0,1]，|y-oy|≤0.4m）
+    # 注意：障碍按物理盘(r=0.5)画上；仿真里雷达按 OBS_CLEAR=0.7 盘感知（含狗半径0.2），
+    # 所以这里的"封闭"判定比仿真略严——0.3m 净空档下缝心恰好在边界（几何见文档）。
     n_closed = 0
     for ox, oy in bends:
         slit_x0, slit_x1 = (49.05, 49.95) if ox > 25 else (0.05, 0.95)
