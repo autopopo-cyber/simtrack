@@ -19,7 +19,7 @@ import mujoco
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml, HF_SURF
-from simtrack.obstacles_random import RandomObstacleField
+from simtrack.obstacles_random import RandomObstacleField, mix_bend_positions
 from simtrack.algorithms.dwa import DWAAlgorithm
 from simtrack.odometry import Odometry
 
@@ -407,30 +407,35 @@ def update_random(dt):
     random_field.update(dt)
     obs_world = list(_obs_fixed_prefix) + random_field.positions   # 保留固定障碍前缀（混合场）
 
+def _moving_obs_positions():
+    """当前**移动**障碍位置列表（接触区豁免只豁免移动障碍）。
+    2026-08-10 根修：旧版豁免对 obs_world 全部生效——混合场里狗贴近**固定**弯道障碍时，
+    障碍命中格也被标 FREE → 地图把固定障碍从狗身边擦掉 → 狗开进障碍体内持续碰撞
+    （实测 5 号弯 (46.9,24.8) 卡 7700 步 / collision 8000+）。固定障碍有安全圈+刹车
+    机械兜底，不需要豁免；移动障碍会主动逼近狗，豁免保留。"""
+    if random_field is not None:
+        return random_field.positions
+    if patrol_paths:
+        return obs_world[:len(patrol_paths)]
+    return []
+
 _obs_fixed_prefix = []   # 混合场（--obs-mix）的固定弯道障碍；update_random 重写 obs_world 时保留
 
 def init_mix_obstacles():
     """混合障碍场（主人指令 2026-08-09）：每拐弯处 1 个固定障碍（9 个 U 型弯）
     + 每直道 1 个随机反弹障碍（1m/s，20%/s 变向，撞墙反弹，
     活动范围 x∈[4.5,45]——不超出本通道直道段，不进转弯开口）。
-    弯道障碍贴外侧墙（右弯 x=48.5 / 左弯 x=1.5）：不堵转弯走线
-    （主人反馈"明明还有很宽的道路，狗却要挤过去"——摆弯心的障碍把 4.9m
-    转弯区分成两条 ~1.7m 缝；贴外墙后内侧留出 ~3.3m 宽转弯通道）。"""
+    2026-08-10：弯道障碍改种子随机分布（mix_bend_positions，贴外侧墙一带但不再
+    刚性一列；范围核算见 obstacles_random.py——不嵌墙、不堵转弯走线）。"""
     global random_field, obs_world, _obs_fixed_prefix
-    bends = []
-    for k in range(1, 10):
-        y = k * 5.0
-        if k % 2 == 1:
-            bends.append((48.5, y))   # 奇数分隔墙右端开口 → 右 U 型弯，贴外侧墙
-        else:
-            bends.append((1.5, y))    # 偶数分隔墙左端开口 → 左 U 型弯，贴外侧墙
-    bends = [(x, y) for x, y in bends
+    bends = [(x, y) for x, y in mix_bend_positions(FIXED_SEED)
              if sample_hf(x, y) == ROAD_PIX and not _obs_hits_wall(x, y, 0.5)]
     _obs_fixed_prefix = bends
     chs = list(range(10))
     random_field = RandomObstacleField(channels=chs, seed=FIXED_SEED, x0=4.5, x1=45.0)
     obs_world = list(_obs_fixed_prefix) + random_field.positions
-    print(f"  [CFG] 混合障碍场：弯道固定 {len(bends)} 个(贴外侧墙) + 直道移动 {len(chs)} 个 (1m/s, x∈[4.5,45])", flush=True)
+    print(f"  [CFG] 混合障碍场：弯道固定 {len(bends)} 个(种子随机贴外侧一带) + 直道移动 {len(chs)} 个 (1m/s, x∈[4.5,45])", flush=True)
+    print(f"  [CFG] 弯道障碍: {[(round(x,1), round(y,1)) for x, y in bends]}", flush=True)
 
 def _obs_hits_wall(ox, oy, r):
     """检查以 (ox,oy) 为中心 r 半径的圆是否碰到墙（确保障碍不嵌墙）"""
@@ -546,6 +551,7 @@ def scan(bx, by, yaw_ang):
         pyc = np.clip(py, 0, HF_RES - 1)
         wall = (_hf_bin[pyc, pxc]) & inb               # 真值墙像素
         obs_hit = None
+        obs_mov_hit = None
         if len(obs_world):
             # 障碍命中用 1/4 分辨率（0.1m 栅格级）计算再扩回：障碍盘 0.7m，
             # 0.1m 采样必命中——全分辨率是 4 倍浪费（实测 20 障碍广播是 scan 最大热点）
@@ -555,6 +561,13 @@ def scan(bx, by, yaw_ang):
                 obs4 |= (xs4 - ox) ** 2 + (ys4 - oy) ** 2 <= OBS_CLEAR ** 2
             obs_hit = np.repeat(obs4, 4, axis=1)[:, :wall.shape[1]]
             wall |= obs_hit
+            # 移动障碍单独一张掩码（接触区豁免只豁免移动障碍，固定障碍贴近也必须保持 WALL）
+            _mov = _moving_obs_positions()
+            if _mov:
+                obs4m = np.zeros(xs4.shape, dtype=bool)
+                for ox, oy in _mov:
+                    obs4m |= (xs4 - ox) ** 2 + (ys4 - oy) ** 2 <= OBS_CLEAR ** 2
+                obs_mov_hit = np.repeat(obs4m, 4, axis=1)[:, :wall.shape[1]]
         hit_any = wall | (~inb)                         # 出界=射线终止（不标 WALL）
         R, S = hit_any.shape
         first = np.argmax(hit_any, axis=1)              # 每条射线首个终止下标
@@ -585,10 +598,13 @@ def scan(bx, by, yaw_ang):
         # （实测 collision 800+）；留 UNKNOWN：贴脸障碍周围冒未知泡 → 幽灵门把狗吸回去（实测游荡）。
         # 标 FREE 让狗始终能拉开距离；移动障碍有 DWA 运动预测兜底（r+0.3 排斥）不会真撞。
         # 固定障碍场不豁免（无 DWA，靠标记+安全圈刹停）
+        # 2026-08-10：豁免掩码改为**仅移动障碍**（obs_mov_hit）——混合场里固定弯道障碍
+        # 贴狗时也被豁免擦掉 → 狗开进障碍体内持续碰撞 8000+（5 号弯卡 7700 步实测）
         _close_obs = None
-        if obs_hit is not None and (random_field is not None or patrol_paths):
+        if obs_mov_hit is not None:
             _obs_hit_r = obs_hit[np.arange(R), hi] & _real_hit
-            _close_obs = _obs_hit_r & ((first * SCAN_STEP) < 0.5)
+            _mov_hit_r = obs_mov_hit[np.arange(R), hi] & _real_hit
+            _close_obs = _mov_hit_r & ((first * SCAN_STEP) < 0.5)
             _mark_hit = (_real_hit & ~_obs_hit_r) | (_obs_hit_r & ~_close_obs)
         else:
             _mark_hit = _real_hit
@@ -1119,8 +1135,11 @@ def astar_to(fvx, fvy, tfx, tfy, goal_relax=False):
 
 def build_xml():
     # 障碍红色圆柱贴路面（中心 z = HF_SURF+半高1.0；旧硬编码 2.0 埋地里）
+    # mocap="true"（2026-08-10 修视觉冻结 bug）：无关节静态 body 的 xpos 永远不随
+    # obs_world 更新——移动障碍逻辑上在动（雷达/碰撞/DWA 都看到），但渲染画面 frozen
+    # 在初始位置（实测录像里 10 个障碍全冻在 x=25 一列）。mocap 体每 tick 同步位置。
     OBS_XML = "".join(
-        f'<body name="obs{i}" pos="{x:.1f} {y:.1f} {HF_SURF + 1.0:.2f}">'
+        f'<body name="obs{i}" mocap="true" pos="{x:.1f} {y:.1f} {HF_SURF + 1.0:.2f}">'
         f'<geom type="cylinder" size="0.5 1.0" rgba="0.9 0.2 0.2 0.9" contype="0" conaffinity="0"/></body>'
         for i,(x,y) in enumerate(obs_world))
     FINISH_XML = f'<body mocap="true" pos="{FINISH[0]:.1f} {FINISH[1]:.1f} {HF_SURF + 1.5:.2f}"><geom type="sphere" size="1.5" rgba="0.2 1.0 0.2 0.8"/></body>'
@@ -1512,6 +1531,20 @@ print(f"━━━ 萤火 Firefly v3 SLAM headless ━━━ {VOXEL}m 三级跳A*
 xml = build_xml()
 m = mujoco.MjModel.from_xml_string(xml)
 d = mujoco.MjData(m)
+# 障碍 mocap 体 id 表（视觉位置同步用；非 mocap 为 -1 跳过）
+_OBS_MOCAP = []
+for _i in range(len(obs_world)):
+    _bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"obs{_i}")
+    _OBS_MOCAP.append(int(m.body_mocapid[_bid]) if _bid >= 0 else -1)
+
+def sync_obs_mocap():
+    """把 obs_world 当前位置写进 mocap 体（渲染跟随逻辑位置）。contype=0 无物理副作用。"""
+    for _i, (_ox, _oy) in enumerate(obs_world):
+        if _i >= len(_OBS_MOCAP):
+            break
+        _mid = _OBS_MOCAP[_i]
+        if _mid >= 0:
+            d.mocap_pos[_mid] = (_ox, _oy, HF_SURF + 1.0)
 if args.random_start:
     rs_x, rs_y = random_road_pos(FIXED_SEED + 1000, min_dist_from=5.0, from_pos=FINISH)
     d.qpos[0] = rs_x; d.qpos[1] = rs_y
@@ -1717,6 +1750,10 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     # 随机反弹障碍移动（每 tick 更新，1m/s 弹性反弹）
     if random_field is not None:
         update_random(m.opt.timestep)
+
+    # 障碍视觉位置同步（mocap 体——无此调用渲染 frozen 在初始位置）
+    if (patrol_paths or random_field is not None) and RENDER_OK and args.render_every > 0:
+        sync_obs_mocap()
 
     # 路标放置
     if abs(vx-last_mx)+abs(vy-last_my) >= MILESTONE_STEP:

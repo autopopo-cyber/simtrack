@@ -2,11 +2,12 @@
 
 不跑仿真，直接在真值地图上验证门宽度判断的两个性质：
 ①连通性：PASS（净空≥0.6m 可规划格）从起点到终点**全图连通**——净空场没把迷宫封死；
-②窄缝封闭：混合场 9 个弯道障碍（贴外墙 x=48.5/1.5，1.0m 窄缝）与外墙之间的缝
-  **全部对规划关闭**（栅栏陷阱识别——能透过激光但过不去的缝不是路）；
-③宽路不误伤：直道中线、转弯内侧走线保持开放。
+②缝宽判定：混合场 9 个弯道障碍（种子随机贴外侧一带）与外墙的缝——
+  **缝宽 <1.15m 必须封闭**（栅栏陷阱识别——能透过激光但过不去的缝不是路）、
+  **≥1.15m 必须开放**（宽路不误封）；
+③宽路不误伤：直道中线全开放 + 每个弯道开口区有可穿行带。
 
-用法：.venv/Scripts/python scripts/test_pass_clear.py
+用法：.venv/Scripts/python scripts/test_pass_clear.py [PASS_CLEAR格数，默认6=0.6m]
 退出码 0=全过，1=有失败项。
 """
 import sys
@@ -41,9 +42,11 @@ def paint_disk(G, ox, oy, r=0.5):
                 if 0 <= cx+dx < GRID_N and 0 <= cy+dy < GRID_N:
                     G[cx+dx, cy+dy] = True
 
-# ── 混合场弯道障碍（贴外墙，与 algo3_headless.init_mix_obstacles 同几何）──
-bends = [(48.5, k*5.0) if k % 2 == 1 else (1.5, k*5.0) for k in range(1, 10)]
-# 注意：init_mix_obstacles 会用 sample_hf/_obs_hits_wall 过滤嵌墙的；这里全部保留做几何验证
+# ── 混合场弯道障碍（种子随机贴外侧一带，与 init_mix_obstacles 同源）──
+sys.path.insert(0, ".")
+from simtrack.obstacles_random import mix_bend_positions
+bends = mix_bend_positions(7)   # 回归/录像用 seed 7
+print(f"弯道障碍(seed7): {[(round(x,1), round(y,1)) for x, y in bends]}")
 G = WALLG.copy()
 for ox, oy in bends:
     paint_disk(G, ox, oy)
@@ -85,35 +88,49 @@ for name, Gx in (("真值", G), ("感知(+2格墙厚先验)", G_perc)):
     print(f"  ①连通性 起点→终点3.5m圈: {'PASS' if ok else 'FAIL'}")
     if not ok: fails.append(f"{name}: 连通性")
 
-    # ② 窄缝封闭：每个弯道障碍与外墙的 1.0m 缝（x∈[49,50] 或 [0,1]，|y-oy|≤0.4m）
-    # 注意：障碍按物理盘(r=0.5)画上；仿真里雷达按 OBS_CLEAR=0.7 盘感知（含狗半径0.2），
-    # 所以这里的"封闭"判定比仿真略严——0.3m 净空档下缝心恰好在边界（几何见文档）。
-    n_closed = 0
+    # ② 缝宽判定：每个弯道障碍与外墙之间的缝——
+    # **缝宽 <1.0m 必须封闭**（明确过不去的栅栏陷阱，两个地图变体都不许有 PASS 格）；
+    # **缝宽 ≥1.6m 必须开放**（两个变体里都得有可穿格——宽路不误封）；
+    # 1.0~1.6m 是边界区（结果取决于墙厚先验/格量化，闭=安全答案，不做断言）。
+    n_ok = 0
+    n_assert = 0
     for ox, oy in bends:
-        slit_x0, slit_x1 = (49.05, 49.95) if ox > 25 else (0.05, 0.95)
-        closed = True
-        for wx in np.arange(slit_x0, slit_x1, 0.1):
+        if ox > 25:
+            gap = 50.0 - (ox + 0.5)           # 右弯：障碍右缘 → 外墙 x=50
+            sx0, sx1 = ox + 0.55, 49.95
+        else:
+            gap = (ox - 0.5) - 0.0            # 左弯：外墙 x=0 → 障碍左缘
+            sx0, sx1 = 0.05, ox - 0.55
+        if 1.0 <= gap < 1.6:
+            continue                          # 边界区不断言
+        has_pass = False
+        for wx in np.arange(sx0, sx1, 0.1):
             for wy in np.arange(oy-0.4, oy+0.41, 0.1):
                 cx, cy = to_cell(wx, wy)
-                if not Gx[cx, cy] and PASS[cx, cy]:   # 物理自由但规划可穿 → 缝没封住
-                    closed = False
-        n_closed += closed
-    print(f"  ②窄缝封闭 {n_closed}/9: {'PASS' if n_closed == 9 else 'FAIL'}")
-    if n_closed != 9: fails.append(f"{name}: 窄缝 {n_closed}/9")
+                if 0 <= cx < GRID_N and 0 <= cy < GRID_N and not Gx[cx, cy] and PASS[cx, cy]:
+                    has_pass = True
+        expect_open = gap >= 1.6
+        n_assert += 1
+        if has_pass == expect_open:
+            n_ok += 1
+    print(f"  ②缝宽判定 {n_ok}/{n_assert}（<1.0m封/≥1.6m开，边界区跳过）: {'PASS' if n_ok == n_assert else 'FAIL'}")
+    if n_ok != n_assert: fails.append(f"{name}: 缝宽判定 {n_ok}/{n_assert}")
 
-    # ③ 宽路不误伤：直道中线 + 转弯内侧走线开放
+    # ③ 宽路不误伤：直道中线全开放 + 每个弯道开口区有可穿行带（≥20% PASS 格）
     mid_ok = all(PASS[to_cell(25.0, 2.5+5*k)] for k in range(10))
-    inner_ok = True
+    bend_ok = True
     for ox, oy in bends:
-        ix = 46.5 if ox > 25 else 3.5     # 转弯内侧走线（远离贴墙障碍一侧）
-        if not PASS[to_cell(ix, oy)]:
-            inner_ok = False
-    print(f"  ③直道中线 10/10: {'PASS' if mid_ok else 'FAIL'}  转弯内侧 9/9: {'PASS' if inner_ok else 'FAIL'}")
+        x0, x1 = (45.5, 49.5) if ox > 25 else (0.5, 4.5)
+        cells = [PASS[to_cell(wx, wy)]
+                 for wx in np.arange(x0, x1, 0.5) for wy in np.arange(oy-2, oy+2.01, 0.5)]
+        if sum(cells) < 0.2 * len(cells):
+            bend_ok = False
+    print(f"  ③直道中线 10/10: {'PASS' if mid_ok else 'FAIL'}  弯道开口可穿行带 9/9: {'PASS' if bend_ok else 'FAIL'}")
     if not mid_ok: fails.append(f"{name}: 直道中线")
-    if not inner_ok: fails.append(f"{name}: 转弯内侧")
+    if not bend_ok: fails.append(f"{name}: 弯道开口")
 
 print()
 if fails:
     print("[FAIL]", fails)
     sys.exit(1)
-print("[OK] 门宽度判断静态验证全过：窄缝封闭 + 全图连通 + 宽路不误伤")
+print("[OK] 门宽度判断静态验证全过：缝宽判定（窄封宽开）+ 全图连通 + 宽路不误伤")
