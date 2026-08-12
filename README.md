@@ -162,10 +162,12 @@ MuJoCo 仿真中，机器狗在 **50×50m 蛇形迷宫**（10 条水平通道 + 
 ### 里程碑 / 复盘（最重要！）
 | 文档 | 内容 |
 |---|---|
+| [**2026-08-12-no-truth-localization.md**](docs/2026-08-12-no-truth-localization.md) | **审核整改：默认完全无真值化（5%/s 里程计+scan-matching+二维码定位、感知跟踪障碍速度、滚动局部障碍层）+ 复审/复现指南** |
+| [2026-08-10-gate-width.md](docs/2026-08-10-gate-width.md) | 门宽度判断：PASS 净空场识别窄缝/栅栏陷阱（注：成绩表为真值位姿调试模式） |
 | [**2026-08-07-obs-progressive-milestone.md**](docs/2026-08-07-obs-progressive-milestone.md) | **M2 障碍渐进：动态安全距离 + 撞障碍学习闭环 + 混合 20 跑通** |
 | [2026-08-07-milestone-hpa-yawfix.md](docs/2026-08-07-milestone-hpa-yawfix.md) | HPA\* 移植 + yaw bug + 距离场 min bug — 四场景全达标 |
 | [2026-08-06-retrospective.md](docs/2026-08-06-retrospective.md) | 48 小时开发复盘（视觉花 70% 时间但核心目标未验收完的审视） |
-| [2026-08-05-dog50-maze-pitfalls.md](docs/2026-08-05-dog50-maze-pitfalls.md) | 全部踩坑「现象→根因→修复」（卡死三连环/斜墙漏扫/相机roll/box墙/M2六坑） |
+| [2026-08-05-dog50-maze-pitfalls.md](docs/2026-08-05-dog50-maze-pitfalls.md) | 全部踩坑「现象→根因→修复」（卡死三连环/斜墙漏扫/相机roll/box墙/M2六坑/门宽度九坑/无真值化十三坑） |
 
 ### 架构/设计（docs/superpowers/specs/）
 | 文档 | 内容 |
@@ -202,24 +204,29 @@ MuJoCo 仿真中，机器狗在 **50×50m 蛇形迷宫**（10 条水平通道 + 
 
 ## 六、常用命令
 
-```bash
-# 探索模式（SLAM 自建图，126s 全通）
-python test_scripts/algo3_headless.py --seed 7 --no-obs 1 --timeout 280
+> **2026-08-12 起默认无真值**（里程计定位+匹配+二维码），旧表里的成绩如需真值位姿调试请加 `--odom 0`。
 
-# 已知地图全程（125s，HPA*）
-python test_scripts/algo3_headless.py --seed 7 --no-obs 1 --known-raw 1 --timeout 280
+```bash
+# 探索模式（默认无特权：5%/s 里程计 + scan-matching + 二维码修正）
+python test_scripts/algo3_headless.py --seed 7 --no-obs 1 --timeout 2300
+
+# 直道特征障碍场（15±5m 间隔固定障碍，建图随机）
+python test_scripts/algo3_headless.py --seed 7 --obs-feature 1 --timeout 2300
+
+# 混合场（弯道固定 + 直道移动障碍，DWA 速度=感知跟踪估计）
+python test_scripts/algo3_headless.py --seed 7 --obs-mix 1 --timeout 2300
+
+# 已知地图全程（125s，HPA*）——调试用真值位姿
+python test_scripts/algo3_headless.py --seed 7 --no-obs 1 --known-raw 1 --odom 0 --timeout 280
 
 # 绑架恢复（随机位置→起点）
-python test_scripts/algo3_headless.py --seed 42 --no-obs 1 --known-raw 1 --random-start 1 --target start --timeout 150
+python test_scripts/algo3_headless.py --seed 42 --no-obs 1 --known-raw 1 --odom 0 --random-start 1 --target start --timeout 150
 
 # 任意通道二维码（随机位置→通道4二维码）
-python test_scripts/algo3_headless.py --seed 42 --no-obs 1 --known-raw 1 --random-start 1 --target ch4 --timeout 150
+python test_scripts/algo3_headless.py --seed 42 --no-obs 1 --known-raw 1 --odom 0 --random-start 1 --target ch4 --timeout 150
 
 # 视觉标牌测试
 python test_scripts/algo3_headless.py --landmarks 1 --vision 1 --timeout 60
-
-# 混合 20 障碍（直道1+弯道1，M2 最终形态）
-python test_scripts/algo3_headless.py --seed 7 --known-raw 1 --obs-straight 1 --obs-turn 1 --timeout 380
 ```
 
 ## 七、本轮收获（08-05 ~ 08-07）

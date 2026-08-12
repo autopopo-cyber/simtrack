@@ -1446,7 +1446,11 @@ class Mover:
         if (self.speed <= 0.05 and d_clear < STOP_MARGIN + 0.15) or (
                 self.dwa is not None and self.dwa_target is None
                 and step - self.dwa_t <= LIDAR_TICK and self.speed > 0.05):
-            _hit_wall = sample_hf(bx, by) != ROAD_PIX
+            # 诊断日志用感知版"撞墙了吗"：狗脚下格有无 3s 内激光直接命中（局部层）。
+            # （旧版 sample_hf 真值——只进日志不进决策，但审核口径下真值连日志也不该读）
+            _svx, _svy = int(bx / VOXEL), int(by / VOXEL)
+            _hit_wall = bool(LOCAL_STAMP[_svx, _svy] > _scan_step[0] - LOCAL_WIN) \
+                if 0 <= _svx < GRID_N and 0 <= _svy < GRID_N else False
             # 被挡时前方 ~1.5m 内是否有障碍——纯感知：查雷达扫到的障碍格记忆 OBS_SEEN
             # （旧版查 obs_world 真值=特权）。放宽：狗在障碍 0.7m 外就会被 blocked 挡住，但距离判定>0.7 会漏
             _near_obs = False
