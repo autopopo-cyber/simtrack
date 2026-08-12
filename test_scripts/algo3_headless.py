@@ -22,6 +22,8 @@ from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall
 from simtrack.obstacles_random import RandomObstacleField, mix_bend_positions
 from simtrack.algorithms.dwa import DWAAlgorithm
 from simtrack.odometry import Odometry
+from simtrack.scan_matching import ScanMatcher
+from simtrack.obstacle_tracker import ObstacleTracker
 
 # ═══════════════════════════════════════════
 # 全部可配置参数（与 algo3_firefly.py 一致）
@@ -123,8 +125,11 @@ ap.add_argument("--obs-patrol", type=int, default=0, help="巡逻障碍数：沿
 ap.add_argument("--obs-random", type=int, default=0, help="随机反弹障碍数(2-4)：每段20m×5m, 1m/s, 20%/s变向, 撞墙/虚拟墙反弹")
 ap.add_argument("--obs-random-ch", type=str, default="1,4,6,8", help="反弹区段通道列表(逗号分隔)")
 ap.add_argument("--obs-mix", type=int, default=0, help="混合场：每拐弯处1个固定障碍(9个U型弯)+每直道1个随机反弹障碍(1m/s, x∈[4.5,45]不出本通道)")
-ap.add_argument("--odom", type=int, default=0, help="1=里程计模式：决策/建图只用带噪里程计位姿（不用 d.qpos 真值），二维码标牌做绝对修正")
-ap.add_argument("--odom-noise", type=float, default=0.02, help="里程计线速度比例噪声（0.02=2%）")
+ap.add_argument("--odom", type=int, default=1, help="1=里程计模式(默认,无特权)：决策/建图只用带噪里程计位姿（不用 d.qpos 真值），scan-matching 连续修正 + 二维码标牌绝对修正；0=真值位姿调试模式")
+ap.add_argument("--odom-noise", type=float, default=0.05, help="里程计噪声量级（0.05=5%/s，四足 IMU+步态推算水平；含慢变偏差与陀螺漂移，见 odometry.py）")
+ap.add_argument("--match", type=int, default=1, help="1=scan-to-map 匹配修正（默认开，激光里程计）；0=纯推算（仅二维码修正，A/B 调试用）")
+ap.add_argument("--obs-feature", type=int, default=0, help="1=长直道特征障碍场：每段直道按间隔 15±5m 放固定障碍（每次建图随机），作为长直道激光特征防迷路")
+ap.add_argument("--dwa-truth-vel", type=int, default=0, help="⚠️A/B 调试：DWA 障碍速度用真值 velocities（作弊，仅用于隔离跟踪器 bug——审核整改后默认 0=感知跟踪估计）")
 ap.add_argument("--pass-clear", type=float, default=-1, help="规划净空(m)：通行宽<2×此值的窄缝封闭（默认用 PASS_CLEAR_M=0.6；0=关闭门宽度判断，回退旧行为做 A/B）")
 args = ap.parse_args()
 
@@ -183,6 +188,16 @@ SG = np.zeros((GRID_N, GRID_N), dtype=np.int8)     # static 背景（旧地图/�
 KNOWN_MAP_MODE = False  # True=阶段2（加载旧地图），规划叠加 SG
 _wd = {}
 OBS_SEEN = {}      # 雷达扫到的障碍格 key → 命中时扫描序号（纯感知障碍记忆，替代 obs_world 真值查询）
+OBS_PTS_LAST = []  # 最近一次扫描的障碍命中点（估计系世界坐标）——ObstacleTracker 输入
+HIT_CONFIRMED = np.zeros((GRID_N, GRID_N), dtype=bool)  # 激光**直接命中**过的格（经验墙感知确认凭据）
+# 滚动局部障碍层（ROS costmap obstacle layer 思想，2026-08-12 审核整改新增）：
+# 全局地图随累计位姿漂移错位（幻影墙），但**最近几秒的激光观测在局部是准的**
+# （3s 窗口内 odom 增量误差 ~1-2%=0.1m 级）。执行层避障（前瞻/制动/DWA）以新鲜
+# 观测为准，全局地图只做规划——碰撞不再依赖"地图多准"。
+LOCAL_STAMP = np.zeros((GRID_N, GRID_N), dtype=np.int32)  # 格 → 最近直接命中（+0.2m 膨胀）的扫描序号
+LOCAL_WIN = 60   # 60 次扫描 ≈ 3s 观测有效期
+LOCAL_STAMP[:] = -10**6   # 零初始化会被当"新鲜"（0 > scan_step-60 在开局成立）→ 全图堵死起点瘫痪（实测）
+_dog_est = [0.0, 0.0]   # 狗当前估计位（DWA 局部层 0.3m 自清用）
 _scan_step = [0]   # scan 调用计数
 
 def gget(vx, vy):
@@ -328,6 +343,33 @@ def gen_obstacles_progressive(seed):
                         out.append((ox, oy)); break
     return out
 
+def gen_feature_obstacles(seed):
+    """长直道特征障碍（主人 2026-08-12 指令）：每段直道按间隔 15m±5m 放固定障碍，
+    每次新建图重新随机（种子=建图种子）。
+    用途：长直道两侧墙 45m 无特征——激光 scan-matching 沿走廊方向退化不可观测，
+    二维码每通道只有 1 个；这些障碍作为直道上的激光/视觉特征锚点，防长直道迷路。
+    约束：x∈[7,43]（距两端转弯口 ≥6m，不堵转弯）、y=通道中心±1.2m、
+    不嵌墙、互不重叠、离起点 (2.5,2.5) ≥4m。"""
+    rng = random.Random(seed)
+    out = []
+    obs_r = 0.5
+    for ch in range(10):
+        yc = 2.5 + ch * 5.0
+        x = 7.0 + rng.uniform(0.0, 2.0)   # 首锚点 7~9m（转弯口 6m 外）
+        while x <= 43.0:
+            for _try in range(100):
+                ox = x + rng.uniform(-1.5, 1.5)
+                oy = yc + rng.uniform(-1.2, 1.2)
+                if not (6.0 <= ox <= 44.0):
+                    continue
+                if math.hypot(ox - 2.5, oy - 2.5) < 4.0:
+                    continue
+                if sample_hf(ox, oy) == ROAD_PIX and not _obs_hits_wall(ox, oy, obs_r):
+                    if all(math.hypot(ox - a, oy - b) > obs_r * 2 + 0.3 for a, b in out):
+                        out.append((ox, oy)); break
+            x += 15.0 + rng.uniform(-5.0, 5.0)   # 间隔 15±5m
+    return out
+
 # ═══════════════════════════════════════════
 # 巡逻障碍（主人指令 08-07：两直道+一弯道，1m/s，~50m 往返）
 # ═══════════════════════════════════════════
@@ -468,6 +510,10 @@ if args.no_obs:
 elif args.obs_mix > 0:
     obs_world = []
     init_mix_obstacles()             # 混合场：弯道固定 + 直道移动（random_field 驱动）
+elif args.obs_feature > 0:
+    obs_world = gen_feature_obstacles(FIXED_SEED)   # 长直道特征障碍（纯固定，15±5m 间隔）
+    print(f"  [CFG] 直道特征障碍 {len(obs_world)} 个（间隔15±5m，种子随机）: "
+          f"{[(round(x,1), round(y,1)) for x, y in obs_world]}", flush=True)
 elif args.obs_random > 0:
     obs_world = []
     init_random_obstacles()          # 随机反弹障碍（obs_world[0:N] 是随机障碍）
@@ -516,9 +562,23 @@ def is_obstacle_world(wx, wy, inflation=0.0):
 # 扫描 + 碰撞检测
 # ═══════════════════════════════════════════
 
-def scan(bx, by, yaw_ang):
+MATCH_RANGE = 8.0   # scan-matching 只用 ≤8m 近距命中点（远处位姿误差杠杆大）
+_in_init_scan = [False]   # 初始自旋期间禁匹配（地图空 + 每帧转 18° 超出搜索窗）
+_STORM = [False]   # 保留位：风暴隔离机制已实测否决并移除（冻结会切断射线清除自救通道，
+                   # 见踩坑文档 16.6）——恒 False，代码里留的隔离门全部惰性
+
+def scan(cast_x, cast_y, cast_yaw, est_x=None, est_y=None, est_yaw=None):
     """前方 FOV 扇形扫描（相对狗 yaw）——无特权：只感知狗能看到的物理真实。
     多线（--lidar-lines N）：不同俯仰角的线，2D 导航取最近（任一线命中=检测到，冗余确认）。
+
+    2026-08-12 物理/估计坐标系分离（代码审核整改）：
+    - 投射（物理层）用**真值位姿** (cast_*)：激光从狗的真实位置发出，打的是真实世界
+      ——真实激光雷达不知道自己位姿错了，点云相对机身是精确的；
+    - 写图（认知层）用**估计位姿** (est_*)：狗把点云按自己以为的位姿放进地图，
+      位姿误差 → 地图错位——这正是真实 SLAM 要面对的问题；
+    - 写图前做 scan-to-map 匹配（ScanMatcher，ROS Cartographer 思想），
+      用当前帧近距墙命中点对已建地图求位姿修正量，连续压住里程计漂移。
+    --odom 0 调试模式：est=cast，行为与旧版一致。
 
     2026-08-09 重写（修"幽灵门"泄漏）：
     - 旧版沿射线 0.1m 步进逐点 is_obstacle_world——会跨过 <0.1m 的真缝
@@ -528,6 +588,8 @@ def scan(bx, by, yaw_ang):
       特征 1px，采样跨不过任何缝。numpy 向量化（每射线 1200 步一次性算），
       命中后批量去重写 grid，成本与旧版相当。
     """
+    if est_x is None:
+        est_x, est_y, est_yaw = cast_x, cast_y, cast_yaw
     fov_rad = math.radians(args.lidar_fov)
     n_lines = max(1, args.lidar_lines)
     _scan_step[0] += 1
@@ -535,15 +597,18 @@ def scan(bx, by, yaw_ang):
     if OBS_SEEN and _scan_step[0] % 10 == 0:
         for _k in [_k for _k, _v in OBS_SEEN.items() if _scan_step[0] - _v > 200]:
             del OBS_SEEN[_k]
+    OBS_PTS_LAST.clear()
     # 2D 简化：多线 = 同 FOV 的多条水平线（不同俯仰角扫不同高度，2D 判定等价；
     # 真实多线雷达主要价值是 3D 感知/鲁棒性，导航 2D 下取最近点）
     for _line in range(n_lines):
-        angles = yaw_ang + np.linspace(-fov_rad / 2, fov_rad / 2, LIDAR_RAYS)
+        rel = np.linspace(-fov_rad / 2, fov_rad / 2, LIDAR_RAYS)
+        # ── 物理投射：真值位姿（激光打的是真实世界）──
+        angles = cast_yaw + rel
         cos_a = np.cos(angles).astype(np.float32)
         sin_a = np.sin(angles).astype(np.float32)
         xs = cos_a[:, None] * _scan_k32[None, :]     # (R,S) float32
         ys = sin_a[:, None] * _scan_k32[None, :]
-        xs += np.float32(bx); ys += np.float32(by)   # 世界坐标（原地加，省一次分配）
+        xs += np.float32(cast_x); ys += np.float32(cast_y)   # 世界坐标（真值系）
         px = (xs * PIX_PER_M).astype(np.int32)
         py = HF_RES - 1 - (ys * PIX_PER_M).astype(np.int32)
         inb = (px >= 0) & (px < HF_RES) & (py >= 0) & (py < HF_RES)
@@ -561,7 +626,9 @@ def scan(bx, by, yaw_ang):
                 obs4 |= (xs4 - ox) ** 2 + (ys4 - oy) ** 2 <= OBS_CLEAR ** 2
             obs_hit = np.repeat(obs4, 4, axis=1)[:, :wall.shape[1]]
             wall |= obs_hit
-            # 移动障碍单独一张掩码（接触区豁免只豁免移动障碍，固定障碍贴近也必须保持 WALL）
+            # 移动障碍单独一张掩码（接触区豁免只豁免移动障碍，固定障碍贴近也必须保持 WALL）。
+            # 注：动/静区分是**物理层标注**（与 hfield 真值模拟激光回波同层），
+            # 决策层从不读它——决策用的障碍运动信息全部来自 ObstacleTracker 感知估计。
             _mov = _moving_obs_positions()
             if _mov:
                 obs4m = np.zeros(xs4.shape, dtype=bool)
@@ -570,26 +637,70 @@ def scan(bx, by, yaw_ang):
                 obs_mov_hit = np.repeat(obs4m, 4, axis=1)[:, :wall.shape[1]]
         hit_any = wall | (~inb)                         # 出界=射线终止（不标 WALL）
         R, S = hit_any.shape
+        _hr = np.arange(R)
         first = np.argmax(hit_any, axis=1)              # 每条射线首个终止下标
-        has = hit_any[np.arange(R), first]
+        has = hit_any[_hr, first]
         stop = np.where(has, first, S)                  # 终止步；无命中=S（全程 FREE）
-        cx = px >> 2    # 0.1m 感知格 = 4 个 hfield 像素（非负区等价 int(x/VOXEL)，越界格下面 mask 掉）
-        cy = (HF_RES - 1 - py) >> 2   # py 是图像行（row0=y=50m 顶部，y 翻转）——必须翻回世界格！
-        free_mask = np.arange(S)[None, :] < stop[:, None]
         hi = np.minimum(first, S - 1)
-        _hit_inb = has & inb[np.arange(R), hi]   # 真命中（排除出界终止）
+        _hit_inb = has & inb[_hr, hi]   # 真命中（排除出界终止）
+        _rd = first.astype(np.float32) * np.float32(SCAN_STEP)    # 命中距 (R,)
+        if obs_hit is not None:
+            _wall_hit0 = _hit_inb & ~obs_hit[_hr, hi]   # 纯墙命中（匹配专用：障碍会动，不能当地图锚）
+        else:
+            _wall_hit0 = _hit_inb
         if odom is not None:
             # 里程计模式：只写近距墙标记（远处命中随位姿误差错位涂抹地图，实测 1m 漂移
             # 时墙根陷阱卡死）——射线仍被远墙终止（FREE 标记不穿墙），只是远墙格留 UNKNOWN，
-            # 狗走近再标（那时位姿已被二维码修正）
-            _real_hit = _hit_inb & ((first * SCAN_STEP) <= WALL_MAP_RANGE)
+            # 狗走近再标（那时位姿已被 scan-matching/二维码修正）
+            _real_hit = _hit_inb & (_rd <= WALL_MAP_RANGE)
         else:
             _real_hit = _hit_inb
+
+        # ── scan-to-map 匹配（激光里程计修正，写图前）──
+        # 参照 = 全局感知墙掩码（PG）。风暴期/初始自旋期不匹配（位姿不可信时修正=加注正反馈）。
+        # 匹配点只用纯墙命中（障碍会动/被写过位姿误差，不当锚）。
+        _quarantine = _STORM[0] and odom is not None   # 风暴隔离：全局写图/匹配/绝对修正冻结
+        if (odom is not None and matcher is not None and not _in_init_scan[0] and not _quarantine):
+            _mp = _wall_hit0 & (_rd <= MATCH_RANGE)
+            if _mp.any():
+                _ma = est_yaw + rel[_mp]
+                _mpts = np.stack([est_x + _rd[_mp] * np.cos(_ma),
+                                  est_y + _rd[_mp] * np.sin(_ma)], axis=1)
+                _pg_ensure()
+                _wdil = cv2.dilate((PG == WALL).astype(np.uint8),
+                                   np.ones((3, 3), np.uint8))
+                _corr = matcher.match(_mpts, est_x, est_y, _wdil)
+                if _corr is not None:
+                    _dxm, _dym, _dam, _msc = _corr
+                    odom.x += _dxm; odom.y += _dym
+                    odom.yaw = (odom.yaw + _dam + math.pi) % (2 * math.pi) - math.pi
+                    est_x += _dxm; est_y += _dym; est_yaw = odom.yaw
+
+        # ── 写图坐标系：估计系（狗以为自己在哪里，点云就放在哪里）──
+        if odom is not None:
+            angles_e = est_yaw + rel
+            cos_e = np.cos(angles_e).astype(np.float32)
+            sin_e = np.sin(angles_e).astype(np.float32)
+            xe = cos_e[:, None] * _scan_k32[None, :]
+            ye = sin_e[:, None] * _scan_k32[None, :]
+            xe += np.float32(est_x); ye += np.float32(est_y)
+            cx = np.floor(xe / VOXEL).astype(np.int32)   # 世界→感知格（floor 语义，负坐标也正确越界）
+            cy = np.floor(ye / VOXEL).astype(np.int32)
+            _hx = xe[_hr, hi]                     # 命中点世界坐标（估计系，掠射填充用）
+            _hy = ye[_hr, hi]
+        else:
+            cx = px >> 2    # 0.1m 感知格 = 4 个 hfield 像素（非负区等价 int(x/VOXEL)，越界格下面 mask 掉）
+            cy = (HF_RES - 1 - py) >> 2   # py 是图像行（row0=y=50m 顶部，y 翻转）——必须翻回世界格！
+            _hx = px[_hr, hi].astype(np.float32) / PIX_PER_M          # 命中点世界坐标 (R,)
+            _hy = (HF_RES - 1 - py[_hr, hi]).astype(np.float32) / PIX_PER_M
+        free_mask = np.arange(S)[None, :] < stop[:, None]
         # 2026-08-09 性能：numpy 数组批量标记（原 dict 逐格 gset 循环 + np.unique 是 scan 一半耗时）。
         # 先写 FREE（射线清除：穿过格强制 FREE，旧障碍被"照"掉）再写 WALL → 同格命中 WALL 优先。
+        # 风暴隔离：全局地图写入全部暂停（防不可信位姿涂抹），只留局部层/障碍记忆保执行安全
         fm = free_mask & (cx >= 0) & (cx < GRID_N) & (cy >= 0) & (cy < GRID_N)
-        G[cx[fm], cy[fm]] = FREE
-        _pg_touch()
+        if not _quarantine:
+            G[cx[fm], cy[fm]] = FREE
+            _pg_touch()
         # 墙厚先验（本地图墙 ≥0.2m=2格）：命中点再往里 0.1m/0.2m 深处也是墙。
         # 旧版只标命中格 → 掠射射线把墙面格又清成 FREE、墙背行留 UNKNOWN →
         # 墙脸上长出"伪前沿门"（门后是墙体，狗去确认=贴墙 bounce，实测之字打转每条墙 8 段×6-8s）
@@ -601,29 +712,67 @@ def scan(bx, by, yaw_ang):
         # 2026-08-10：豁免掩码改为**仅移动障碍**（obs_mov_hit）——混合场里固定弯道障碍
         # 贴狗时也被豁免擦掉 → 狗开进障碍体内持续碰撞 8000+（5 号弯卡 7700 步实测）
         _close_obs = None
+        _obs_hit_r0 = None
         if obs_mov_hit is not None:
-            _obs_hit_r = obs_hit[np.arange(R), hi] & _real_hit
-            _mov_hit_r = obs_mov_hit[np.arange(R), hi] & _real_hit
-            _close_obs = _mov_hit_r & ((first * SCAN_STEP) < 0.5)
+            _obs_hit_r = obs_hit[_hr, hi] & _real_hit
+            _mov_hit_r = obs_mov_hit[_hr, hi] & _real_hit
+            _close_obs = _mov_hit_r & (_rd < 0.5)
             _mark_hit = (_real_hit & ~_obs_hit_r) | (_obs_hit_r & ~_close_obs)
+            _obs_hit_r0 = _obs_hit_r & ~_close_obs   # 局部层用：剔除贴脸豁免格
         else:
             _mark_hit = _real_hit
-        _wc = [(cx[np.arange(R), hi], cy[np.arange(R), hi])]
+            if obs_hit is not None:
+                _obs_hit_r0 = obs_hit[_hr, hi] & _real_hit
+        # 直接命中格登记（HIT_CONFIRMED）：经验墙写入的感知确认凭据——
+        # 只认激光**直接打中**的格，墙厚先验/掠射填充推断的格不算（防假墙自指扩散）
+        _dhx = cx[_hr, hi][_mark_hit]; _dhy = cy[_hr, hi][_mark_hit]
+        _dok = (_dhx >= 0) & (_dhx < GRID_N) & (_dhy >= 0) & (_dhy < GRID_N)
+        if _dok.any():
+            if not _quarantine:
+                HIT_CONFIRMED[_dhx[_dok], _dhy[_dok]] = True
+        # 滚动局部障碍层（风暴期照常——执行层逃生靠它；**只在有障碍体的场启用**——
+        # 纯墙场地图管线已被充分验证，加戳只增刹车噪声）：
+        # ① 全部直接命中格（墙+障碍）**无膨胀**打戳——距离沿视线方向是精确的（位姿误差
+        #    只带来横向偏移），正前方的墙/障碍永远被新鲜直读兜底（实测无墙戳时地图漂移
+        #    会把狗嵌进真墙：地图自洽地错，blocked 永不触发，contype=0 物理不设防）。
+        # ② 障碍命中额外 +0.4m 膨胀（命中面 0.5m 外还有狗半径+余量）。
+        # 接触区豁免格（贴脸移动障碍）不打（打狗脚上=永冻）。墙戳无膨胀故走廊不变窄。
+        # 注：所有场启用（纯墙场也要——漂移嵌墙没有障碍也一样发生）。
+        # ③ 狗身 0.35m 自清区：膨胀戳可能盖住狗当前格（障碍逼近到 0.5-0.9m 时），
+        #    把移动护卫在狗脚下锁死（实测混合场冻结：d_fwd=4.0 明明畅通但一步不动
+        #    bounce 刷到 1100+）——打戳时跳过狗身边格（该处由接触区豁免+逃逸逻辑接管）。
+        _evx2, _evy2 = int(est_x / VOXEL), int(est_y / VOXEL)
+        if _dok.any():
+            _sx = _dhx[_dok]; _sy = _dhy[_dok]
+            _sf = (_sx - _evx2) ** 2 + (_sy - _evy2) ** 2 > 12   # >0.35m（格平方）
+            if _sf.any():
+                LOCAL_STAMP[_sx[_sf], _sy[_sf]] = _scan_step[0]
+        if _obs_hit_r0 is not None and _obs_hit_r0.any():
+            _ohx = cx[_hr, hi][_obs_hit_r0]; _ohy = cy[_hr, hi][_obs_hit_r0]
+            _oko = (_ohx >= 0) & (_ohx < GRID_N) & (_ohy >= 0) & (_ohy < GRID_N)
+            if _oko.any():
+                _lh = np.zeros((GRID_N, GRID_N), dtype=np.uint8)
+                _lh[_ohx[_oko], _ohy[_oko]] = 1
+                _lh = cv2.dilate(_lh, np.ones((9, 9), np.uint8))
+                # 自清区清零（0.35m ≈ ±3 格；数组 [vx, vy] 索引 x 在前）
+                _lh[max(0, _evx2-3):_evx2+4, max(0, _evy2-3):_evy2+4] = 0
+                LOCAL_STAMP[_lh.astype(bool)] = _scan_step[0]
+        _wc = [(cx[_hr, hi], cy[_hr, hi])]
         for _extra in (4, 8):   # +0.1m、+0.2m 深处（4 采样=1 格）
             _di = np.minimum(first + _extra, S - 1)
-            _wc.append((cx[np.arange(R), _di], cy[np.arange(R), _di]))
+            _wc.append((cx[_hr, _di], cy[_hr, _di]))
         wcx = np.concatenate([_w[0][_mark_hit] for _w in _wc])
         wcy = np.concatenate([_w[1][_mark_hit] for _w in _wc])
         _ok = (wcx >= 0) & (wcx < GRID_N) & (wcy >= 0) & (wcy < GRID_N)
         wcx = wcx[_ok]; wcy = wcy[_ok]
-        if wcx.size:
+        if wcx.size and not _quarantine:
             if (G[wcx, wcy] != WALL).any():   # 有新墙格才清 wall_dist 缓存（原 gset 语义）
                 _wd.clear()
             G[wcx, wcy] = WALL
-        if _close_obs is not None and _close_obs.any():
+        if _close_obs is not None and _close_obs.any() and not _quarantine:
             # 接触区格主动标 FREE（在 WALL 写之后，防止同格被墙厚先验覆盖）
-            _ccx = cx[np.arange(R), hi][_close_obs]
-            _ccy = cy[np.arange(R), hi][_close_obs]
+            _ccx = cx[_hr, hi][_close_obs]
+            _ccy = cy[_hr, hi][_close_obs]
             _cok = (_ccx >= 0) & (_ccx < GRID_N) & (_ccy >= 0) & (_ccy < GRID_N)
             if _cok.any():
                 G[_ccx[_cok], _ccy[_cok]] = FREE
@@ -635,16 +784,12 @@ def scan(bx, by, yaw_ang):
         # 判定 = 折中条件初筛 + **自由空间反证**（关键）：弦内部采样格若已被射线穿过标 FREE
         # （>25%），说明弦横穿开阔空间（开口/拐角/不同墙）→ 拒填；同墙掠射弦贴着墙皮，
         # 无任何射线能穿过 → 填充。障碍命中对不填（防假墙封死障碍↔墙的缝）。
-        _hr = np.arange(R)
-        _hx = px[_hr, hi].astype(np.float32) / PIX_PER_M          # 命中点世界坐标 (R,)
-        _hy = (HF_RES - 1 - py[_hr, hi]).astype(np.float32) / PIX_PER_M
-        _rd = first.astype(np.float32) * np.float32(SCAN_STEP)    # 命中距 (R,)
         if obs_hit is not None:
             _wall_hit = _real_hit & ~obs_hit[_hr, hi]
         else:
             _wall_hit = _real_hit
         _vp = _wall_hit[:-1] & _wall_hit[1:]
-        if _vp.any():
+        if _vp.any() and not _quarantine:
             _x0, _x1 = _hx[:-1], _hx[1:]
             _y0, _y1 = _hy[:-1], _hy[1:]
             _ch = np.hypot(_x1-_x0, _y1-_y0)                     # 相邻命中点弦长
@@ -666,9 +811,14 @@ def scan(bx, by, yaw_ang):
                 _pg_touch()
         # 障碍命中格登记（纯感知）：执行层"附近有无障碍"判定用——替代 obs_world 真值查询
         if obs_hit is not None:
-            _oh = obs_hit[np.arange(R), hi] & _real_hit
+            _oh = obs_hit[_hr, hi] & _real_hit
             for _r in np.nonzero(_oh)[0]:
                 OBS_SEEN[int(cx[_r, hi[_r]]) * 4096 + int(cy[_r, hi[_r]])] = _scan_step[0]
+                OBS_PTS_LAST.append((float(_hx[_r]), float(_hy[_r])))   # 跟踪器输入（估计系）
+    # 匹配修正过的估计位姿回传（主循环刷新决策位姿）
+    if odom is not None:
+        return (est_x, est_y, est_yaw)
+    return None
 
 # ── 墙边禁入区（主人指令 2026-08-08：墙边 10cm 禁止进入）──
 # ⚠️ 不许作弊：禁入区基于**雷达感知**的墙（grid WALL），不是真值地图 track_clean！
@@ -678,7 +828,7 @@ def scan(bx, by, yaw_ang):
 # 注：keepout 本体维持 0.05m/4邻域（实测 0.10m+对角禁入让狗贴墙 STOP 翻倍——
 # 宽路通过性的瓶颈在规划层附加余量，不在执行层 keepout）
 KEEP_M = 0.05   # 距感知墙禁入距离 (m，表面距离)
-WALL_MAP_RANGE = 12.0   # 里程计模式只标记 12m 内的墙（远处命中随位姿误差涂抹地图；射线仍被远墙终止）
+WALL_MAP_RANGE = 10.0   # 里程计模式只标记 10m 内的墙（远处命中随位姿误差涂抹地图；射线仍被远墙终止）
 
 # 距感知墙表面 < KEEP_M 的格偏移集合（按连续距离算）：
 # KEEP_M=0.05 → 自身+4邻域（对角 d=1.41→表面 0.091m 不算贴墙）
@@ -712,9 +862,11 @@ def blocked(wx, wy, inflation=0.0):
 def blocked_batch(pts):
     """批量 blocked（DWA 快路径用）：pts (N,2) 世界坐标 → bool (N,)。
     与 blocked() 同语义：越界 True；自身+4邻域（keepout）任一感知墙 True。
-    边界处邻格 clip 到自身——与标量版"越界邻格=非墙"效果等价（自身格已被 (0,0) 覆盖）。"""
+    边界处邻格 clip 到自身——与标量版"越界邻格=非墙"效果等价（自身格已被 (0,0) 覆盖）。
+    2026-08-12：叠加滚动局部层（新鲜直读命中）——DWA 轨迹模拟看到**当前真实**障碍，
+    不被全局地图漂移误导；狗位 0.3m 内局部层不算（轨迹起点在狗身上，防全碰撞假死锁）。"""
     x = pts[:, 0]; y = pts[:, 1]
-    oob = (x < 0.0) | (x > 50.0) | (y < 0.0) | (y > 50.0)
+    oob = (x < 0.0) | (x > 50.0) | (y > 50.0) | (y < 0.0)
     vx = np.clip((x / VOXEL).astype(np.int32), 0, GRID_N - 1)
     vy = np.clip((y / VOXEL).astype(np.int32), 0, GRID_N - 1)
     hit = np.zeros(len(pts), dtype=bool)
@@ -722,6 +874,9 @@ def blocked_batch(pts):
         nx = np.clip(vx + dx, 0, GRID_N - 1)
         ny = np.clip(vy + dy, 0, GRID_N - 1)
         hit |= (G[nx, ny] == WALL) | (SG[nx, ny] == WALL)
+    _fresh = LOCAL_STAMP[vx, vy] > _scan_step[0] - LOCAL_WIN
+    _dd2 = (x - _dog_est[0]) ** 2 + (y - _dog_est[1]) ** 2
+    hit |= _fresh & (_dd2 > 0.09)
     return hit | oob
 
 # ── 三级跳A* ──
@@ -1194,7 +1349,7 @@ class Mover:
         self.yaw = 0.0; self.speed = 0.0; self.bounce = 0
         self.pose = None   # (x,y) 里程计位姿覆盖（--odom 1 时决策用估计位姿；None=用真值）
         self.stuck_t = 0; self.stuck_x = 0.0; self.stuck_y = 0.0
-        self.target = (FINISH[0], FINISH[1])  # 当前目标（GATE 方向），bounce 时优先朝向
+        self.target = None            # 当前目标（GATE 方向），bounce 时优先朝向；None=尚未有目标（不用 FINISH 真值先验）
         self.escape_steps = 0   # bounce 逃生冷却：沿 escape_yaw 强制走 N 步（绕出墙角再回归路径）
         self.escape_yaw = 0.0
         self.need_replan = False  # 撞到新障碍（不在当前路径规划里）→ 主循环强制重规划
@@ -1205,13 +1360,20 @@ class Mover:
         self.omega = 0.0         # 当前角速度（DWA 动态窗口用）
 
     def _forward_clear(self, bx, by, yaw_ang):
-        """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。blocked() 已含机器人半径膨胀。
+        """沿 yaw 方向前瞻测距：返回前方最近障碍距离 (m)。
+        判定 = 全局地图 blocked()（含机器人半径膨胀）**或** 滚动局部层新鲜命中——
+        局部层是最近 3s 的激光直读（odom 增量误差毫米级），全局地图漂移错位时
+        执行层依然看到真实障碍（ROS rolling obstacle layer 思想，2026-08-12 审核整改）。
         2026-08-09 性能：采样 0.05→0.1m（墙厚≥0.2m+keepout 邻格覆盖，0.1m 采样不会漏墙；
         原 80 次 blocked/步是执行层主成本）。"""
         for k in range(1, int(LOOKAHEAD / 0.1) + 1):
             px = bx + math.cos(yaw_ang) * 0.1 * k
             py = by + math.sin(yaw_ang) * 0.1 * k
             if blocked(px, py):
+                return 0.1 * k
+            _lx, _ly = int(px / VOXEL), int(py / VOXEL)
+            if 0 <= _lx < GRID_N and 0 <= _ly < GRID_N and \
+                    LOCAL_STAMP[_lx, _ly] > _scan_step[0] - LOCAL_WIN:
                 return 0.1 * k
         return LOOKAHEAD
 
@@ -1337,8 +1499,13 @@ class Mover:
         vx = math.cos(self.yaw)*self.speed; vy = math.sin(self.yaw)*self.speed
         nx, ny = bx+vx*dt, by+vy*dt
         # 硬防穿墙/障碍：下一位置 blocked（中心0.2m圆触障碍）就不动——物理上不可能穿。
+        # 2026-08-12：移动护卫叠加滚动局部层（新鲜直读命中格）——全局地图漂移时
+        # 真墙/真障碍照样封死（实测只信地图会把狗嵌进墙体 5 万步碰撞）
+        _nvx, _nvy = int(nx / VOXEL), int(ny / VOXEL)
+        _local_hit = (0 <= _nvx < GRID_N and 0 <= _nvy < GRID_N
+                      and LOCAL_STAMP[_nvx, _nvy] > _scan_step[0] - LOCAL_WIN)
         # bounce 决策已由上方 STOP 分支负责，这里只保证不移动（防低速漂移滑入）
-        if blocked(nx, ny):
+        if blocked(nx, ny) or _local_hit:
             if blocked(bx, by) and self._forward_clear(bx, by, self.yaw) > 0.15:
                 # 狗当前格已在禁入区（墙是狗停下后被后续扫描标到身边的）——此时 speed≈0
                 # 导致 nx≈bx 永远 blocked → 永冻锁死（实测 ch9 (7.7,45.2) bounce#1530）。
@@ -1354,13 +1521,28 @@ class Mover:
                 self.speed = 0.0
                 self.d.qvel[0] = 0; self.d.qvel[1] = 0; self.d.qvel[2] = 0
                 # 从经验学习：撞到的未知格写回地图为 WALL（A* 下次就不会规划穿墙路径）
-                # ⚠️ 必须真值确认（sample_hf 非路 或 真值障碍）才标——blocked 是纯感知判定，
-                # bounce 时会把"自己标的假墙"当挡 → 假墙自指包围死循环（2.9,3.4 实测 40+ bounce）。
-                # 物理事实记忆（非决策）用真值合理，与碰撞统计同理。
+                # ⚠️ 必须**感知确认**（2026-08-12 去真值，代码审核整改）：
+                # 旧版用 sample_hf 真值/obs_world 真值确认（特权）。现改为——
+                #   ① 该格 ±0.3m 邻域内有激光**直接命中**记录（HIT_CONFIRMED：
+                #      掠射填充/墙厚先验推断的格不算，防假墙自指扩散）；或
+                #   ② 附近有近期雷达障碍记忆（OBS_SEEN，撞到的是障碍）
+                # blocked 是纯感知判定，无确认就写会把"自己标的假墙"当挡 →
+                # 假墙自指包围死循环（2.9,3.4 实测 40+ bounce）。
                 gvx, gvy = int(nx/VOXEL), int(ny/VOXEL)
-                if gget(gvx, gvy) == UNKNOWN and (sample_hf(nx, ny) != ROAD_PIX or
-                                                  any(math.hypot(nx-ox, ny-oy) < OBS_CLEAR + 0.2 for ox, oy in obs_world)):
-                    gset(gvx, gvy, WALL)
+                if gget(gvx, gvy) == UNKNOWN:
+                    _x0c, _x1c = max(0, gvx-3), min(GRID_N, gvx+4)
+                    _y0c, _y1c = max(0, gvy-3), min(GRID_N, gvy+4)
+                    _cfm = bool(HIT_CONFIRMED[_x0c:_x1c, _y0c:_y1c].any())
+                    if not _cfm:
+                        for _kk, _st in OBS_SEEN.items():
+                            if _scan_step[0] - _st > 50:
+                                continue
+                            _cvx, _cvy = divmod(_kk, 4096)
+                            if math.hypot((_cvx+0.5)*VOXEL-nx, (_cvy+0.5)*VOXEL-ny) < OBS_CLEAR + 0.5:
+                                _cfm = True
+                                break
+                    if _cfm:
+                        gset(gvx, gvy, WALL)
         else:
             self.d.qvel[0] = vx; self.d.qvel[1] = vy; self.d.qvel[2] = 0
             self.d.qpos[2] = self.yaw  # 控制 yaw 直接写回物理（滑动模型 friction=0，mj_step 保持）
@@ -1384,7 +1566,10 @@ class Mover:
             print(f"  [BOUNCE] bounce#{self.bounce} @({self.d.qpos[0]:.1f},{self.d.qpos[1]:.1f})", flush=True)
         # 转向：先试目标方向（当前 GATE）的小角度偏转，再试随机（防墙边死循环）
         bx, by = self._pose_xy()
-        tx, ty = self.target
+        if self.target is not None:
+            tx, ty = self.target
+        else:
+            tx, ty = bx + math.cos(self.yaw) * 2.0, by + math.sin(self.yaw) * 2.0   # 无目标先验：朝当前朝向
         tgt_yaw = math.atan2(ty - by, tx - bx)
         _dbg = (self.bounce % 20 == 0)
         # 全向每 5° 扫（防稀疏角度漏掉窄缺口——迷宫段间墙缺口只有 ~10° 宽）
@@ -1510,18 +1695,20 @@ stats = {
     "final_pos": None,
 }
 
-_road_total_cache = [None]
+_road_mask_cache = [None]   # 真值路面掩码缓存（coverage 评分用，500×500 bool）
 def coverage_pct():
-    """探索覆盖率：FREE+WALL 占总可通行格（用地图真值，世界 0-100m）"""
-    if _road_total_cache[0] is None:
-        road_total = 0
+    """探索覆盖率（评分指标，可用真值）：真值路面内已探索格 / 真值路面格。
+    2026-08-12 口径修复（代码审核：旧版 >104% 失真）——旧版分母排除障碍格、
+    分子却含障碍残影/墙外涂抹格；现统一：分子分母都限定在真值路面掩码内。"""
+    if _road_mask_cache[0] is None:
+        rm = np.zeros((GRID_N, GRID_N), dtype=bool)
         for wy in range(0, 500):  # 50m / 0.1m
             for wx in range(0, 500):
-                if not is_obstacle_world((wx+0.5)*VOXEL, (wy+0.5)*VOXEL):
-                    road_total += 1
-        _road_total_cache[0] = road_total
-    road_total = _road_total_cache[0]
-    explored = _count(FREE) + _count(WALL)
+                rm[wx, wy] = not is_obstacle_world((wx+0.5)*VOXEL, (wy+0.5)*VOXEL)
+        _road_mask_cache[0] = rm
+    rm = _road_mask_cache[0]
+    road_total = int(rm.sum())
+    explored = int(np.count_nonzero(((G == FREE) | (G == WALL)) & rm))
     return explored / road_total * 100 if road_total else 0
 
 # ═══════════════════════════════════════════
@@ -1607,12 +1794,26 @@ def render_frame(step):
         print(f"  [RENDER-ERR] {e}", flush=True)  # 不静默吞渲染失败
 
 mv = Mover(m, d)
-# 里程计（--odom 1）：决策/建图只用带噪估计位姿；真值 d.qpos 只用于物理/碰撞/统计
+# 里程计（--odom 1，2026-08-12 起默认）：决策/建图只用带噪估计位姿；真值 d.qpos 只用于物理/碰撞/统计。
+# 初始帧定义：狗以上电点为世界系原点（自己的坐标系自己做主，非特权）；
+# 之后全靠带噪推算 + scan-matching（激光里程计）+ 二维码绝对修正收敛。
 odom = None
+matcher = None
+tracker = None
 if args.odom:
-    odom = Odometry(d.qpos[0], d.qpos[1], 0.0, v_noise=args.odom_noise,
-                    rng=random.Random(FIXED_SEED + 55))
-    print(f"  [ODOM] 里程计模式：决策位姿=估计（噪声 {args.odom_noise*100:.0f}%），二维码标牌绝对修正", flush=True)
+    # --odom-noise 是噪声量级档位（默认 0.05 = 四足 IMU+步态推算的 ~5%/s 水平），
+    # 按 5% 档标定的各分量随档位等比缩放（白噪/线速偏差游走/陀螺偏置/转弯比例偏差）
+    _s = args.odom_noise / 0.05
+    odom = Odometry(d.qpos[0], d.qpos[1], 0.0, v_noise=0.01 * _s, w_noise=0.01 * _s,
+                    rng=random.Random(FIXED_SEED + 55),
+                    v_bias_rw=0.02 * _s, w_bias_rw=0.06 * _s, w_scale_rw=0.02 * _s)
+    if args.match:
+        matcher = ScanMatcher(voxel=VOXEL)
+    print(f"  [ODOM] 里程计定位（默认无特权）：决策位姿=估计（噪声 {args.odom_noise*100:.0f}%/s 级+慢变偏差+陀螺漂移），"
+          f"scan-matching={'开' if matcher else '关'} + 二维码标牌绝对修正", flush=True)
+# 移动障碍感知跟踪器：DWA 运动预测的唯一障碍速度来源（替代真值 velocities，审核整改）
+if args.obs_random > 0 or args.obs_mix > 0:
+    tracker = ObstacleTracker()
 _prev_yaw = 0.0
 if args.obs_random > 0 or args.obs_mix > 0:
     mv.dwa = DWAAlgorithm(v_max=SPEED_MAX, w_max=YAW_RATE,
@@ -1703,6 +1904,9 @@ def bad_add_counted(cells, gkey):
         dead_gates.update(cells)
 _gate_cluster_cells = {}  # 最近一次 find_gates 的聚类映射：质心(sx,sy) → 原始门格列表
 finish_est = None       # 终点位置估计（相机看到绿球才有；无特权——狗亲眼所见）
+_goal_close_since = [None]  # 直奔死锁保险：狗贴在估计点却判不了到达的起始步
+_goal_blacklist = []        # 作废过的估计区域（5m 格，4 万步过期）——防同点再锁
+_est_dbg = [None]           # 估计变更调试（打印旧→新）
 finish_obs = []         # 最近 N 次终点观测（世界坐标），中位数滤波
 finish_rays = []        # 最近 N 次观测射线 (x,y,方位)——三角定位用（方位角抗背景板遮挡）
 finish_last_step = -1   # 上次观测步（去重）
@@ -1716,15 +1920,29 @@ print(f"=== Firefly v3 headless start: seed={FIXED_SEED} max_steps={args.max_ste
 
 # 初始扫描：开机原地自旋一圈（真实机器人上电自检旋转建图）——
 # 前方 180° 雷达只能看到半圆，不自旋身后永远 UNKNOWN → gate 把起点自身格当门 → 卡死
+# 初始扫描：开机原地自旋一圈（真实机器人上电自检旋转建图）——
+# 前方 180° 雷达只能看到半圆，不自旋身后永远 UNKNOWN → gate 把起点自身格当门 → 卡死
+# 2026-08-12 去真值：自旋期间里程计同步积分（陀螺有噪声——转一圈下来 yaw 漂几度是
+# 真实物理），写图用估计位姿；结束后**不再** odom.yaw=真值 同步（那是真值校准=作弊），
+# 残余 yaw 误差由后续 scan-matching/二维码修正收敛（地图初期轻微涂抹会被射线清除翻新）。
+_in_init_scan[0] = True
+_spin_omega = 2 * math.pi / (INIT_SCAN_STEPS * m.opt.timestep)
 for _ in range(INIT_SCAN_STEPS):
     bx, by = d.qpos[0], d.qpos[1]
     d.qpos[2] = 2 * math.pi * (_ / INIT_SCAN_STEPS)   # 匀速转一圈，每 LIDAR_TICK 扫当前朝向
-    if _ % LIDAR_TICK == 0: scan(bx, by, d.qpos[2])
+    if odom is not None:
+        odom.update(m.opt.timestep, 0.0, _spin_omega)   # 纯旋转积分（带噪）
+        if _ % LIDAR_TICK == 0:
+            scan(bx, by, d.qpos[2], odom.x, odom.y, odom.yaw)
+    else:
+        if _ % LIDAR_TICK == 0: scan(bx, by, d.qpos[2])
     mujoco.mj_step(m, d)
 d.qpos[2] = mv.yaw   # 自旋结束归位（与 Mover 朝向一致，scan 继续用 mv 视角）
+_in_init_scan[0] = False
 if odom is not None:
-    odom.yaw = mv.yaw
     _prev_yaw = mv.yaw
+    # 注意：mv.yaw 是控制系朝向（狗自己知道"我现在朝哪"=机身系定义），odom.yaw 保持自旋
+    # 积分结果（含漂移）——两者差异就是 IMU 漂移，不许互相同步
 print(f"  [OK] FREE={_count(FREE)} WALL={_count(WALL)}", flush=True)
 
 frame_idx = 0
@@ -1742,6 +1960,12 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     else:
         px, py, pyaw = bx, by, mv.yaw
     bx, by = px, py   # 下游全部是决策位姿（无特权）
+    _dog_est[0], _dog_est[1] = bx, by   # DWA 局部层自清参照
+
+    # 风暴检测（2026-08-12 实验后**移除**）：隔离本意是迷失期冻结建图防正反馈发散，
+    # 实测反成死地——冻结把"射线清除自救"也冻了，地图不更新 → 狗永远逃不出 →
+    # bounce 率降不下 → 永不解除（v13 全程锁死 4 万步实测）。教训：**恢复机制不能
+    # 切断自身的逃生通道**。_STORM 恒 False（保留开关位防回归参考）。
     vx, vy = int(bx/VOXEL), int(by/VOXEL)
     if gget(vx, vy) == UNKNOWN:
         gset(vx, vy, FREE)
@@ -1766,7 +1990,18 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             save_state()
 
     if step % LIDAR_TICK == 0:
-        scan(bx, by, pyaw)
+        # 物理投射用真值位姿（激光打真实世界）；写图用估计位姿（狗以为的自己在哪）；
+        # scan 内部做 scan-matching 并回传修正后的估计位姿
+        _ep = scan(d.qpos[0], d.qpos[1], mv.yaw, bx, by, pyaw)
+        if _ep is not None:
+            bx, by, pyaw = _ep
+            vx, vy = int(bx/VOXEL), int(by/VOXEL)
+            mv.pose = (bx, by)
+            _dog_est[0], _dog_est[1] = bx, by
+        # 移动障碍感知跟踪：本帧障碍命中点 → 聚类/关联/速度估计（DWA 运动预测用）。
+        # 空帧也要 update（track 老化/丢弃依赖时间推进）
+        if tracker is not None:
+            tracker.update(OBS_PTS_LAST, step * m.opt.timestep)
 
     # B阶段：运行中障碍变化（--obs-reseed 指定步数换新障碍 seed）
     if args.obs_reseed > 0 and step == args.obs_reseed:
@@ -1783,7 +2018,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     if vis is not None:
         vis.scan_once(step)
         # 里程计绝对修正：二维码标牌位置已知（环境设施表）→ 由观测方位/距离反解狗位姿，拉回漂移
-        if odom is not None and vis.geo_obs:
+        # 风暴期不修正：迷失时 yaw 不可信，反解位姿是错的，强修=往正反馈里加注（实测发散主因之一）
+        if odom is not None and vis.geo_obs and not _STORM[0]:
             for (_gs, _gidx, _gd, _gb) in vis.geo_obs:
                 if _gidx in vis._pos_map():
                     _lx, _ly = vis._pos_map()[_gidx]
@@ -1808,11 +2044,17 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             vis.geo_obs.clear()   # 里程计关时也清空，防无限累积
         # 终点发现（无特权）：相机看到绿色终点球 → 方位+距离 → 世界坐标估计
         # 尺寸法距离在标牌背景板遮挡下系统性偏远（实测 3 倍）→ 多方位观测三角定位（方位角抗遮挡）
-        if vis.finish_obs is not None and vis.finish_obs[4] != finish_last_step:
+        if vis.finish_obs is not None and vis.finish_obs[4] != finish_last_step and not _STORM[0]:
             _br, _fd, _fa, _fbottom, finish_last_step = vis.finish_obs
             _wa = pyaw - _br   # 图像右 = 世界 -y（相机 right=-y）→ 世界方位 = yaw - bearing
-            finish_obs.append((bx + _fd*math.cos(_wa), by + _fd*math.sin(_wa)))
-            finish_rays.append((bx, by, _wa))
+            # 估计喂料统一门槛 fd≤25m：>25m 的帧球被部分遮挡/像素太少，针孔距离**和**
+            # 质心方位角都不可信（实测 fd 30-80m 的垃圾帧把已收敛的 est (2.5,47.2)
+            # 一步步拖到 35m 外）——远距帧只用于"看到球"的事实记录，不进任何估计
+            if _fd > 25.0:
+                pass   # 远距帧不进估计（finish_last_step 已更新=去重）
+            else:
+                finish_obs.append((bx + _fd*math.cos(_wa), by + _fd*math.sin(_wa)))
+                finish_rays.append((bx, by, _wa))
             del finish_obs[:-12]
             del finish_rays[:-30]
             # 三角定位：各观测射线的法向方程 n·X=n·p 最小二乘（2x2）
@@ -1849,7 +2091,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                         or math.hypot(bx-finish_est[0], by-finish_est[1]) < 12.0):
                     finish_est = _tri
                 finish_est_tri = True
-            elif not finish_est_tri:
+            elif not finish_est_tri and _fd <= 25.0:
+                # 尺寸法中位数（>25m 的针孔距离是噪声，不更新——远距只信三角定位的方位角）
                 _oxs = sorted(p[0] for p in finish_obs)
                 _oys = sorted(p[1] for p in finish_obs)
                 finish_est = (_oxs[len(_oxs)//2], _oys[len(_oys)//2])
@@ -1860,17 +2103,42 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
             # 让估计随接近逐步走向球（针孔在 <10m 无遮挡时可靠）。
             if (finish_est is not None and finish_est_tri
                     and math.hypot(bx-finish_est[0], by-finish_est[1]) < 3.5
-                    and _fd > 6.0):
+                    and 6.0 < _fd <= 25.0):
                 _nx2, _ny2 = bx + _fd*math.cos(_wa), by + _fd*math.sin(_wa)
                 if 0.0 <= _nx2 <= 50.0 and 0.0 <= _ny2 <= 50.0:   # 越界观测不采纳（坏投影防 HPA 目标格非法）
                     finish_est = (_nx2, _ny2)
                     finish_est_tri = False
-            if not finish_announced:
+            # 作废区域拉黑：估计落进 4 万步内作废过的 5m 格 → 拒绝锁定（防假终点死锁复发）
+            if finish_est is not None:
+                _ek = (int(finish_est[0] // 5), int(finish_est[1] // 5))
+                for _bk0, _bk1, _bt in _goal_blacklist:
+                    if _bk0 == _ek[0] and _bk1 == _ek[1] and step - _bt < 40000:
+                        finish_est = None; finish_est_tri = False
+                        break
+            # 估计变更调试：定位假终点锁定的凭据
+            if finish_est is not None and _est_dbg[0] != finish_est:
+                print(f"  [EST] step={step} est={_est_dbg[0]}→({finish_est[0]:.1f},{finish_est[1]:.1f}) "
+                      f"tri={finish_est_tri} fd={_fd:.1f} pos=({bx:.1f},{by:.1f})", flush=True)
+                _est_dbg[0] = finish_est
+            if not finish_announced and finish_est is not None:
                 finish_announced = True
                 print(f"  [FINISH-SEEN] step={step} 首次看到终点! est=({finish_est[0]:.1f},{finish_est[1]:.1f}) pos=({bx:.1f},{by:.1f})", flush=True)
             finish_area = _fa   # 当前帧 blob 面积（近距到达判定用）
             finish_bottom = _fbottom   # 当前帧 blob 底行 px
             finish_wa = _wa     # 当前帧球的世界方位角（视觉视线核查用）
+
+    # ── 视觉伺服直奔（终局，全局漂移免疫）：球新鲜可见（≤25m）且感知视线通畅 →
+    # 直接把当前观测投影设为目标路径（相对方位/距离是精确的，全局位姿误差不相关），
+    # 逐帧更新目标点收敛到球。实测 v12：漂移 14m 时 finish_est 错到对角，
+    # 狗在真球 6m 外却因估计错误不触发到达——眼睛看到的球，直接走过去就是。
+    if vis is not None and vis.finish_obs is not None and not _STORM[0]:
+        _sbr, _sfd, _sfa, _sfb, _sstep = vis.finish_obs
+        if step - _sstep < 40 and _sfd <= 25.0:
+            _swa = pyaw - _sbr
+            _spx, _spy = bx + _sfd * math.cos(_swa), by + _sfd * math.sin(_swa)
+            if (0.0 <= _spx <= 50.0 and 0.0 <= _spy <= 50.0
+                    and line_clear(vx, vy, int(_spx / VOXEL), int(_spy / VOXEL))):
+                path = [(_spx, _spy)]; path_idx = 0; path_is_goal = True
 
     if (path is None or path_idx >= len(path) or (mv.need_replan and mv.escape_steps == 0)
             # bounce 过多 → 强制重规划（路径穿未知/贴墙时 path 有效但不推进 → 死循环；两种模式都需要）
@@ -1977,7 +2245,10 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                     if _ns is not None:
                         _psx, _psy = _ns
                 # 目标格被移动障碍临时标记占住 → 就近吸附可达格（标记随障碍移动/射线清除消退）
-                _gcx, _gcy = int(_goal[0]/VOXEL), int(_goal[1]/VOXEL)
+                # 2026-08-12：格坐标钳制图内——est/自定义目标贴地图边（如 x=50.0）时
+                # int(50/0.1)=500 越界 → HPA 细层调试打印 IndexError 崩溃（实测）
+                _gcx = min(GRID_N - 1, max(0, int(_goal[0]/VOXEL)))
+                _gcy = min(GRID_N - 1, max(0, int(_goal[1]/VOXEL)))
                 if not traversable(_gcx, _gcy):
                     _nsg = _nearest_walkable(_gcx, _gcy, max_r=20)
                     if _nsg is not None:
@@ -2002,7 +2273,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                         print(f"    [PATH] plan#{stats['hpa_plans']} len={len(gp)} min_obs_dist={_min_obs_d:.2f} pos=({bx:.1f},{by:.1f})", flush=True)
                 path = [((px+0.5)*VOXEL, (py+0.5)*VOXEL) for px, py in gp] if gp else None
             else:
-                path = astar_to(vx, vy, int(_goal[0]/VOXEL), int(_goal[1]/VOXEL))
+                path = astar_to(vx, vy, min(GRID_N - 1, max(0, int(_goal[0]/VOXEL))),
+                                min(GRID_N - 1, max(0, int(_goal[1]/VOXEL))))
             path_is_goal = True   # KNOWN_MAP 直奔终点：必须真到达，不能提前消耗
             if path:
                 path_idx = 0; wander = 0; last_dist = 999; no_gate_count = 0
@@ -2217,7 +2489,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         if look_target is not None:
             tx, ty = look_target
         # DWA 决策：每 LIDAR_TICK 步，用 lookahead 目标
-        # obstacles_motion：随机障碍带速度向量，DWA 模拟时用未来位置判定（运动预测，
+        # obstacles_motion：感知跟踪器估计的障碍速度（ObstacleTracker，聚类+帧间关联+EMA），
+        # 替代真值 velocities（2026-08-12 审核整改）——DWA 模拟时用未来位置判定（运动预测，
         # 替代盲目膨胀——障碍朝狗移动则提前避让，远离则不误判）
         if mv.dwa is not None and step % LIDAR_TICK == 0:
             mv.dwa_target = mv.dwa.choose_velocity(
@@ -2225,7 +2498,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                 v_now=mv.speed, w_now=mv.omega,
                 target=(tx, ty),
                 blocked_fn=lambda pt: blocked(pt[0], pt[1]),
-                obstacles_motion=random_field.velocities if random_field is not None else None,
+                obstacles_motion=(random_field.velocities if (args.dwa_truth_vel and random_field is not None)
+                                  else (tracker.moving() if tracker is not None else None)),
                 blocked_batch=blocked_batch)
             mv.dwa_t = step   # 咨询时刻：dwa_target=None 只在新鲜时才判全碰撞（防陈旧 None 死锁）
         ddist = math.hypot(tx-bx, ty-by)
@@ -2266,14 +2540,15 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         else:
             _fx, _fy = bx + math.cos(mv.yaw)*2.0, by + math.sin(mv.yaw)*2.0
         # 无路径分支也要咨询 DWA（否则 dwa_target 停在陈旧 None → 被判全碰撞 → 死锁）；
-        # 移动障碍在此分支同样需要运动预测避让
+        # 移动障碍在此分支同样需要运动预测避让（速度=感知跟踪估计，无真值）
         if mv.dwa is not None and step % LIDAR_TICK == 0:
             mv.dwa_target = mv.dwa.choose_velocity(
                 robot_pos=(bx, by), yaw=mv.yaw,
                 v_now=mv.speed, w_now=mv.omega,
                 target=(_fx, _fy),
                 blocked_fn=lambda pt: blocked(pt[0], pt[1]),
-                obstacles_motion=random_field.velocities if random_field is not None else None,
+                obstacles_motion=(random_field.velocities if (args.dwa_truth_vel and random_field is not None)
+                                  else (tracker.moving() if tracker is not None else None)),
                 blocked_batch=blocked_batch)
             mv.dwa_t = step
         mv.step(_fx, _fy, step)
@@ -2331,6 +2606,24 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         stats["arrived"] = True
         break
 
+    # 直奔死锁保险（2026-08-12 实测纯墙场 est 锁到狗脚边 (49.2,47.6)，9 万步无进展）：
+    # 狗贴在估计点 2.5m 内 >4000 步（20s）仍判不了到达 = 球根本不在那（坏估计）→
+    # 作废估计 + 清空观测缓存，回 frontier 探索；该 5m 区域拉黑 4 万步防同点再锁。
+    if finish_est is not None and math.hypot(bx-finish_est[0], by-finish_est[1]) < 2.5:
+        if _goal_close_since[0] is None:
+            _goal_close_since[0] = step
+        elif step - _goal_close_since[0] > 4000:
+            print(f"  [GOAL-INVALID] step={step} est=({finish_est[0]:.1f},{finish_est[1]:.1f}) "
+                  f"贴估{step-_goal_close_since[0]}步未到达 → 作废回探索", flush=True)
+            _goal_blacklist.append((int(finish_est[0]//5), int(finish_est[1]//5), step))
+            finish_est = None; finish_est_tri = False
+            finish_obs.clear(); finish_rays.clear()
+            _est_dbg[0] = None
+            path = None; path_idx = 0; wander = 0; last_dist = 999
+            _goal_close_since[0] = None
+    else:
+        _goal_close_since[0] = None
+
     # 碰撞检测（主人要求碰撞=0）：真实几何——机器人中心进入障碍安全圈才算碰撞
     # is_obstacle_world 已含 OBS_CLEAR=0.7（障碍半径0.5+机器人半径0.2），中心<0.7m即碰撞
     if is_obstacle_world(d.qpos[0], d.qpos[1]):
@@ -2346,7 +2639,8 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
     # 进度日志
     if step % 20000 == 0:
         cov = coverage_pct()
-        print(f"  ... step={step} F={_count(FREE)} W={_count(WALL)} ms={len(milestones)} cov={cov:.1f}% t={time.time()-t0:.0f}s pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f}) yaw={math.degrees(d.qpos[2]):.0f}°", flush=True)
+        _drift = f" drift={odom.error(d.qpos[0], d.qpos[1]):.2f}m(评分)" if odom is not None else ""
+        print(f"  ... step={step} F={_count(FREE)} W={_count(WALL)} ms={len(milestones)} cov={cov:.1f}% t={time.time()-t0:.0f}s pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f}) yaw={math.degrees(d.qpos[2]):.0f}°{_drift}", flush=True)
 
 # ── 收尾统计 ──
 stats["steps"] = step
@@ -2368,10 +2662,18 @@ if finish_est is not None:
     stats["finish_est"] = [round(finish_est[0], 2), round(finish_est[1], 2)]
     stats["finish_est_err"] = round(math.hypot(finish_est[0]-FINISH[0], finish_est[1]-FINISH[1]), 2)
 stats["dist_to_true_finish"] = round(math.hypot(d.qpos[0]-FINISH[0], d.qpos[1]-FINISH[1]), 2)
+stats["loc_mode"] = "odom" if odom is not None else "truth(DEBUG)"
 if odom is not None:
     # 里程计漂移（评分用真值，决策不用）：最终估计位姿与真值的差距
     stats["odom_drift_final"] = round(odom.error(d.qpos[0], d.qpos[1]), 2)
-    stats["odom_corrections"] = odom.corrections
+    stats["odom_corrections"] = odom.corrections      # 二维码绝对修正次数
+    stats["odom_bias_v_pct"] = round(odom.bias_v * 100, 2)
+    stats["odom_bias_w_degs"] = round(math.degrees(odom.bias_w), 3)
+if matcher is not None:
+    stats["match_tries"] = matcher.matches
+    stats["match_corrections"] = matcher.corrections   # scan-matching 激光里程计修正次数
+if tracker is not None:
+    stats["tracker_tracks"] = len(tracker.tracks)
 stats["seed"] = FIXED_SEED
 stats["free_cells"] = _count(FREE)
 stats["wall_cells"] = _count(WALL)

@@ -142,9 +142,10 @@ def test_full_pipeline_headless():
                 coll += 1
                 break
 
-        d.qvel[0] = vc * math.cos(yaw)
-        d.qvel[1] = vc * math.sin(yaw)
-        d.qvel[2] = 0
+        data.qvel[0] = vc * math.cos(yaw)
+        data.qvel[1] = vc * math.sin(yaw)
+        data.qvel[2] = 0
+        data.qpos[2] = yaw   # 控制 yaw 写回物理（滑动模型约定，同 algo3：朝向=控制变量）
         mujoco.mj_step(model, data)
         cnt += 1
 

@@ -81,6 +81,34 @@ class _BaseRadar:
     def hit_count(self):
         return len(self._last_points)
 
+    def cluster(self, grid_size=1.0, min_hits=2):
+        """点云栅格聚类：返回 [(cx, cy, r), ...]（r=簇内最大散布半径）。
+        相邻栅格簇合并（8 邻域链式），小簇（<min_hits 点）丢弃。"""
+        cells = {}
+        for x, y, z in self._last_points:
+            key = (int(x // grid_size), int(y // grid_size))
+            cells.setdefault(key, []).append((x, y))
+        # 链式合并相邻栅格
+        keys = [k for k, v in cells.items() if len(v) >= 1]
+        groups = []
+        for k in keys:
+            for g in groups:
+                if any(abs(k[0] - q[0]) <= 1 and abs(k[1] - q[1]) <= 1 for q in g):
+                    g.append(k)
+                    break
+            else:
+                groups.append([k])
+        out = []
+        for g in groups:
+            pts = [p for k in g for p in cells[k]]
+            if len(pts) < min_hits:
+                continue
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            r = max(math.hypot(px - cx, py - cy) for px, py in pts)
+            out.append((cx, cy, r))
+        return out
+
 
 class MultiLineLidar(_BaseRadar):
     """水平多线雷达 — 均匀角间距 + 可调线数。
@@ -141,6 +169,10 @@ class SphereSampler(_BaseRadar):
                 pts.append(hit)
         self._last_points = pts
         return pts
+
+
+# ── 兼容别名：旧代码/测试里的 LidarSensor = 多线激光雷达默认实现 ──
+LidarSensor = MultiLineLidar
 
 
 # ── 自测 ──

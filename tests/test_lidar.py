@@ -24,8 +24,8 @@ def simple_scene():
     <joint name="y" type="slide" axis="0 1 0"/>
     <site name="lidar" pos="0 0 0.3" size="0.02"/>
     </body>
-    <body pos="3 0 0.2"><geom type="cylinder" size="0.3 0.2"/></body>
-    <body pos="0 5 0.2"><geom type="cylinder" size="0.2 0.2"/></body>
+    <body pos="3 0 0.2"><geom type="cylinder" size="0.3 0.8"/></body>
+    <body pos="0 5 0.2"><geom type="cylinder" size="0.2 0.8"/></body>
     </worldbody></mujoco>"""
     import tempfile, os
     path = os.path.join(tempfile.gettempdir(), "lidar_test.xml")
@@ -67,7 +67,7 @@ class TestLidarSensor:
             mujoco.mj_step(model, data)
 
         lidar.update(0, 0, 0)
-        clusters = lidar.cluster(grid_size=1.0, min_hits=2)
+        clusters = lidar.cluster(grid_size=1.0, min_hits=1)   # 稀疏场景（细柱每柱仅 1-2 命中）
         assert len(clusters) > 0
         for c in clusters:
             assert len(c) == 3  # (cx, cy, r)
