@@ -66,7 +66,7 @@ def build():
           "<worldbody>" \
           "<light pos='{hw} {hh} 30' dir='0 0 -1' diffuse='0.9 0.9 0.95' ambient='0.5 0.5 0.55'/>" \
           "<geom type='hfield' hfield='maze' pos='{hw} {hh} 0' rgba='0.55 0.6 0.65 1' contype='0' conaffinity='0'/>" \
-          "<body name='bot' pos='1.5 1.5 0.5'>" \
+          "<body name='bot' pos='0 0 0.5'>" \
           "<joint type='slide' axis='1 0 0'/><joint type='slide' axis='0 1 0'/>" \
           "<joint name='yaw' type='hinge' axis='0 0 1'/>" \
           "<geom type='capsule' fromto='-0.4 0 0 0.4 0 0' size='0.2' rgba='1 0.85 0.1 1' contype='0' conaffinity='0'/>" \

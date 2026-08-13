@@ -89,7 +89,10 @@ class SimBackend:
     def _build_xml(self):
         """构建 MuJoCo 场景 XML（狗体 + 迷宫 hfield 可视化）。"""
         maze_abs = os.path.abspath(self.maze_path)
-        sx, sy, syaw = self.x, self.y, self.yaw
+        # 注意：狗体 body pos 必须为 0——它是关节体（slide x/y + hinge yaw），
+        # MuJoCo 里关节体的世界位姿 = body.pos + 关节位移(qpos)。若 body.pos 设成起点
+        # 又把 qpos 设成起点，视觉位置会叠加成 2×（狗跑到 (3,3) 墙角而非 (1.5,1.5) 房间中心）。
+        # 碰撞/扫描用的是 self.x/self.y（不读 MuJoCo 位姿），所以逻辑没坏，只是可视化解耦。
         # hfield half-extent = 迷宫半宽（10m for 20m maze）
         hw = self.hf_w / self.px_per_m / 2.0  # 10.0
         return f"""<mujoco>
@@ -103,7 +106,7 @@ class SimBackend:
     <light pos="{hw} {hw} 30" dir="0 0 -1" diffuse="0.9 0.9 0.95" ambient="0.4 0.4 0.45"/>
     <geom type="hfield" hfield="maze" pos="{hw} {hw} 0" rgba="0.55 0.6 0.65 1"
           friction="0 0 0" contype="0" conaffinity="0"/>
-    <body name="bot" pos="{sx} {sy} 2.5">
+    <body name="bot" pos="0 0 2.5">
       <joint type="slide" axis="1 0 0" damping="0"/>
       <joint type="slide" axis="0 1 0" damping="0"/>
       <joint name="yaw" type="hinge" axis="0 0 1" damping="0"/>
