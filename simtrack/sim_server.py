@@ -157,18 +157,29 @@ class SimBackend:
         return False
 
     def step(self):
-        """推进一个物理步（timestep 秒）。碰到墙停住（不穿墙）。"""
-        # 更新 yaw（转向不受墙限制）
-        self.yaw += self.vyaw * self.timestep
-        self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
-        # 试探性新位置
-        new_x = self.x + self.vx * self.timestep
-        new_y = self.y + self.vy * self.timestep
-        # 碰撞检测：碰墙就不动（原地转向仍允许）
-        if self._check_collision(new_x, new_y, self.yaw):
-            self.vx, self.vy = 0.0, 0.0
+        """推进一个物理步（timestep 秒）。
+
+        碰撞策略（修复"旋转进墙后死锁"bug）：
+          - 转向：新朝向若把足印甩进墙，拒绝转向（保持原 yaw）——否则机器狗一转身
+            就把胶囊尖插进墙，之后任何平移都被拦住，永久卡死。
+          - 平移：只在"当前自由 → 新位置碰墙"时拦住（防穿墙）；若当前已卡在墙里
+            （历史遗留/边界数值），放行让它能脱困，否则 Nav2 永远拽不出来。
+        """
+        dt = self.timestep
+        # ── 转向（碰撞受限）──
+        new_yaw = self.yaw + self.vyaw * dt
+        new_yaw = (new_yaw + math.pi) % (2 * math.pi) - math.pi
+        if not self._check_collision(self.x, self.y, new_yaw):
+            self.yaw = new_yaw
+        # ── 平移 ──
+        new_x = self.x + self.vx * dt
+        new_y = self.y + self.vy * dt
+        cur_stuck = self._check_collision(self.x, self.y, self.yaw)
+        new_coll = self._check_collision(new_x, new_y, self.yaw)
+        if (not cur_stuck) and new_coll:
+            self.vx, self.vy = 0.0, 0.0          # 自由态要进墙 → 拦
         else:
-            self.x, self.y = new_x, new_y
+            self.x, self.y = new_x, new_y         # 自由→自由 / 已卡→放行脱困
         # 写入 MuJoCo（qpos 直接设，qvel=0 防 mj_step 二次积分）
         if self.d is not None:
             self.d.qpos[0] = self.x
