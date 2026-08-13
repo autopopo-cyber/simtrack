@@ -4,6 +4,63 @@
 > 当前状态：sim_bridge → slam_toolbox → Nav2 全通，5/7 航点导航成功。
 > 用户指示：先 2（firefly_explorer 自主探索）后 3（复杂迷宫），航点失败先观察不急修。
 
+## ✅ Phase 1 完成（firefly_explorer，2026-08-13 实测）
+
+`simtrack/firefly_explorer.py` 已实现并远程验证通过。在 20×20m 迷宫里从 (1.5,1.5) 出发
+**全自主探索**，无人工航点：
+
+| # | frontier 目标 | 距离 | 结果 |
+|---|---|---|---|
+| 1 | (1.8,15.8) | 15.3m | ✅ 到达 |
+| 2 | (3.3,9.7) | 6.3m | ❌ Nav2 ABORTED（角落 inflation，见下方"已知问题"）→ 拉黑，自动选下一个 |
+| 3 | (18.8,13.5) | 17.0m | ✅ 到达 |
+| 4 | (17.6,16.6) | 3.3m | ✅ 到达 |
+| 5 | (0.8,6.0) | 19.8m | ❌ Nav2 ABORTED（同上）→ 拉黑 |
+| 6 | (0.4,9.6) | 18.5m | ✅ 到达 |
+
+- **4 次到达 / 2 次优雅失败**，最长单次导航 18.5m。机器人自主横穿整张地图。
+- frontier 数量：**234 → 23**（约 90% 探索完成，仍在下降）。
+- 失败处理：`_result_cb` 收到 status=6(ABORTED) 立刻拉黑该区域半径 2.5m 并重选下一个
+  frontier，**无卡死、无崩溃**。看门狗 90s 超时作为兜底（本次实测 Nav2 自己 19s 就 abort 了，没等到）。
+
+### 关键设计点（已验证）
+
+- frontier 检测：纯 numpy（`_dilate4` 自写膨胀 + `_cluster8` BFS 连通域），**不依赖 cv2/scipy**，
+  避免远程依赖问题。移植 algo3 的 `_open_frontier`（free 格的未知邻居需开阔）——参数
+  `wall_clear_cells`，slam_toolbox 0.05m/格下默认 1（轻过滤），0 = 纯 Yamauchi。
+- 聚类：动态 min_size（簇 <40 时降到 2，防早期稀疏前沿被全过滤卡死——algo3 的老坑）。
+- 打分：`size - dist_weight·distance`（信息增益优先，略偏近）。
+- **竞态守卫**：单调 `_goal_seq`。看门狗取消+重发后，旧目标的 result 回调按 seq 丢弃，
+  不会污染新目标的状态/统计（firefly 跑长循环必须防这个）。
+- 目标序号/坐标全部在回调闭包里捕获，不读 `self.current_goal`（避免过期值）。
+
+### ⚠️ 远程运行坑：python3 被 hermes-venv 抢走（无 numpy）
+
+远程 `~/simtrack` 的 tmux 会话里 `python3` = `/home/qin/hermes-venv/bin/python3`（一个没装 numpy
+的 venv），不是 `/usr/bin/python3`。直接 `python3 -m simtrack.firefly_explorer` 会
+`ModuleNotFoundError: No module named 'numpy'`。sim_bridge 不受影响是因为它只依赖 rclpy
+（ROS PYTHONPATH 提供）。
+
+**解法**：显式用 `/usr/bin/python3`（system + `~/.local` 都有 numpy，rclpy 经 ROS PYTHONPATH 可用）。
+远程已放启动器 `~/simtrack/run_firefly.sh`：
+```bash
+#!/bin/bash
+source /opt/ros/jazzy/setup.bash
+cd ~/simtrack
+exec /usr/bin/python3 -m simtrack.firefly_explorer
+```
+启动：`tmux new-window -t sim -n firefly "bash ~/simtrack/run_firefly.sh"`
+
+### 已知问题（不阻塞，与航点角落失败同源，观察中）
+
+Nav2 全局规划器在某些位置报 `Failed to create a plan from potential when a legal
+potential was found` → abort。根因：机器人停在未知边缘/角落时，全局 costmap 把周围 unknown
+当 lethal，NavFn 无法从起点扩散。firefly 靠拉黑+重选绕过，探索仍能推进。彻底解决要么：
+(a) 全局 costmap 允许穿越 unknown（`track_unknown_space`/`unknown_cost_value` 调参），或
+(b) frontier 目标向已知区偏移一点（别停在未知边缘）。留待复杂迷宫阶段一起调。
+
+
+
 ## Phase 1：firefly_explorer（自主探索节点）
 
 ### 目标

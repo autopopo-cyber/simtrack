@@ -102,6 +102,7 @@ Nav2         ──→ navigation_launch: costmap + NavFn planner + DWB controll
 | slam_toolbox 吃 MuJoCo 激光建图 | ✅ 19.7×19.8m, 74.7% free, 回环正确 |
 | Nav2 单目标导航 | ✅ (1.5,1.5)→(5.0,1.5) SUCCEEDED |
 | Nav2 整圈航点导航 | **5/7 SUCCEEDED**（详见下表） |
+| **firefly_explorer 自主探索** | ✅ **frontier 234→23（~90%），4 次到达 / 2 次优雅失败，最长 18.5m** |
 
 ### 5.3 航点导航详情
 
@@ -143,6 +144,12 @@ ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
 # 4. 航点整圈（可选）
 nohup bash ~/simtrack/run_loop.sh > /dev/null 2>&1 &
 cat ~/simtrack/loop_result.txt   # 查结果
+
+# 5. 自主探索（firefly_explorer，无需给航点）
+#    ⚠️ 远程 tmux 里 python3 被 hermes-venv 抢走（无 numpy），必须显式用 /usr/bin/python3
+#    远程已放启动器 ~/simtrack/run_firefly.sh（内容：source ROS; cd ~/simtrack; exec /usr/bin/python3 -m simtrack.firefly_explorer）
+tmux new-window -t sim -n firefly "bash ~/simtrack/run_firefly.sh"
+tmux capture-pane -t sim:firefly -p   # 看选 frontier / 到达 / 拉黑 日志
 ```
 
 ### 干净重启（清残留进程）
