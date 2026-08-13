@@ -58,6 +58,7 @@ class FireflyExplorer(Node):
 
         # ── 状态 ──
         self.state = self.IDLE
+        self._completed = False   # 探索是否已完成（完成后不再每帧重判，避免日志刷屏）
         self.latest_map = None
         self.blacklist = []          # [(wx, wy)] 失败区域中心（世界坐标）
         self.current_goal = None     # (wx, wy) 当前导航目标
@@ -90,11 +91,15 @@ class FireflyExplorer(Node):
     # ════════════════════════════════════════════
     def _map_cb(self, msg: OccupancyGrid):
         self.latest_map = msg
+        if self._completed:
+            return   # 已完成，不再每帧重判（否则日志被"探索结束"刷屏）
         if self.state == self.IDLE:
             self._try_explore()
 
     def _try_explore(self):
         if self.latest_map is None:
+            return
+        if self._completed:
             return
         if not self.nav.wait_for_server(timeout_sec=1.0):
             self.get_logger().warn("Nav2 navigate_to_pose 未就绪，等待…", throttle_duration_sec=5.0)
@@ -106,6 +111,7 @@ class FireflyExplorer(Node):
 
         frontiers = self._detect_frontiers(self.latest_map)
         if not frontiers:
+            self._completed = True
             self.get_logger().info(
                 "✅ 无 frontier —— 探索完成！(sent=%d ok=%d fail=%d)"
                 % (self._stats["sent"], self._stats["ok"], self._stats["fail"]))
@@ -113,6 +119,7 @@ class FireflyExplorer(Node):
 
         target = self._pick_best(frontiers, robot)
         if target is None:
+            self._completed = True
             self.get_logger().info(
                 "所有 frontier 已拉黑，探索结束。(sent=%d ok=%d fail=%d)"
                 % (self._stats["sent"], self._stats["ok"], self._stats["fail"]))
