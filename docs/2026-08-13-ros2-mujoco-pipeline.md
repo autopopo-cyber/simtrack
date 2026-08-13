@@ -1,7 +1,9 @@
 # ROS2 + MuJoCo 导航管线 —— 2026-08-13
 
 > 里程碑：用自己写的 MuJoCo 仿真后端完全替代 Gazebo，接通 slam_toolbox + Nav2 标准栈。
-> 全链路验证通过：建图 + 自主导航（5/7 航点到达）。
+> 全链路验证通过：建图 + 自主导航（5/7 航点到达）→ firefly 自主探索（frontier 234→23）→
+> rooms5x5 传统房间迷宫（Nav2 穿 1.5m 门、自主探完）→ 走终点演示。
+> 本地一键可视化：`watch_firefly.bat`（日志）/ `save_map.bat`（地图 png）/ `record_sim.bat`（MuJoCo 3D 录像 mp4）。
 
 ## 一、背景与决策
 
@@ -147,10 +149,46 @@ cat ~/simtrack/loop_result.txt   # 查结果
 
 # 5. 自主探索（firefly_explorer，无需给航点）
 #    ⚠️ 远程 tmux 里 python3 被 hermes-venv 抢走（无 numpy），必须显式用 /usr/bin/python3
-#    远程已放启动器 ~/simtrack/run_firefly.sh（内容：source ROS; cd ~/simtrack; exec /usr/bin/python3 -m simtrack.firefly_explorer）
+#    远程已放启动器 run_sim.sh / run_slam.sh / run_nav2.sh / run_firefly.sh / run_goal.sh
+#    （都 source ROS + exec /usr/bin/python3，避开 hermes-venv + tmux 嵌套引号两个坑）
 tmux new-window -t sim -n firefly "bash ~/simtrack/run_firefly.sh"
 tmux capture-pane -t sim:firefly -p   # 看选 frontier / 到达 / 拉黑 日志
 ```
+
+### 选迷宫（MAZE 环境变量）
+
+`sim_bridge` 启动时读 `MAZE` 环境变量选迷宫，文件 `confirmed/maze_<name>.png`：
+
+```bash
+# rooms5x5 传统房间迷宫（5×5 房间，3m/间，1.5m 门）—— 压测穿门
+tmux new-session -d -s sim -n bridge "MAZE=rooms5x5 bash ~/simtrack/run_sim.sh"
+# loop20 旧版绕方块回环（默认）
+tmux new-session -d -s sim -n bridge "MAZE=loop20 bash ~/simtrack/run_sim.sh"
+# 生成新迷宫/换种子（本地或远程）：python -m simtrack.maze_gen rooms5x5 7
+```
+> 切迷宫要全套重启（bridge 回起点 + slam 重置地图 + nav2 重置 costmap），干净重启见下。
+
+### 走终点演示（rooms5x5，先让 firefly 把地图探全再发终点 goal）
+
+```bash
+# 1) firefly 跑到地图探全（frontier 探完），停掉它
+tmux kill-window -t sim:firefly
+# 2) 发终点 goal 到右上角房间中心 (13.5,13.5)
+tmux new-window -t sim -n navgoal "bash ~/simtrack/run_goal.sh 13.5 13.5"
+# 3) 录像（本地 Windows）：双击 record_sim.bat，或 record_sim.bat 65 10 rooms5x5
+```
+
+### 本地可视化工具箱（Windows 双击 bat，自动 SSH 远程）
+
+| bat | 作用 |
+|---|---|
+| `watch_firefly.bat` | 实时滚动看 firefly 探索日志 + 统计（解析 sent=/ok=/fail= 行） |
+| `save_map.bat` | 抓 slam 的 /map 渲染成彩色 png（白free/黑墙/灰未知）自动打开 |
+| `record_sim.bat` | 录 MuJoCo 3D 俯视画面为 mp4 下载播放。参数 `[秒] [fps] [maze]`，默认 60/10/rooms5x5 |
+
+> record_sim 原理：远程订阅 /odom 拿狗位姿 → EGL 离屏渲染（`MUJOCO_GL=egl`，无头可用）→
+> PNG 序列 → ffmpeg 合成 mp4 → 下载。**仿真独立全速跑、不受渲染拖慢**；要更快可降 fps。
+> 录长导航再压成短视频：`ffmpeg -i src.mp4 -filter:v setpts=0.46*PTS -r 30 out.mp4`（≈2x 快放）。
 
 ### 干净重启（清残留进程）
 
@@ -183,6 +221,19 @@ sleep 2; ros2 daemon stop; sleep 1; ros2 daemon start
 6. **base_footprint vs base_frame** → slam_toolbox 要 `base_footprint`，Nav2 要 `base_link` → 加静态 TF `base_footprint→base_link`
 7. **sim_bridge 不用 use_sim_time** → 用 wall-clock 时间戳，避免 /clock 同步问题（sim_time 版导致 slam "Failed to compute odom pose"）
 8. **碰撞检测** → sim_server 加 5 点足印检查，碰墙停（之前 contype=0 无碰撞，探索脚本把狗开出迷宫 80m）
+9. **转向不检碰撞 → 死锁** → 旧 `step()` 只在平移检碰撞、转向随便转。机器狗靠墙一转身，胶囊足印尖被甩进墙，
+   之后任何平移都因足印点仍在墙内被拦 → 永久卡死（"卡在墙里、碰撞没效果"的根因之一）。
+   修：转向也检碰撞（新朝向进墙则拒转）；平移改成"只在自由态→碰墙时拦"，已卡住时放行让它脱困。
+10. **机器狗渲染位置叠加 → "一开始就卡墙"真根因** → 狗是关节体（slide x/y+hinge yaw），MuJoCo 里
+    关节体世界位姿 = `body.pos + qpos`。record_sim/sim_server 都把 `body.pos` 设成起点又把 `qpos` 设成起点
+    → 视觉叠加成 2× 起点（(1.5,1.5)→(3,3)=墙角），看着像"一开始就卡墙里"。逻辑没坏（碰撞/扫描读 self.x，
+    不走 MuJoCo 位姿），只是画面错。修：`body.pos` 置零，让 qpos 当绝对世界坐标。
+11. **远程 tmux 里 python3 被 hermes-venv 抢走** → 该 venv 没装 numpy，`python3 -m simtrack.*` 直接
+    `ModuleNotFoundError: numpy`。sim_bridge 不受影响（只靠 rclpy via ROS PYTHONPATH），但 firefly/record_sim
+    要 numpy。修：所有启动器显式 `/usr/bin/python3`（system + ~/.local 都有 numpy）。另：tmux new-window
+    里嵌 `bash -lc "..."` 引号会被吃掉，改用 `run_*.sh` 启动器脚本彻底避开。
+12. **rooms5x5 px_per_m 算错** → 旧 `sim_server` 写死 `px_per_m = hf_w // 20`（按 20m 宽），rooms5x5(15m/750px)
+    会算成 37px/m，射线尺度全错。修：改为参数 `px_per_m=50`（maze_gen 统一）。
 
 ## 八、已否决 / 超越的旧方案
 
