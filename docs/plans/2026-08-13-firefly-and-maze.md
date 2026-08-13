@@ -141,6 +141,30 @@ NavigateToPose action → Nav2 规划+控制 → /cmd_vel → sim_bridge → MuJ
 更真实的迷宫环境——不只是"绕一个方块"，而是有房间、死胡同、窄缝、多路径。
 用于压测 Nav2 在复杂场景下的表现。
 
+### ✅ 2.0 完成：rooms5x5 传统房间迷宫（2026-08-13）
+
+`maze_gen.py` 重构为多迷宫（`MAZES` 字典 + CLI `python -m simtrack.maze_gen rooms5x5 [seed]`），
+新增 `gen_rooms_grid()`：
+
+- 5×5 房间，每间 3×3m（总 15×15m），门宽 1.5m（居中于 3m 墙段）。
+- 随机 DFS 生成树 → **保证全连通 + 起点(0,0)→终点(4,4) 有路**；`extra_prob=0.08` 额外开门
+  造少量环路 → 留下死胡同（seed=7 得 4 个 1 门死胡同）。
+- 每个房间 1~4 扇门（生成树保证 ≥1）。BFS 校验连通性 + 打印起点→终点路径。
+- 输出高度图 `confirmed/maze_rooms5x5.png` + 人眼核对图 `_annot.png`（标 S/G/门数）。
+
+**sim 适配（关键 bug 修复）**：
+- `sim_server.py` 原 `px_per_m = hf_w // 20` 硬编码 20m 宽 → rooms5x5(15m/750px) 会算成 37px/m，
+  射线尺度全错。改为参数 `px_per_m=50`（maze_gen 统一）。
+- `sim_bridge.py` 加 `MAZE` 环境变量选迷宫（`confirmed/maze_<name>.png`），启动：
+  `MAZE=rooms5x5 bash ~/simtrack/run_sim.sh`。
+- 迷宫文件命名统一为 `maze_<name>.png`（旧 `maze20.png` → `maze_loop20.png`）。
+
+**实测（rooms5x5，firefly 自主探索）**：
+- Nav2 **能穿过 1.5m 门**（"Reached the goal!"/"Goal succeeded"），机器人在房间网格里逐间探索。
+- firefly 连续到达多个房间：(7.0,9.7)→(7.2,7.6)→(7.1,13.8)→(4.2,7.2)→(10.9,14.0)…，单段最长 9.6m。
+- 修了一个 busy-loop bug：机器人在某 frontier 正上方时(distance≈0)，Nav2 秒成功→重选同点→
+  0.5s 内刷 15 行。修复：`_pick_best` 跳过离机器人 < `min_goal_dist`(0.35m) 的 frontier。
+
 ### maze_gen.py 扩展方案
 
 当前 maze_gen.py 是**数据驱动**的（墙段列表），扩展只需加更多 WALLS 条目。

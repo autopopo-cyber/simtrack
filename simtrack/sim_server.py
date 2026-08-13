@@ -39,28 +39,30 @@ class SimBackend:
 
     def __init__(self, maze_path=None, start=(1.5, 1.5, 0.0),
                  lidar_rays=360, lidar_fov_deg=360, lidar_range=15.0,
-                 timestep=0.005, use_mujoco_viewer=False):
+                 timestep=0.005, use_mujoco_viewer=False, px_per_m=50):
         """
         Args:
-            maze_path: 高度图 PNG 路径（默认 confirmed/maze20.png）
+            maze_path: 高度图 PNG 路径（默认 confirmed/maze_loop20.png）
             start: (x, y, yaw) 起点位姿
             lidar_rays: 射线数（360 = 1°间隔）
             lidar_fov_deg: 视场角（360=全向，180=前半圆）
             lidar_range: 最大探测距离 (m)
             timestep: 物理步长 (s)
             use_mujoco_viewer: 自测用，开 MuJoCo 窗口
+            px_per_m: 高度图分辨率（像素/米），maze_gen 统一 50。不再从图宽硬算，
+                      否则非 20m 宽的迷宫（如 rooms5x5=15m）会算错射线尺度。
         """
         # ── 路径 ──
         proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if maze_path is None:
-            maze_path = os.path.join(proj, "confirmed", "maze20.png")
+            maze_path = os.path.join(proj, "confirmed", "maze_loop20.png")
         self.maze_path = maze_path
 
         # ── 加载高度图（射线用）──
         hf = np.array(Image.open(maze_path))
         self._hf_bin = hf != 128           # True = 墙
         self.hf_h, self.hf_w = hf.shape    # 图像尺寸（像素）
-        self.px_per_m = self.hf_w // 20    # 1000/20 = 50 px/m
+        self.px_per_m = px_per_m           # 50 px/m（maze_gen 统一），不再 hf_w//20
         self.scan_step = 1.0 / self.px_per_m  # 0.02m = 1 像素
 
         # ── 雷达参数 ──

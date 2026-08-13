@@ -51,13 +51,23 @@ class SimBridge(Node):
         self.get_logger().info("sim_bridge starting…")
 
         # ── SimBackend ──
+        # 迷宫由环境变量 MAZE 选择（loop20 / rooms5x5），文件名 confirmed/maze_<name>.png
+        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        maze_name = os.environ.get("MAZE", "loop20")
+        maze_path = os.path.join(proj, "confirmed", "maze_%s.png" % maze_name)
+        if not os.path.exists(maze_path):
+            self.get_logger().warn("MAZE=%s 的文件 %s 不存在，回退 maze_loop20.png"
+                                   % (maze_name, maze_path))
+            maze_path = os.path.join(proj, "confirmed", "maze_loop20.png")
         self.sim = SimBackend(
+            maze_path=maze_path,
             start=(1.5, 1.5, 0.0),
             lidar_rays=360,
             lidar_fov_deg=360,
             lidar_range=15.0,
             timestep=0.01,   # 100Hz 物理
             use_mujoco_viewer=False,
+            px_per_m=50,
         )
         self.physics_dt = 0.01
         self.sim_time = 0.0          # 仿真秒（从 0 开始）

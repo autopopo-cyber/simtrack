@@ -6,96 +6,307 @@ maze_gen.py — 为 MuJoCo + ROS2 SLAM/Nav2 生成干净的迷宫高度图。
   世界系：x 向右, y 向上, 原点 (0,0) = 迷宫左下角
   图像系：col = x * PX_PER_M,  row = (MAZE_H - y) * PX_PER_M
           （row 0 = 图像顶部 = 世界 y 最大处，标准图像约定）
-  起点在 (1.5, 1.5) 朝 +x，靠近原点，无偏移混乱。
 
-输出：
-  confirmed/maze20.png   — 高度图 PNG（road=128, wall=255）
-  MuJoCo hfield 直接引用此文件（value=高度，255=高墙 128=地面）
+输出（每种迷宫一组）：
+  confirmed/maze_<name>.png   — 高度图（road=128, wall=255），MuJoCo hfield 引用
+  confirmed/maze_<name>_annot.png — 彩色标注图（仅供人眼核对，不给 MuJoCo）
 
-用法：python -m simtrack.maze_gen
+用法：
+  python -m simtrack.maze_gen loop20            # 旧版绕方块回环（默认）
+  python -m simtrack.maze_gen rooms5x5          # 5x5 房间网格迷宫（seed=42）
+  python -m simtrack.maze_gen rooms5x5 7        # 指定 seed
 """
 import os
+import sys
+import random
+from collections import deque
+
 import numpy as np
 from PIL import Image, ImageDraw
 
-# ── 迷宫参数 ──
-MAZE_W = 20.0          # 宽 (m), x ∈ [0, 20]
-MAZE_H = 20.0          # 高 (m), y ∈ [0, 20]
-PX_PER_M = 50          # 分辨率：2cm/像素 → 1000×1000（雷达步进 0.02m，够精细）
-WALL_T = 0.3           # 墙厚 (m)，雷达清晰可见、狗（0.4m 宽）过不去
-ROAD_VAL = 128         # 地面像素值（MuJoCo hfield 中等高度）
-WALL_VAL = 255         # 墙像素值（MuJoCo hfield 最高）
-START = (1.5, 1.5)     # 起点世界坐标（左下角内侧）
-START_YAW = 0.0        # 起点朝向（弧度，0=朝+x）
-
-IMG_W = int(MAZE_W * PX_PER_M)
-IMG_H = int(MAZE_H * PX_PER_M)
-
-# ── 墙段定义：((x1,y1), (x2,y2)) 世界坐标 ──
-# 设计目标：有拐角（SLAM 特征）、有回路（回环修正）、走廊宽 ≥3m（狗/Nav2 舒适）
-WALLS = [
-    # 外边界
-    ((0, 0), (MAZE_W, 0)),
-    ((MAZE_W, 0), (MAZE_W, MAZE_H)),
-    ((MAZE_W, MAZE_H), (0, MAZE_H)),
-    ((0, MAZE_H), (0, 0)),
-    # 内部墙——创造回路 + 房间
-    # 中央方块（绕一圈走 = 回环）
-    ((6, 6), (14, 6)),
-    ((14, 6), (14, 14)),
-    ((14, 14), (6, 14)),
-    ((6, 14), (6, 6)),
-    # 外圈走廊中的隔断（增加特征，不完全封死）
-    ((3, 3), (3, 10)),       # 左下竖墙（上方留口 → 走廊连通）
-    ((17, 10), (17, 17)),    # 右上竖墙（下方留口）
-]
+# ── 全局渲染参数 ──
+PX_PER_M = 50          # 分辨率：2cm/像素
+WALL_T = 0.3           # 墙厚 (m)
+ROAD_VAL = 128         # 地面像素值
+WALL_VAL = 255         # 墙像素值
 
 
-def world_to_pixel(x, y):
-    """世界坐标 → 图像像素 (col, row)。"""
+# ══════════════════════════════════════════════
+# 迷宫定义：每个 gen_*() 返回 dict
+#   walls: [((x1,y1),(x2,y2)), ...] 世界坐标墙段
+#   w, h: 迷宫宽高 (m)
+#   start: (x, y) 起点世界坐标
+#   start_yaw: 起点朝向 (rad)
+#   goal: (x, y) 终点世界坐标 或 None
+#   info: dict 额外信息（房间图、门等，可选）
+# ══════════════════════════════════════════════
+def gen_loop20():
+    """旧版：20×20m，绕中央方块走一圈的回环迷宫。"""
+    W = H = 20.0
+    return {
+        "walls": [
+            ((0, 0), (W, 0)), ((W, 0), (W, H)),
+            ((W, H), (0, H)), ((0, H), (0, 0)),
+            ((6, 6), (14, 6)), ((14, 6), (14, 14)),
+            ((14, 14), (6, 14)), ((6, 14), (6, 6)),
+            ((3, 3), (3, 10)), ((17, 10), (17, 17)),
+        ],
+        "w": W, "h": H,
+        "start": (1.5, 1.5), "start_yaw": 0.0, "goal": None,
+        "info": {},
+    }
+
+
+def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18, seed=42):
+    """网格房间迷宫：rows×cols 个 room×room 的房间，相邻房间间的墙上有门(宽 door_w)。
+
+    生成保证：
+      - 随机 DFS 生成树 → 所有房间全连通（每个房间至少 1 扇门）。
+      - 额外按 extra_prob 给非树相邻对开门 → 形成环路/死胡同，
+        所以不是所有房间都在 起点→终点 的直路上（但仍可达，因为全连通）。
+      - 起点=(0,0) 左下房间中心，终点=(rows-1,cols-1) 右上房间中心，生成树保证连通。
+
+    房间 (r,c) 占据世界 x∈[c*room, c*room+room], y∈[r*room, r*room+room]
+      （r=row 向上增 y，c=col 向右增 x）。
+    """
+    rnd = random.Random(seed)
+    R, C = rows, cols
+
+    def nbrs(r, c):
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < R and 0 <= nc < C:
+                yield (nr, nc)
+
+    # ── 随机 DFS 生成树（迭代，避免深递归）──
+    start_room = (0, 0)
+    visited = {start_room}
+    tree = set()        # frozenset({a,b})
+    stack = [start_room]
+    while stack:
+        r, c = stack[-1]
+        cand = [n for n in nbrs(r, c) if n not in visited]
+        if not cand:
+            stack.pop()
+            continue
+        nxt = rnd.choice(cand)
+        tree.add(frozenset({(r, c), nxt}))
+        visited.add(nxt)
+        stack.append(nxt)
+    assert len(visited) == R * C, "生成树未覆盖所有房间"
+
+    # ── 额外门（环路）──
+    all_adj = set()
+    for r in range(R):
+        for c in range(C):
+            for n in nbrs(r, c):
+                all_adj.add(frozenset({(r, c), n}))
+    doors = set(tree)
+    for e in all_adj:
+        if e not in tree and rnd.random() < extra_prob:
+            doors.add(e)
+
+    # ── 房间邻接图（用于校验 + info）──
+    adj = {(r, c): set() for r in range(R) for c in range(C)}
+    for e in doors:
+        a, b = tuple(e)
+        adj[a].add(b)
+        adj[b].add(a)
+    door_count = {rc: len(adj[rc]) for rc in adj}
+
+    # ── 渲染墙段：每条内部墙，有门则中间留 door_w 缺口，否则整墙 ──
+    walls = _rooms_to_walls(R, C, room, door_w, doors)
+    W, H = C * room, R * room
+    goal_room = (R - 1, C - 1)
+
+    return {
+        "walls": walls,
+        "w": W, "h": H,
+        "start": (room / 2, room / 2),                       # 房间(0,0)中心
+        "start_yaw": 0.0,
+        "goal": (goal_room[1] * room + room / 2,
+                 goal_room[0] * room + room / 2),            # 右上房间中心
+        "info": {
+            "rows": R, "cols": C, "room": room, "door_w": door_w,
+            "doors": doors, "adj": adj, "door_count": door_count,
+            "start_room": start_room, "goal_room": goal_room,
+        },
+    }
+
+
+def _rooms_to_walls(R, C, room, door_w, doors):
+    """把房间-门图转成世界坐标墙段列表。门居中于 3m 墙段，宽 door_w。"""
+    walls = []
+    half = door_w / 2.0
+    # 水平内墙 y=r*room（隔开 row r-1 与 r），r∈[1,R-1]
+    for r in range(1, R):
+        for c in range(C):
+            y = r * room
+            x0, x1 = c * room, c * room + room
+            if frozenset({(r - 1, c), (r, c)}) in doors:
+                walls.append(((x0, y), (x0 + half, y)))
+                walls.append(((x1 - half, y), (x1, y)))
+            else:
+                walls.append(((x0, y), (x1, y)))
+    # 竖直内墙 x=c*room（隔开 col c-1 与 c），c∈[1,C-1]
+    for c in range(1, C):
+        for r in range(R):
+            x = c * room
+            y0, y1 = r * room, r * room + room
+            if frozenset({(r, c - 1), (r, c)}) in doors:
+                walls.append(((x, y0), (x, y0 + half)))
+                walls.append(((x, y1 - half), (x, y1)))
+            else:
+                walls.append(((x, y0), (x, y1)))
+    # 外边界（整墙无门）
+    walls.append(((0, 0), (C * room, 0)))
+    walls.append(((C * room, 0), (C * room, R * room)))
+    walls.append(((C * room, R * room), (0, R * room)))
+    walls.append(((0, R * room), (0, 0)))
+    return walls
+
+
+# ══════════════════════════════════════════════
+# 渲染
+# ══════════════════════════════════════════════
+def _wp(x, y, maze_h):
+    """世界 → 像素 (col, row)。"""
     col = int(x * PX_PER_M)
-    row = IMG_H - 1 - int(y * PX_PER_M)
+    row = int(maze_h * PX_PER_M) - 1 - int(y * PX_PER_M)
     return col, row
 
 
-def generate():
-    """生成高度图 numpy 数组 (IMG_H, IMG_W)，road=128, wall=255。"""
-    img = Image.new("L", (IMG_W, IMG_H), ROAD_VAL)  # 全地面
+def render_heightfield(maze):
+    """生成高度图 numpy 数组，road=128, wall=255。"""
+    W, H = maze["w"], maze["h"]
+    img_w, img_h = int(W * PX_PER_M), int(H * PX_PER_M)
+    img = Image.new("L", (img_w, img_h), ROAD_VAL)
     draw = ImageDraw.Draw(img)
-    wt_px = max(1, int(WALL_T * PX_PER_M))  # 墙厚像素
-
-    for (x1, y1), (x2, y2) in WALLS:
-        c1, r1 = world_to_pixel(x1, y1)
-        c2, r2 = world_to_pixel(x2, y2)
-        # ImageDraw.line 的 width 是居中加粗；用矩形更精确
-        if x1 == x2:  # 竖墙
-            c = c1
-            draw.rectangle([c - wt_px // 2, min(r1, r2),
-                             c + wt_px // 2, max(r1, r2)], fill=WALL_VAL)
-        elif y1 == y2:  # 横墙
-            r = r1
-            draw.rectangle([min(c1, c2), r - wt_px // 2,
-                             max(c1, c2), r + wt_px // 2], fill=WALL_VAL)
+    wt = max(1, int(WALL_T * PX_PER_M))
+    for (x1, y1), (x2, y2) in maze["walls"]:
+        c1, r1 = _wp(x1, y1, H)
+        c2, r2 = _wp(x2, y2, H)
+        if x1 == x2:      # 竖墙
+            draw.rectangle([c1 - wt // 2, min(r1, r2), c1 + wt // 2, max(r1, r2)], fill=WALL_VAL)
+        elif y1 == y2:    # 横墙
+            draw.rectangle([min(c1, c2), r1 - wt // 2, max(c1, c2), r1 + wt // 2], fill=WALL_VAL)
         else:
-            draw.line([c1, r1, c2, r2], fill=WALL_VAL, width=wt_px)
-
-    arr = np.array(img)
-    return arr
+            draw.line([c1, r1, c2, r2], fill=WALL_VAL, width=wt)
+    return np.array(img)
 
 
-def save(arr, path):
-    """保存高度图 PNG。"""
+def render_annotated(maze):
+    """彩色标注图（人眼核对用）：墙=深灰，门缺口高亮，起点绿/终点红，房间标门数。"""
+    W, H = maze["w"], maze["h"]
+    img_w, img_h = int(W * PX_PER_M), int(H * PX_PER_M)
+    img = Image.new("RGB", (img_w, img_h), (235, 235, 235))
+    draw = ImageDraw.Draw(img)
+    wt = max(2, int(WALL_T * PX_PER_M))
+    for (x1, y1), (x2, y2) in maze["walls"]:
+        c1, r1 = _wp(x1, y1, H)
+        c2, r2 = _wp(x2, y2, H)
+        if x1 == x2:
+            draw.rectangle([c1 - wt // 2, min(r1, r2), c1 + wt // 2, max(r1, r2)], fill=(50, 50, 50))
+        elif y1 == y2:
+            draw.rectangle([min(c1, c2), r1 - wt // 2, max(c1, c2), r1 + wt // 2], fill=(50, 50, 50))
+        else:
+            draw.line([c1, r1, c2, r2], fill=(50, 50, 50), width=wt)
+    info = maze.get("info") or {}
+    if "door_count" in info:
+        room = info["room"]
+        for (r, c), n in info["door_count"].items():
+            cx, cy = c * room + room / 2, r * room + room / 2
+            pc, pr = _wp(cx, cy, H)
+            tag = "S" if (r, c) == info["start_room"] else ("G" if (r, c) == info["goal_room"] else str(n))
+            color = (40, 160, 40) if tag == "S" else ((200, 40, 40) if tag == "G" else (20, 20, 20))
+            draw.ellipse([pc - 14, pr - 14, pc + 14, pr + 14], outline=color, width=2)
+            draw.text((pc - 5, pr - 8), tag, fill=color)
+    return np.array(img)
+
+
+# ══════════════════════════════════════════════
+# 校验：BFS 确认起点→终点连通 + 打印门数分布
+# ══════════════════════════════════════════════
+def verify(maze):
+    info = maze.get("info") or {}
+    if "adj" not in info:
+        print("  (无房间图，跳过校验)")
+        return
+    adj = info["adj"]
+    s, g = info["start_room"], info["goal_room"]
+    # BFS 全图（不提前 break，否则连通性统计会少算房间）
+    prev = {s: None}
+    q = deque([s])
+    while q:
+        cur = q.popleft()
+        for n in adj[cur]:
+            if n not in prev:
+                prev[n] = cur
+                q.append(n)
+    if g not in prev:
+        print("  ❌ 起点{} 到不了 终点{}！".format(s, g))
+        return
+    path = []
+    cur = g
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    # 全连通校验
+    reach = set(prev) | {g}
+    print("  房间数 {} | 起点{}→终点{} 路径长 {} 步: {}".format(
+        len(adj), s, g, len(path) - 1, "→".join(str(p) for p in path)))
+    print("  全连通: {} (可达 {} 个房间)".format(len(reach) == len(adj), len(reach)))
+    dc = info["door_count"]
+    dist = {}
+    for n in dc.values():
+        dist[n] = dist.get(n, 0) + 1
+    print("  每房间门数分布(门数:房间数): {}".format(
+        " ".join("{}:{}".format(k, dist[k]) for k in sorted(dist))))
+
+
+def save_heightfield(arr, path, maze):
     Image.fromarray(arr).save(path)
     wall_pct = 100.0 * (arr == WALL_VAL).sum() / arr.size
-    print(f"  生成: {path}  {arr.shape[1]}×{arr.shape[0]}px  "
-          f"墙{wall_pct:.1f}%  分辨率{PX_PER_M}px/m({1000/PX_PER_M:.0f}mm/px)")
-    print(f"  迷宫: {MAZE_W}×{MAZE_H}m  起点: ({START[0]}, {START[1]}) 朝{START_YAW}rad")
-    print(f"  坐标系: 原点(0,0)=左下角, x→右 y→上")
+    print("  高度图: {}  {}×{}px  墙{:.1f}%  {}px/m".format(
+        path, arr.shape[1], arr.shape[0], wall_pct, PX_PER_M))
+    print("  迷宫: {}×{}m  起点:{} 朝{}rad  终点:{}".format(
+        maze["w"], maze["h"], tuple(round(v, 1) for v in maze["start"]),
+        maze["start_yaw"], tuple(round(v, 1) for v in maze["goal"]) if maze["goal"] else None))
+
+
+MAZES = {
+    "loop20": gen_loop20,
+    "rooms5x5": lambda seed=42: gen_rooms_grid(5, 5, 3.0, 1.5, 0.08, seed),
+}
+
+
+def main():
+    args = sys.argv[1:]
+    name = args[0] if args else "loop20"
+    if name == "loop20":
+        maze = gen_loop20()
+    elif name.startswith("rooms"):
+        seed = int(args[1]) if len(args) > 1 else 42
+        maze = MAZES["rooms5x5"](seed)
+    elif name in MAZES:
+        maze = MAZES[name]()
+    else:
+        print("未知迷宫:", name, "可选: loop20, rooms5x5 [seed]")
+        sys.exit(1)
+
+    out_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "confirmed"))
+    os.makedirs(out_dir, exist_ok=True)
+    hf_path = os.path.join(out_dir, "maze_%s.png" % name)
+    ann_path = os.path.join(out_dir, "maze_%s_annot.png" % name)
+
+    print("== 迷宫 %s ==" % name)
+    verify(maze)
+    arr = render_heightfield(maze)
+    save_heightfield(arr, hf_path, maze)
+    Image.fromarray(render_annotated(maze)).save(ann_path)
+    print("  标注图:", ann_path)
 
 
 if __name__ == "__main__":
-    out = os.path.join(os.path.dirname(__file__), "..", "confirmed", "maze20.png")
-    out = os.path.normpath(out)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    arr = generate()
-    save(arr, out)
+    main()

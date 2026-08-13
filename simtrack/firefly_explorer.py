@@ -47,6 +47,7 @@ class FireflyExplorer(Node):
         self.declare_parameter("nav_timeout", 90.0)     # 单点导航超时（s）
         self.declare_parameter("blacklist_r", 2.5)      # 失败区域拉黑半径（m）
         self.declare_parameter("dist_weight", 0.15)     # 距离项权重（越大越偏近）
+        self.declare_parameter("min_goal_dist", 0.35)   # 离机器人太近(<此值)的 frontier 跳过：机器人在它上面时 Nav2 秒成功→重选→忙循环
         self.declare_parameter("wall_clear_cells", 1)   # 开阔判定：未知邻居的 ±N 格内无墙（slam_toolbox 0.05m/格，1=0.05m 轻过滤；0=纯 Yamauchi）
 
         self.min_cluster = self.get_parameter("min_cluster").value
@@ -54,6 +55,7 @@ class FireflyExplorer(Node):
         self.nav_timeout = self.get_parameter("nav_timeout").value
         self.blacklist_r = self.get_parameter("blacklist_r").value
         self.dist_weight = self.get_parameter("dist_weight").value
+        self.min_goal_dist = self.get_parameter("min_goal_dist").value
         self.wall_clear_cells = self.get_parameter("wall_clear_cells").value
 
         # ── 状态 ──
@@ -228,8 +230,10 @@ class FireflyExplorer(Node):
         for f in frontiers:
             if self._is_blacklisted(f["wx"], f["wy"]):
                 continue
-            d = math.hypot(f["wx"] - rx, f["wy"] - ry) + 1e-3
-            score = f["size"] - self.dist_weight * d
+            d = math.hypot(f["wx"] - rx, f["wy"] - ry)
+            if d < self.min_goal_dist:
+                continue   # 机器人就在这 frontier 上：Nav2 秒成功→重选→忙循环，跳过
+            score = f["size"] - self.dist_weight * (d + 1e-3)
             if score > best_score:
                 best_score = score; best = f
         return best
