@@ -159,7 +159,7 @@ class VisionLandmark:
                 continue
             for i, marker_id in enumerate(ids.flatten()):
                 idx = int(marker_id)
-                if idx >= 30 or idx not in self._pos_map():
+                if idx >= 30 or idx not in self._pos_map():   # aruco PNG 仅 00-29；idx10-29=中间锚点
                     continue
                 if idx in step_ids:   # 本步已记录，跳过（多尺度去重）
                     continue

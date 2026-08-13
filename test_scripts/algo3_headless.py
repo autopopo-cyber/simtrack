@@ -19,6 +19,7 @@ import mujoco
 # 地标标牌系统（30 个 ArUco+数字标牌）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from test_scripts.landmarks import landmark_xml, landmark_positions, BOT_Z, wall_xml, HF_SURF
+import test_scripts.landmarks as _landmarks_mod   # 为设 QR_SPACING 全局（密集锚点）
 from simtrack.obstacles_random import RandomObstacleField, mix_bend_positions
 from simtrack.algorithms.dwa import DWAAlgorithm
 from simtrack.odometry import Odometry
@@ -102,6 +103,9 @@ ap.add_argument("--seed", type=int, default=None, help="随机种子（默认随
 ap.add_argument("--max-steps", type=int, default=300000, help="最大步数上限")
 ap.add_argument("--render-every", type=int, default=200, help="离屏渲染间隔（步）")
 ap.add_argument("--out-dir", type=str, default="/tmp/firefly_frames", help="渲染帧输出目录")
+ap.add_argument("--viewer", type=int, default=0, help="1=开实时 MuJoCo 窗口（跟随相机看狗跑，优先于离屏 PNG 渲染）")
+ap.add_argument("--cam-elevation", type=float, default=-75.0, help="相机俯角(度)：MuJoCo 负值=俯视，-75=75°俯视(较陡)，-90=正俯视，-60=较平。默认-75")
+ap.add_argument("--qr-spacing", type=float, default=0.0, help="中间锚点二维码间距(米,0=关)：>0 时每通道沿中心线加密二维码(idx10-29)作密集绝对锚点，降沿走廊漂移。真实环境等效=自然视觉特征/SLAM")
 ap.add_argument("--timeout", type=float, default=900, help="墙钟超时（秒）")
 ap.add_argument("--save-name", type=str, default="", help="成绩单文件名（默认 auto）")
 ap.add_argument("--save-map", type=str, default="", help="跑完保存地图到文件 (npz)")
@@ -132,6 +136,9 @@ ap.add_argument("--obs-feature", type=int, default=0, help="1=长直道特征障
 ap.add_argument("--dwa-truth-vel", type=int, default=0, help="⚠️A/B 调试：DWA 障碍速度用真值 velocities（作弊，仅用于隔离跟踪器 bug——审核整改后默认 0=感知跟踪估计）")
 ap.add_argument("--pass-clear", type=float, default=-1, help="规划净空(m)：通行宽<2×此值的窄缝封闭（默认用 PASS_CLEAR_M=0.6；0=关闭门宽度判断，回退旧行为做 A/B）")
 args = ap.parse_args()
+
+# 密集锚点二维码间距（须在 landmark_positions() 首次调用前设）
+_landmarks_mod.QR_SPACING[0] = args.qr_spacing
 
 if args.pass_clear >= 0:
     PASS_CLEAR_M = args.pass_clear
@@ -566,6 +573,11 @@ MATCH_RANGE = 8.0   # scan-matching 只用 ≤8m 近距命中点（远处位姿�
 _in_init_scan = [False]   # 初始自旋期间禁匹配（地图空 + 每帧转 18° 超出搜索窗）
 _STORM = [False]   # 保留位：风暴隔离机制已实测否决并移除（冻结会切断射线清除自救通道，
                    # 见踩坑文档 16.6）——恒 False，代码里留的隔离门全部惰性
+# 漂移检测状态（2026-08-13 P0-4 调研）：_align_ema = scan-matching identity 分 EMA。
+# 注：纯墙场景 identity 恒≈1.0（自洽漂移，地图与扫描一起漂），此值对纯墙无信号；
+# 仅在有特征障碍/转弯破坏自洽时才反映真实对齐。保留供后续/特征场诊断用。
+_align_ema = [1.0]
+_lost_scan = [0]
 
 def scan(cast_x, cast_y, cast_yaw, est_x=None, est_y=None, est_yaw=None):
     """前方 FOV 扇形扫描（相对狗 yaw）——无特权：只感知狗能看到的物理真实。
@@ -670,11 +682,18 @@ def scan(cast_x, cast_y, cast_yaw, est_x=None, est_y=None, est_yaw=None):
                 _wdil = cv2.dilate((PG == WALL).astype(np.uint8),
                                    np.ones((3, 3), np.uint8))
                 _corr = matcher.match(_mpts, est_x, est_y, _wdil)
+                # P0-4 漂移失控检测：跟踪 identity 对齐分（当前激光帧在估计位姿贴地图墙的程度）
+                _align_ema[0] += (matcher.last_identity - _align_ema[0]) * 0.3
                 if _corr is not None:
                     _dxm, _dym, _dam, _msc = _corr
                     odom.x += _dxm; odom.y += _dym
                     odom.yaw = (odom.yaw + _dam + math.pi) % (2 * math.pi) - math.pi
                     est_x += _dxm; est_y += _dym; est_yaw = odom.yaw
+                    _lost_scan[0] = 0    # 窄窗修正成功 = 漂移在窗内，不迷失
+                else:
+                    _lost_scan[0] += 1
+                    # 注：宽窗重定位(CSM式)对【纯墙自洽漂移】无效——identity=1.0 即使漂移2m
+                    # （地图与扫描一起漂，匹配看不到）。仅 QR 绝对锚点/特征障碍可破。保留窄窗修正。
 
         # ── 写图坐标系：估计系（狗以为自己在哪里，点云就放在哪里）──
         if odom is not None:
@@ -1754,32 +1773,36 @@ mujoco.mj_forward(m,d)
 os.makedirs(args.out_dir, exist_ok=True)
 renderer = None
 RENDER_OK = False
-try:
-    from mujoco import egl
-    _ctx = egl.GLContext(640, 360)
-    _ctx.make_current()
-    renderer = mujoco.Renderer(m, 360, 640)   # 2026-08-09 性能：1280×720→640×360（mjr_render 30→~8ms/帧）
-    RENDER_OK = True
-    print("  [RENDER] EGL 离屏渲染 OK", flush=True)
-except Exception as e:
+# --viewer 1 时跳过离屏渲染初始化（避免与 viewer 原生窗口的 GL 上下文冲突）；此时看实时窗口即可
+if not args.viewer:
     try:
-        import glfw
-        glfw.init()
-        glfw.window_hint(glfw.VISIBLE, 0)
-        _glfw_win = glfw.create_window(640, 360, "offscreen", None, None)
-        glfw.make_context_current(_glfw_win)
-        renderer = mujoco.Renderer(m, 360, 640)
+        from mujoco import egl
+        _ctx = egl.GLContext(640, 360)
+        _ctx.make_current()
+        renderer = mujoco.Renderer(m, 360, 640)   # 2026-08-09 性能：1280×720→640×360（mjr_render 30→~8ms/帧）
         RENDER_OK = True
-        print(f"  [RENDER] GLFW 离屏渲染 OK（EGL 不可用: {e}）", flush=True)
-    except Exception as e2:
-        print(f"  [RENDER] 离屏渲染不可用: EGL={e} GLFW={e2}", flush=True)
+        print("  [RENDER] EGL 离屏渲染 OK", flush=True)
+    except Exception as e:
+        try:
+            import glfw
+            glfw.init()
+            glfw.window_hint(glfw.VISIBLE, 0)
+            _glfw_win = glfw.create_window(640, 360, "offscreen", None, None)
+            glfw.make_context_current(_glfw_win)
+            renderer = mujoco.Renderer(m, 360, 640)
+            RENDER_OK = True
+            print(f"  [RENDER] GLFW 离屏渲染 OK（EGL 不可用: {e}）", flush=True)
+        except Exception as e2:
+            print(f"  [RENDER] 离屏渲染不可用: EGL={e} GLFW={e2}", flush=True)
+else:
+    print("  [RENDER] viewer 模式：跳过离屏渲染（用实时窗口）", flush=True)
 
-# 俯视相机（--cam-elevation 控制俯角；MuJoCo elevation 负值=俯视，-60 = 上方60°）
+# 俯视相机（--cam-elevation 控制俯角；MuJoCo elevation 负值=俯视，-75=75°俯视，-90=正俯视）
 _cam = None
-CAM_ELEVATION = -60.0
+CAM_ELEVATION = args.cam_elevation
 
-def render_frame(step):
-    """离屏渲染当前帧保存 PNG（俯视 60° 跟随狗）"""
+def render_frame(step, idx):
+    """离屏渲染当前帧保存 PNG（俯视 60° 跟随狗）。idx=连续序号(供 ffmpeg %06d 序列拼接，避开 render_every 间隔)"""
     if renderer is None:
         return
     global _cam
@@ -1793,9 +1816,56 @@ def render_frame(step):
         _cam.lookat[:] = np.array([d.qpos[0], d.qpos[1], 1.0], dtype=np.float64)
         renderer.update_scene(d, _cam)
         img = renderer.render()
-        Image.fromarray(img).save(os.path.join(args.out_dir, f"frame_{step:06d}.png"))
+        Image.fromarray(img).save(os.path.join(args.out_dir, f"frame_{idx:06d}.png"))
     except Exception as e:
         print(f"  [RENDER-ERR] {e}", flush=True)  # 不静默吞渲染失败
+
+def render_map_frame(step, idx):
+    """2D 俯视【感知地图】诊断帧（与 3D 跟随相机互补——3D 看物理行为，本帧看狗"脑内"的地图）。
+    idx=连续序号(供 ffmpeg %06d 序列拼接)。
+    画 G(感知栅格: unknown 灰/free 白/wall 黑) + SG 静态层(蓝灰) + 轨迹(淡蓝) + 终点(绿圈) +
+    二维码(黄块) + 【估计位姿(蓝框) vs 真值位姿(绿点) + 漂移红线】。
+    漂移红线长度=当前 odom 漂移；墙画歪的位置=幻影墙。视觉定位楔入/迷路根因用。
+    保存 map_{step:06d}.png 到 out_dir（与 frame_*.png 同目录）。"""
+    try:
+        from PIL import ImageDraw
+        img = np.full((GRID_N, GRID_N, 3), 40, dtype=np.uint8)       # UNKNOWN=深灰
+        img[G == FREE] = (225, 225, 225)                              # FREE=近白
+        img[G == WALL] = (25, 25, 25)                                 # 感知墙=黑
+        _sgw = (SG == WALL)
+        if _sgw.any():
+            img[_sgw] = (70, 70, 100)                                 # 静态层墙=蓝灰（区分 live/static）
+        # 显示：transpose 让 axis0=y、[::-1] 翻 y 朝上 → 世界 x→右、y→上
+        disp = Image.fromarray(img.transpose(1, 0, 2)[::-1]).convert("RGB")
+        draw = ImageDraw.Draw(disp)
+        def w2p(wx, wy):   # 世界(m) → PIL 像素 (col=x, row=y上)
+            return (int(wx / VOXEL), GRID_N - 1 - int(wy / VOXEL))
+        # 轨迹（淡蓝折线，抽样防过密）
+        if len(trail) > 2:
+            stride = max(1, len(trail) // 600)
+            pts = [w2p(t[1], t[2]) for t in trail[::stride]]
+            for i in range(len(pts) - 1):
+                draw.line([pts[i], pts[i + 1]], fill=(90, 150, 210), width=1)
+        # 终点球（绿色双圈）
+        pf = w2p(*FINISH)
+        draw.ellipse([pf[0] - 7, pf[1] - 7, pf[0] + 7, pf[1] + 7], outline=(40, 210, 40), width=2)
+        # 二维码标牌（黄方块）
+        try:
+            for lx, ly in landmark_positions()[:10]:
+                pp = w2p(lx, ly); draw.rectangle([pp[0] - 2, pp[1] - 2, pp[0] + 2, pp[1] + 2], fill=(225, 200, 0))
+        except Exception:
+            pass
+        # 估计位姿(蓝框) vs 真值位姿(绿点) + 漂移红线
+        if odom is not None:
+            pe = w2p(odom.x, odom.y); pt = w2p(d.qpos[0], d.qpos[1])
+            draw.line([pe, pt], fill=(225, 50, 50), width=2)          # 漂移连线
+            draw.rectangle([pe[0] - 5, pe[1] - 5, pe[0] + 5, pe[1] + 5], outline=(50, 90, 230), width=2)  # 估计
+            draw.ellipse([pt[0] - 3, pt[1] - 3, pt[0] + 3, pt[1] + 3], fill=(50, 210, 50))               # 真值
+            _dr = math.hypot(d.qpos[0] - odom.x, d.qpos[1] - odom.y)
+            draw.text((6, 4), f"step {step}  drift {_dr:.2f}m  bounce {mv.bounce}", fill=(255, 255, 255))
+        disp.save(os.path.join(args.out_dir, f"map_{idx:06d}.png"))
+    except Exception as e:
+        print(f"  [MAP-RENDER-ERR] {e}", flush=True)
 
 mv = Mover(m, d)
 # 里程计（--odom 1，2026-08-12 起默认）：决策/建图只用带噪估计位姿；真值 d.qpos 只用于物理/碰撞/统计。
@@ -1952,7 +2022,26 @@ print(f"  [OK] FREE={_count(FREE)} WALL={_count(WALL)}", flush=True)
 frame_idx = 0
 trail = []          # 轨迹记录：每 trail-every 步存 (step, x, y, yaw, bounce)
 bounce_pts = []     # bounce 位置（分析卡点用）
+
+# 实时 MuJoCo 窗口（--viewer 1）：弹窗跟随相机看狗跑，优先于离屏 PNG（用户要看画面）
+viewer = None
+if args.viewer:
+    import mujoco.viewer as _mjviewer
+    viewer = _mjviewer.launch_passive(m, d)
+    try:
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        viewer.cam.azimuth = 90.0       # 与离屏 _cam 一致：从 +y 看，通道横向展示
+        viewer.cam.elevation = CAM_ELEVATION
+        viewer.cam.distance = 18.0
+        viewer.cam.lookat[:] = [d.qpos[0], d.qpos[1], 1.0]
+    except Exception as _e:
+        print(f"  [VIEWER] 相机设置跳过: {_e}", flush=True)
+    print("  [VIEWER] 实时窗口已开（跟随相机）—— 关窗口或到时长即结束", flush=True)
+
 while step < args.max_steps and time.time() - t0 < args.timeout:
+    if viewer is not None and not viewer.is_running():
+        print("  [VIEWER] 窗口已关闭，结束仿真", flush=True)
+        break
     bx, by = d.qpos[0], d.qpos[1]   # 真值（仅物理/碰撞/统计/轨迹用）
     if odom is not None:
         # 里程计模式：积分上一步运动（带噪声），决策/建图/避障全用估计位姿
@@ -2034,9 +2123,13 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
                     if 5.0 <= _gd <= 25.0:
                         _w = max(0.2, min(0.8, 1.5 / max(_gd, 1.0)))   # 越近越可信
                         odom.correct(_ex, _ey, _w)
+                        # QR 绝对修正 = 知道自己在哪 → 复位漂移失控状态（P0-4）
+                        _lost_scan[0] = 0
+                        _align_ema[0] = max(_align_ema[0], 0.6)
                         # 朝向修正：标牌近似正面（|bearing|<15°）→ 狗绝对方位 ≈ 标牌朝向反方向+bearing
                         # （偶通道标牌朝 -x、奇通道朝 +x——标牌朝向是环境先验）
-                        if abs(_gb) < 0.26:
+                        # 仅端墙标牌(idx<10)；中间锚点(idx10+)只做位置修正（朝向 parity 不适用）
+                        if abs(_gb) < 0.26 and _gidx < 10:
                             _exp_wb = 0.0 if (_gidx % 2 == 0 or _gidx == 9) else math.pi   # ch9 标牌改贴右墙（球遮挡），朝向同偶通道
                             _yaw_est = _exp_wb + _gb
                             _dyaw = (_yaw_est - odom.yaw + math.pi) % (2*math.pi) - math.pi
@@ -2638,7 +2731,17 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
 
     # 离屏渲染
     if RENDER_OK and args.render_every > 0 and step % args.render_every == 0:
-        render_frame(step)
+        render_frame(step, frame_idx)
+        render_map_frame(step, frame_idx)   # 2D 感知地图诊断帧（漂移/幻影墙可视化）
+        frame_idx += 1
+
+    # 实时窗口跟随相机刷新（每步：相机锁定狗真值位姿 + sync 推最新状态）
+    if viewer is not None:
+        try:
+            viewer.cam.lookat[:] = [d.qpos[0], d.qpos[1], 1.0]
+            viewer.sync()
+        except Exception:
+            pass
 
     # 进度日志
     if step % 20000 == 0:
@@ -2647,6 +2750,9 @@ while step < args.max_steps and time.time() - t0 < args.timeout:
         print(f"  ... step={step} F={_count(FREE)} W={_count(WALL)} ms={len(milestones)} cov={cov:.1f}% t={time.time()-t0:.0f}s pos=({d.qpos[0]:.1f},{d.qpos[1]:.1f}) yaw={math.degrees(d.qpos[2]):.0f}°{_drift}", flush=True)
 
 # ── 收尾统计 ──
+if viewer is not None:
+    try: viewer.close()
+    except Exception: pass
 stats["steps"] = step
 stats["time_sec"] = round(time.time() - t0, 2)
 stats["bounces"] = mv.bounce
@@ -2684,7 +2790,8 @@ stats["wall_cells"] = _count(WALL)
 stats["mode"] = EXPLORE_MODE
 
 if RENDER_OK:
-    render_frame(step)  # 最后帧
+    render_frame(step, frame_idx)  # 最后帧
+    render_map_frame(step, frame_idx)
 
 save_state()
 

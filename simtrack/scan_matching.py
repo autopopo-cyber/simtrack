@@ -38,6 +38,8 @@ class ScanMatcher:
         self.max_dyaw = math.radians(max_dyaw_deg)  # 单次角度修正限幅 (rad)
         self.matches = 0            # 尝试次数
         self.corrections = 0        # 实际修正次数
+        self.last_identity = 1.0    # 最近一次零偏移对齐分（漂移检测用，1=完美对齐）
+        self.last_best = 1.0        # 最近一次最优偏移对齐分
 
     def match(self, pts, ox, oy, wall_dil):
         """求位姿修正量。
@@ -100,6 +102,10 @@ class ScanMatcher:
         # ── 采纳门控：得分可信 且 显著优于零偏移（1%）──
         # （零偏移优先 = 长直道退化方向防噪声拖动；细网格 0.1m 让真实小误差可被表达——
         #   粗 0.2m 网格会把 <0.1m 的漂移挡在采纳门外，实测修正率 4.5% 压不住漂）
+        # last_identity = 零偏移对齐分（当前激光帧在估计位姿处贴地图墙的程度）。
+        # 持续低 = 漂移已超匹配窗（P0-4 漂移失控检测信号）——每次 match 都更新，供调用方 EMA 跟踪。
+        self.last_identity = zero_score
+        self.last_best = best_score
         if best_score < self.min_score or best_score - zero_score < 0.01:
             return None
         dx, dy, da = best

@@ -44,29 +44,47 @@ BOT_Z = HF_SURF + 0.5
 # 贴墙参数：凸出横墙面 0.3m（路牌式，避免嵌进 box 墙）
 WALL_X_OFF = 0.3
 
+# 中间锚点二维码间距（米，0=关）：>0 时每通道沿中心线按此间距加浮空二维码(idx 10-29)，
+# 作为长直道的密集绝对锚点（破纯墙沿走廊方向漂移不可观测）。contype=0 不挡路、lidar 不检测。
+# algo3 由 --qr-spacing 设置。真实环境等效物=自然视觉特征/SLAM。
+QR_SPACING = [0.0]
+
 def landmark_positions():
-    """返回 10 个标牌的 (idx, ch, side, wx, wy, wz, quat)。
+    """返回标牌列表 (idx, ch, side, wx, wy, wz, quat)。
     2026-08-09 贴墙版（主人指令）：标牌贴**端头边界墙**（x≈0/50），法线沿通道，
     狗从通道另一端 40m 外正对可见；不再立在路中间（旧版 x=45.8/4.2 悬在通道中心，
     虽然 contype=0 不挡路，但碍眼且 ch9 背景板曾挡终点球视线）。
     配合方角弯道地图（scripts/gen_square_maze.py）：转弯区无斜墙遮挡，
     贴墙标牌全程视线通畅。y 保持通道中心线（2m 码不能贴 y 向分界墙——会嵌墙只显示一半）。
+    2026-08-13 QR_SPACING>0：每通道加中间浮空二维码（密集锚点，降沿走廊漂移）。
     """
     out = []
+    _next_idx = [10]   # 中间二维码 idx 从 10 起（aruco PNG 仅 00-29；idx10-29=中间锚点）
     for ch in range(10):
         y_center = 2.5 + ch * 5.0    # 通道中心线
         if ch == 9:
-            # 特例：ch9 终点球 (2.5,47.5) 与左墙标牌共线——球 R=1.5 在任何距离都完全
-            # 遮挡 2m 标牌（球更近，角直径恒大）→ 左墙标牌永远看不到。
-            # 改贴右墙 x=49.85（法线 -x）：狗在 ch8 直行 (+x) 时标牌在前方偏左
-            # 18-30° 可见（水平半 FOV 36°），ch8 全程 15-30m 距离稳定识别。
             out.append((ch, ch, 1, 49.85, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+            _face_side, _x_end, _xdir = 1, 49.85, -1   # ch9 也朝 -x（同偶通道）
         elif ch % 2 == 0:
             # 偶通道（朝 +x）：终点 x=50，标牌贴右端墙 x=49.85，法线 -x
             out.append((ch, ch, 1, 49.85, y_center, LM_CENTER_Z, "0.7071 0 -0.7071 0"))
+            _face_side, _x_end, _xdir = 1, 49.85, -1
         else:
             # 奇通道（朝 -x）：终点 x=0，标牌贴左端墙 x=0.15，法线 +x
             out.append((ch, ch, 0, 0.15, y_center, LM_CENTER_Z, "0.7071 0 0.7071 0"))
+            _face_side, _x_end, _xdir = 0, 0.15, +1
+        # 中间锚点（沿通道每隔 QR_SPACING 米加一个，idx 10-29，与端墙标牌同朝向）
+        sp = QR_SPACING[0]
+        if sp > 0:
+            _quat = "0.7071 0 -0.7071 0" if _face_side == 1 else "0.7071 0 0.7071 0"
+            k = 1
+            while _next_idx[0] < 30:
+                _mx = _x_end + _xdir * sp * k
+                if _mx < 5.0 or _mx > 45.0:
+                    break    # 离转弯口 ≥5m，不堵转弯、不嵌端墙
+                out.append((_next_idx[0], ch, _face_side, _mx, y_center, LM_CENTER_Z, _quat))
+                _next_idx[0] += 1
+                k += 1
     return out
 
 def wall_xml():
