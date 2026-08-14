@@ -13,11 +13,16 @@ maze_gen.py — 为 MuJoCo + ROS2 SLAM/Nav2 生成干净的迷宫高度图。
 
 用法：
   python -m simtrack.maze_gen loop20            # 旧版绕方块回环（默认）
-  python -m simtrack.maze_gen rooms5x5          # 5x5 房间网格迷宫（seed=42）
-  python -m simtrack.maze_gen rooms5x5 7        # 指定 seed
+  python -m simtrack.maze_gen rooms5x5          # 5x5 房间 3m×3m（seed=42）
+  python -m simtrack.maze_gen rooms10x10        # 10x10 房间 5m×5m
+  python -m simtrack.maze_gen rooms10x10 7      # 指定 seed
+
+输出还会写 maze_<name>.meta.json（start/goal/尺寸）——sim_bridge 读它决定机器狗起点，
+所以不同房间尺寸的迷宫起点会自动正确（3m房→(1.5,1.5)，5m房→(2.5,2.5)）。
 """
 import os
 import sys
+import json
 import random
 from collections import deque
 
@@ -135,7 +140,12 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18, seed=4
 
 
 def _rooms_to_walls(R, C, room, door_w, doors):
-    """把房间-门图转成世界坐标墙段列表。门居中于 3m 墙段，宽 door_w。"""
+    """把房间-门图转成世界坐标墙段列表。门居中于墙段，缺口宽=door_w。
+
+    注意：缺口必须是 door_w 宽（不是 room-door_w）。旧实现把 half 当墙端桩长，
+    导致缺口=room-door_w——room=3,door_w=1.5 时碰巧=1.5m 蒙混过关，
+    但 room=5,door_w=1.5 会变成 3.5m 大洞。现改为居中留 door_w 缺口。
+    """
     walls = []
     half = door_w / 2.0
     # 水平内墙 y=r*room（隔开 row r-1 与 r），r∈[1,R-1]
@@ -144,8 +154,9 @@ def _rooms_to_walls(R, C, room, door_w, doors):
             y = r * room
             x0, x1 = c * room, c * room + room
             if frozenset({(r - 1, c), (r, c)}) in doors:
-                walls.append(((x0, y), (x0 + half, y)))
-                walls.append(((x1 - half, y), (x1, y)))
+                cx = (x0 + x1) / 2.0
+                walls.append(((x0, y), (cx - half, y)))
+                walls.append(((cx + half, y), (x1, y)))
             else:
                 walls.append(((x0, y), (x1, y)))
     # 竖直内墙 x=c*room（隔开 col c-1 与 c），c∈[1,C-1]
@@ -154,8 +165,9 @@ def _rooms_to_walls(R, C, room, door_w, doors):
             x = c * room
             y0, y1 = r * room, r * room + room
             if frozenset({(r, c - 1), (r, c)}) in doors:
-                walls.append(((x, y0), (x, y0 + half)))
-                walls.append(((x, y1 - half), (x, y1)))
+                cy = (y0 + y1) / 2.0
+                walls.append(((x, y0), (x, cy - half)))
+                walls.append(((x, cy + half), (x, y1)))
             else:
                 walls.append(((x, y0), (x, y1)))
     # 外边界（整墙无门）
@@ -276,29 +288,41 @@ def save_heightfield(arr, path, maze):
 
 
 MAZES = {
-    "loop20": gen_loop20,
+    "loop20": lambda seed=42: gen_loop20(),
     "rooms5x5": lambda seed=42: gen_rooms_grid(5, 5, 3.0, 1.5, 0.08, seed),
+    "rooms10x10": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 1.5, 0.08, seed),
 }
+
+
+def save_meta(maze, path):
+    """写迷宫元数据 sidecar：sim_bridge 读它决定机器狗起点（不同房间尺寸起点不同）。"""
+    meta = {
+        "start": [float(maze["start"][0]), float(maze["start"][1])],
+        "start_yaw": float(maze["start_yaw"]),
+        "goal": [float(maze["goal"][0]), float(maze["goal"][1])] if maze["goal"] else None,
+        "w": float(maze["w"]), "h": float(maze["h"]),
+    }
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print("  元数据: {}  start={} goal={}".format(
+        path, tuple(round(v, 1) for v in meta["start"]),
+        tuple(round(v, 1) for v in meta["goal"]) if meta["goal"] else None))
 
 
 def main():
     args = sys.argv[1:]
     name = args[0] if args else "loop20"
-    if name == "loop20":
-        maze = gen_loop20()
-    elif name.startswith("rooms"):
-        seed = int(args[1]) if len(args) > 1 else 42
-        maze = MAZES["rooms5x5"](seed)
-    elif name in MAZES:
-        maze = MAZES[name]()
-    else:
-        print("未知迷宫:", name, "可选: loop20, rooms5x5 [seed]")
+    if name not in MAZES:
+        print("未知迷宫:", name, "可选:", ", ".join(sorted(MAZES)))
         sys.exit(1)
+    seed = int(args[1]) if len(args) > 1 else 42
+    maze = MAZES[name](seed)
 
     out_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "confirmed"))
     os.makedirs(out_dir, exist_ok=True)
     hf_path = os.path.join(out_dir, "maze_%s.png" % name)
     ann_path = os.path.join(out_dir, "maze_%s_annot.png" % name)
+    meta_path = os.path.join(out_dir, "maze_%s.meta.json" % name)
 
     print("== 迷宫 %s ==" % name)
     verify(maze)
@@ -306,6 +330,7 @@ def main():
     save_heightfield(arr, hf_path, maze)
     Image.fromarray(render_annotated(maze)).save(ann_path)
     print("  标注图:", ann_path)
+    save_meta(maze, meta_path)
 
 
 if __name__ == "__main__":
