@@ -62,7 +62,8 @@ def gen_loop20():
     }
 
 
-def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18, seed=42):
+def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18,
+                   wall_jitter=0.0, seed=42):
     """网格房间迷宫：rows×cols 个 room×room 的房间，相邻房间间的墙上有门(宽 door_w)。
 
     生成保证：
@@ -70,12 +71,18 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18, seed=4
       - 额外按 extra_prob 给非树相邻对开门 → 形成环路/死胡同，
         所以不是所有房间都在 起点→终点 的直路上（但仍可达，因为全连通）。
       - 起点=(0,0) 左下房间中心，终点=(rows-1,cols-1) 右上房间中心，生成树保证连通。
+      - wall_jitter>0：9 排横墙/9 排纵墙**每排整体**±wall_jitter 随机抖动（边界固定），
+        → 每个房间长宽/位置都不同，**破掉 4 重旋转对称**，让 scan matching/回环不再
+        被对称歧义卡死。抖动是"整排线"抖（不是逐段），保证网格仍连贯、墙角无缝。
 
-    房间 (r,c) 占据世界 x∈[c*room, c*room+room], y∈[r*room, r*room+room]
-      （r=row 向上增 y，c=col 向右增 x）。
+    房间 (r,c) 占据四边形 (X[c],Y[r])-(X[c+1],Y[r+1])，X/Y 为（可能抖动的）网格线。
     """
     rnd = random.Random(seed)
     R, C = rows, cols
+
+    # 网格线位置（边界固定 0 和 C*room/R*room；内部线 ±wall_jitter 随机抖动）
+    X = [0.0] + [c * room + rnd.uniform(-wall_jitter, wall_jitter) for c in range(1, C)] + [C * room]
+    Y = [0.0] + [r * room + rnd.uniform(-wall_jitter, wall_jitter) for r in range(1, R)] + [R * room]
 
     def nbrs(r, c):
         for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -119,62 +126,63 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18, seed=4
         adj[b].add(a)
     door_count = {rc: len(adj[rc]) for rc in adj}
 
-    # ── 渲染墙段：每条内部墙，有门则中间留 door_w 缺口，否则整墙 ──
-    walls = _rooms_to_walls(R, C, room, door_w, doors)
+    # ── 渲染墙段：每条内部墙，有门则中间留 door_w 缺口，否则整墙（用抖动网格线 X/Y）──
+    walls = _rooms_to_walls(R, C, X, Y, door_w, doors)
     W, H = C * room, R * room
     goal_room = (R - 1, C - 1)
+    # 房间中心用抖动后的网格线（保证落在 free 空间、不在墙上）
+    cx0, cy0 = (X[0] + X[1]) / 2.0, (Y[0] + Y[1]) / 2.0              # 房间(0,0)中心
+    cgx, cgy = (X[C - 1] + X[C]) / 2.0, (Y[R - 1] + Y[R]) / 2.0      # 右上房间中心
 
     return {
         "walls": walls,
         "w": W, "h": H,
-        "start": (room / 2, room / 2),                       # 房间(0,0)中心
+        "start": (cx0, cy0),
         "start_yaw": 0.0,
-        "goal": (goal_room[1] * room + room / 2,
-                 goal_room[0] * room + room / 2),            # 右上房间中心
+        "goal": (cgx, cgy),
         "info": {
-            "rows": R, "cols": C, "room": room, "door_w": door_w,
+            "rows": R, "cols": C, "room": room, "door_w": door_w, "wall_jitter": wall_jitter,
             "doors": doors, "adj": adj, "door_count": door_count,
             "start_room": start_room, "goal_room": goal_room,
         },
     }
 
 
-def _rooms_to_walls(R, C, room, door_w, doors):
-    """把房间-门图转成世界坐标墙段列表。门居中于墙段，缺口宽=door_w。
+def _rooms_to_walls(R, C, X, Y, door_w, doors):
+    """把房间-门图转成世界坐标墙段列表（用抖动网格线 X[0..C], Y[0..R]）。
 
-    注意：缺口必须是 door_w 宽（不是 room-door_w）。旧实现把 half 当墙端桩长，
-    导致缺口=room-door_w——room=3,door_w=1.5 时碰巧=1.5m 蒙混过关，
-    但 room=5,door_w=1.5 会变成 3.5m 大洞。现改为居中留 door_w 缺口。
+    门居中于墙段，缺口宽=door_w。每排墙整排在一条网格线上（X[c] 或 Y[r]），
+    所以抖动是"整排"抖——网格仍连贯、墙角无缝、每房间形状各异（破对称）。
     """
     walls = []
     half = door_w / 2.0
-    # 水平内墙 y=r*room（隔开 row r-1 与 r），r∈[1,R-1]
+    # 水平内墙在 Y[r]（隔开 row r-1 与 r），r∈[1,R-1]，每段 X[c]→X[c+1]
     for r in range(1, R):
         for c in range(C):
-            y = r * room
-            x0, x1 = c * room, c * room + room
+            y = Y[r]
+            x0, x1 = X[c], X[c + 1]
             if frozenset({(r - 1, c), (r, c)}) in doors:
                 cx = (x0 + x1) / 2.0
                 walls.append(((x0, y), (cx - half, y)))
                 walls.append(((cx + half, y), (x1, y)))
             else:
                 walls.append(((x0, y), (x1, y)))
-    # 竖直内墙 x=c*room（隔开 col c-1 与 c），c∈[1,C-1]
+    # 竖直内墙在 X[c]（隔开 col c-1 与 c），c∈[1,C-1]，每段 Y[r]→Y[r+1]
     for c in range(1, C):
         for r in range(R):
-            x = c * room
-            y0, y1 = r * room, r * room + room
+            x = X[c]
+            y0, y1 = Y[r], Y[r + 1]
             if frozenset({(r, c - 1), (r, c)}) in doors:
                 cy = (y0 + y1) / 2.0
                 walls.append(((x, y0), (x, cy - half)))
                 walls.append(((x, cy + half), (x, y1)))
             else:
                 walls.append(((x, y0), (x, y1)))
-    # 外边界（整墙无门）
-    walls.append(((0, 0), (C * room, 0)))
-    walls.append(((C * room, 0), (C * room, R * room)))
-    walls.append(((C * room, R * room), (0, R * room)))
-    walls.append(((0, R * room), (0, 0)))
+    # 外边界（整墙无门，边界网格线固定）
+    walls.append(((X[0], Y[0]), (X[C], Y[0])))
+    walls.append(((X[C], Y[0]), (X[C], Y[R])))
+    walls.append(((X[C], Y[R]), (X[0], Y[R])))
+    walls.append(((X[0], Y[R]), (X[0], Y[0])))
     return walls
 
 
@@ -289,8 +297,8 @@ def save_heightfield(arr, path, maze):
 
 MAZES = {
     "loop20": lambda seed=42: gen_loop20(),
-    "rooms5x5": lambda seed=42: gen_rooms_grid(5, 5, 3.0, 1.5, 0.08, seed),
-    "rooms10x10": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 1.5, 0.08, seed),
+    "rooms5x5": lambda seed=42: gen_rooms_grid(5, 5, 3.0, 1.5, 0.08, 0.0, seed),
+    "rooms10x10": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 1.5, 0.08, 0.5, seed),
 }
 
 
