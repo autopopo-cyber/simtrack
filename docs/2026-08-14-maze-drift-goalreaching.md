@@ -154,3 +154,42 @@ python scripts/analyze_drift.py _traj.csv    # 出 _traj.png + _error.png + 统�
 - tmux 80 列折行会截断日志数字，抓取要 `grep -A3`。
 - `record_traj.py` 的 slam 列与 monitor 不一致（疑似 TF 时间戳问题）——本节数据以
   monitor 独立计算 + CSV odom 列为准，TODO 修复。
+
+## 九、真实雷达 L2 参数化重测：传感器变差，结果反而好 20 倍 ✅
+
+用户提供了 A2 实机雷达 spec（Unitree 4D LiDAR L2，前后双装）。对表：
+
+| L2 实参 | 仿真现状 → 本轮 |
+|---|---|
+| 10m@10%反射 / 30m@90% | 15m 硬编码 → **env `LIDAR_RANGE`，本轮 10（保守设计点）** |
+| ±3cm 精度 | 零噪声 → **env `LIDAR_NOISE_M`，本轮 0.03**（加在 get_scan 内，/scan 与修正匹配吃同一份噪声） |
+| 21,600点/s 有效（双装4.3万） | 360 rays@10Hz=3,600 → 保持（2D 切片带内密度同量级，保守） |
+| 96° 垂直 FOV（可见地面） | 平面 z=0.5 → **仿真盲区**：真机管线需 pointcloud→laserscan 的 z 带切片（建议 10–40cm 带高，含腿部碰撞高度） |
+| 内置 IMU + POINT-LIO | 5% 腿式漂移模型 → 真机常规层直接用 LIO 里程计（LIO 级 ~0.1–1% 行程）；5% 模型对应"LIO 故障降级"容灾层 |
+
+**实测（10m ±3cm + 同漂移抽签 scale1.027/yaw-0.05°/s + 30s 自建图修正，960s / 132m）**：
+
+| | 15m 无噪声（八，含墙边卡死 35min 损伤） | **10m ±3cm（九，A* 健康驱动）** |
+|---|---|---|
+| odom-真值 | mean 1.81 / max 1.98m | **mean 0.08 / max 0.52m** |
+| slam_err（末段） | ~1.87 | **0.01–0.02** |
+| 修正命中 | mean 266/360 | mean 303/360（噪声几乎不减命中：5cm 栅格+多视角墙厚吸收 ±3cm） |
+| yaw 修正 | mean 1.5°/次 | mean 1.6°/次（同样精确抵消零漂累积） |
+
+**结论（本轮最有价值的一课）**：传感器变差（量程-33%、加噪声），定位反而好 20 倍——
+**误差下限从来不是传感器，是暴露在退化几何下的时间**。八的 1.9m 形变出生于 35 分钟
+贴墙振荡期（走廊 y 轴不可观测 + 反复在同一退化段建图）；本轮 A* 路由成熟后狗 3 分钟
+穿 4 房、持续暴露在二维富几何环境，地图干净，修正把 odom 钉在干净图上 → 8cm。
+对策排序：**探索模式（避免退化几何长期暴露）> 修正频率 > 传感器参数**。
+
+**对真机的直接启示**：
+1. L2 的 POINT-LIO 让"无 IMU 最坏情况"基本不存在——周期重定位降级为容灾层；
+2. 探索策略要防"贴墙蹭"（我们的扇形兜底就犯这个错）——A* 连通推进是正解；
+3. 走廊/长直段是定位毒药，真机房间布局若多走廊，需靠回环重访补偿（或 UWB/视觉锚点）。
+
+**复现**：`MAZE=rooms10x10 ODOM_DRIFT_PCT=5 ODOM_DRIFT_YAW_BIAS_DEG=0.4 ODOM_DRIFT_SEED=42
+CORRECT_PERIOD_S=30 CORRECT_REF=map LIDAR_RANGE=10 LIDAR_NOISE_M=0.03 python -m simtrack.sim_bridge`
+（slam `max_laser_range` 无需改：slam_toolbox 取 min(参数, scan.range_max)，scan 头自带 10m）
+
+工程坑：tmux kill-session 杀不死 launch 的子进程树（旧 slam/nav2 残留双 /map 双 goal 竞争），
+重启栈必须 `pgrep` 确认 + 按 PID 补刀。

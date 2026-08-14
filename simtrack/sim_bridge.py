@@ -132,7 +132,10 @@ class SimBridge(Node):
             start=(sx, sy, syaw),
             lidar_rays=360,
             lidar_fov_deg=360,
-            lidar_range=15.0,
+            # 真实 Unitree L2（A2 前后双装）：10m@10%反射/30m@90%，精度±3cm。
+            # LIDAR_RANGE=10 + LIDAR_NOISE_M=0.03 = 保守设计点（暗面家具全场景）
+            lidar_range=float(os.environ.get("LIDAR_RANGE", "15.0")),
+            range_noise_m=float(os.environ.get("LIDAR_NOISE_M", "0.0")),
             timestep=0.01,   # 100Hz 物理
             use_mujoco_viewer=False,
             px_per_m=50,
@@ -173,7 +176,8 @@ class SimBridge(Node):
         self.get_logger().info(
             f"sim_bridge ready: maze={self.sim.hf_w}×{self.sim.hf_h}px "
             f"({self.sim.px_per_m}px/m), lidar={self.sim.lidar_rays}rays/"
-            f"{self.sim.lidar_range}m, physics={self.physics_dt}s"
+            f"{self.sim.lidar_range}m(noise±{self.sim.range_noise_m * 100:.0f}cm), "
+            f"physics={self.physics_dt}s"
         )
 
         # ── 里程计漂移（可选，足式机器人式）：env ODOM_DRIFT_PCT>0 开启 ──

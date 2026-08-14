@@ -39,6 +39,7 @@ class SimBackend:
 
     def __init__(self, maze_path=None, start=(1.5, 1.5, 0.0),
                  lidar_rays=360, lidar_fov_deg=360, lidar_range=15.0,
+                 range_noise_m=0.0,
                  timestep=0.005, use_mujoco_viewer=False, px_per_m=50):
         """
         Args:
@@ -46,7 +47,9 @@ class SimBackend:
             start: (x, y, yaw) 起点位姿
             lidar_rays: 射线数（360 = 1°间隔）
             lidar_fov_deg: 视场角（360=全向，180=前半圆）
-            lidar_range: 最大探测距离 (m)
+            lidar_range: 最大探测距离 (m)。真实 Unitree L2：10m@10%反射 / 30m@90%，
+                        保守设计点取 10（暗面家具只有 10m）；默认 15 是旧基线
+            range_noise_m: 测距噪声 std (m)。L2 精度 ±3cm → 0.03。默认 0（旧基线）
             timestep: 物理步长 (s)
             use_mujoco_viewer: 自测用，开 MuJoCo 窗口
             px_per_m: 高度图分辨率（像素/米），maze_gen 统一 50。不再从图宽硬算，
@@ -69,6 +72,8 @@ class SimBackend:
         self.lidar_rays = lidar_rays
         self.lidar_fov = math.radians(lidar_fov_deg)
         self.lidar_range = lidar_range
+        self.range_noise_m = range_noise_m
+        self._rng = np.random.default_rng(7)   # 噪声种子固定，实验可复现
         self._scan_k = np.arange(1, int(lidar_range / self.scan_step) + 1,
                                  dtype=np.float32) * self.scan_step
 
@@ -233,6 +238,12 @@ class SimBackend:
         ranges = np.where(has & inb[idx, np.minimum(first, S - 1)],
                           first.astype(np.float32) * self.scan_step,
                           np.float32(np.inf))
+        # 测距噪声（L2 ±3cm）：只加在有限命中值上；inf（未命中）不加。
+        # 加在 get_scan 内 → /scan 发布与 scan_match 修正吃同一份噪声（诚实）。
+        if self.range_noise_m > 0:
+            fin = np.isfinite(ranges)
+            noise = self._rng.normal(0.0, self.range_noise_m, ranges.shape).astype(np.float32)
+            ranges = np.where(fin, ranges + noise, ranges)
         return ranges, rel  # rel = 机身系角度
 
     def get_scan_polar(self):
