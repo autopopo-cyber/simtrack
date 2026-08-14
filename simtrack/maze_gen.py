@@ -299,6 +299,10 @@ MAZES = {
     "loop20": lambda seed=42: gen_loop20(),
     "rooms5x5": lambda seed=42: gen_rooms_grid(5, 5, 3.0, 1.5, 0.08, 0.0, seed),
     "rooms10x10": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 1.5, 0.08, 0.5, seed),
+    # 窄门变体：同 seed=42 → 同 DFS 拓扑/同门位 → goal_runner 航点表仍有效，只缩门宽。
+    # 狗足迹 0.8×0.4 胶囊：0.8m 门两侧各 0.2m 余量（舒服），0.6m 各 0.1m（极限）。
+    "rooms10x10n80": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 0.8, 0.08, 0.5, seed),
+    "rooms10x10n60": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 0.6, 0.08, 0.5, seed),
 }
 
 

@@ -1,8 +1,35 @@
-# simtrack — 机器狗 50m 蛇形迷宫导航
+# simtrack — 机器狗自主导航（ROS2 + MuJoCo 仿真 → Unitree A2 实机）
 
-> **核心索引** · 2026-08-12 无真值化整改更新（代码审核意见闭环：定位/障碍速度/经验墙去特权）
-> 项目：`~/workspace/simtrack/` · 分支：master（exp/dog-navigation 已合并）
-> 主战场：`test_scripts/algo3_headless.py`（萤火 Firefly v3 SLAM 导航）
+> **核心索引** · 2026-08-14 ROS2 栈时期 · 分支：`ros2-mujoco-pipeline`（v2.0-ros2-slam-nav）
+> 主战场：`simtrack/sim_bridge.py`（MuJoCo 仿真桥）+ slam_toolbox（建图定位）+ Nav2（规划控制）+ `goal_runner.py`（A* 连通推进）
+> **最终目标**：A2 进入未知屋子（<300㎡，随机房间，地面可能有障碍物），必要时通过 60–80cm 窄通道。
+
+## ★ 当前状态（2026-08-14）
+
+| 能力 | 实测结果 | 出处 |
+|---|---|---|
+| 建图+探索+导航 | 50×50m 迷宫（比目标难 8 倍）全链路自主走到终点区 | docs/2026-08-14-maze-drift-goalreaching.md |
+| 漂移上限（L2 真实参数 10m±3cm + 30s 自建图重定位） | odom-真值 **mean 0.08 / max 0.52m**（无 IMU 5% 漂移工况） | 同上 §九 |
+| 误差根因 | **不是传感器，是退化几何暴露时长**（走廊 1.9m vs 富几何房间 0.5m） | 同上 §八/九 |
+| 0.8m 窄门 | 通过中（首 4 分钟 3+ 扇零重试） | 迷宫 `rooms10x10n80` |
+| 待办 | 0.6m 极限门、地面障碍物（L2 96° 垂直 FOV 的 z 带切片）、真机集成（L2 UDP/POINT-LIO/EKF） | — |
+
+**远程常用命令**（详见 docs/2026-08-14-maze-drift-goalreaching.md §六/§九）：
+```bash
+# 仿真桥（L2 真实参数 + 漂移 + 30s 自建图重定位）
+MAZE=rooms10x10n80 ODOM_DRIFT_PCT=5 ODOM_DRIFT_YAW_BIAS_DEG=0.4 CORRECT_PERIOD_S=30 \
+CORRECT_REF=map LIDAR_RANGE=10 LIDAR_NOISE_M=0.03 /usr/bin/python3 -m simtrack.sim_bridge
+# 注意：远程交互 shell 的 python3 被 hermes-venv 劫持（无 numpy），必须 /usr/bin/python3
+# slam/nav2/explorer：run_slam.sh / run_nav2.sh / run_frontier.sh（configs/ 下调参版优先）
+```
+
+---
+
+# 以下为纯 Python 原型时期的历史文档（2026-08-12 及以前）
+
+> 时期的分界线：踩坑文档 §17 证明手写定位栈漂移天花板 ≈2m（scan-matching 对自洽漂移是瞎的），
+> 项目随即迁移 ROS2 标准栈。旧代码（algo3_headless.py 等）保留为历史参考与 A/B 基线，
+> 踩坑文档的教训全部仍然有效。docs/2026-08-13-ros2-mujoco-pipeline.md §八有被超越方案的清单。
 
 ---
 
