@@ -108,3 +108,49 @@ python scripts/analyze_drift.py _traj.csv    # 出 _traj.png + _error.png + 统�
 
 > 仍有的小工程点：scan_match 每次约 0.1-0.2s（在 rclpy 单线程里会短暂阻塞物理），30s 一次可接受；
 > 偶尔 scan-match 在局部弱特征处估偏一点点（slam_err 缓爬到 1.8m），但远好于不修正。
+
+## 八、去仿真特权：对"自建图"周期重定位（CORRECT_REF=map）✅
+
+七的修正匹配的是**真迷宫高度图**（仿真特权——真机没有真图）。本轮把参考图换成
+**slam_toolbox 自己建出来的 /map**：真机可复现的土法 AMCL。
+
+**实现**（commit 73e7a3d）：
+- `sim_bridge.py` env `CORRECT_REF=map`：订阅 /map（latched QoS）缓存墙格掩膜
+  （data≥65），每 30s 从**漂移 odom 位姿**出发（不读 slam TF、不读真值）做相关匹配
+  （粗±1.5m/±20° → 细±0.2m/±4°），得分<40 拒绝修正（建图不足区域不硬修）。
+- 行约定 no-flip（row 随 y 增）由 `scripts/probe_map_convention.py` 实测验证：
+  把激光端点按真值投影后 no-flip 命中 65/360 且匹配位姿距真值 0.36m，镜像约定 1%。
+- `goal_runner.py` `_route_step` A*（free=1/unknown=8/墙=∞，**地图数组外=unknown**）：
+  子目标取"从狗出发连续 free 段"末尾（前沿）。修三代死锁：原地等地图 → 扇形贴墙振荡
+  → BFS closest-to-waypoint 墙前鞍点。**NavFn 远目标穿大片 unknown 会"legal potential
+  found but no path"卡死，近距离 free 子目标免疫**——这对真机探索策略同样适用。
+
+**实测（无 IMU 5% 尺度+0.05°/s 偏航抽签 + 30s 对自建图修正，870s / 105.6m 行程）**：
+
+| | odom-真值 | 特征 |
+|---|---|---|
+| 不修正（此前同工况） | 8.5m 失控迷路 | 裸积分发散 |
+| 对真图修正（七，特权） | max 1.81 / mean 0.87m | 锚定真值 |
+| **对自建图修正（本轮）** | **max 1.98 / mean 1.81m，870s 无增长趋势** | **锚定自建图** |
+
+修正日志（59 条）机理证据：yaw 修正量 mean **1.5°/次 = 0.05°/s 偏置×30s 精确抵消**
+陀螺零漂累积；pos 修正 mean 0.11m×29 次 ≈ 3.2m（即不修正本会继续累积的量）；
+命中分 min 99 / mean 266，0 次拒绝。
+
+**诚实结论**：
+1. **有界性成立**（用户假设验证 ✓）：漂移不再无限积分，被钉在 ≤2m；即使参考图是
+   自己建的。反复经过已建图房间=重锚，机制与 MCL/AMCL 相同。
+2. **误差下限=地图局部变形**：mean 1.81 vs 特权版 0.87——修正把 odom 锚到地图系，
+   地图哪里变形 odom 就继承哪里。slam_err 在 0.5↔1.9m 间摆动（跳变分析：1.9m 全是
+   y 偏移，出现在狗沿 col0 南北走廊推进时，进入二维结构丰富房间后自恢复 0.57）——
+   **走廊沿轴不可观测**是根因，与旧 Python 代码的教训一致。破法=墙抖动破对称 +
+   多方向房间几何，不是纯算法。
+3. 本轮漂移抽签（yaw -0.05°/s）比七的（≈-0.31°/s）温和，8.5m 基线是强偏置下的；
+   同 run 反事实证据（修正量累计 3.2m）不依赖抽签强度。
+
+**工程坑（本轮新踩）**：
+- 远端 `~/.bashrc` 把 hermes-venv 塞进 PATH 首位 → 交互 shell `python3` 无 numpy，
+  必须显式 `/usr/bin/python3`；nav2 在无 /clock 时 activation 超时弃疗（bridge 先起）。
+- tmux 80 列折行会截断日志数字，抓取要 `grep -A3`。
+- `record_traj.py` 的 slam 列与 monitor 不一致（疑似 TF 时间戳问题）——本节数据以
+  monitor 独立计算 + CSV odom 列为准，TODO 修复。
