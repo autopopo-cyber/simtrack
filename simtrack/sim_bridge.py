@@ -28,7 +28,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from rosgraph_msgs.msg import Clock
@@ -200,12 +200,26 @@ class SimBridge(Node):
 
         # 周期性 LiDAR 重定位（env CORRECT_PERIOD_S，默认 30s；0=关）——航向/位置不裸积分，
         # 每隔 N 秒拿当前 scan 在已知迷宫上 scan-match 估出真实位姿，把漂移里程计重置回去。
+        # 参考图选择（env CORRECT_REF）：
+        #   true = 真迷宫高度图（仿真特权，仅实验上限参考——真机没有真图）
+        #   map  = slam_toolbox 自建 /map（诚实版=土法 AMCL：反复经过已建图房间即可重锚，
+        #          行约定 no-flip 已由 scripts/probe_map_convention.py 实测验证）
+        self._correct_ref = os.environ.get("CORRECT_REF", "true").lower()
         self._correct_period = float(os.environ.get("CORRECT_PERIOD_S", "30")) if self.drift is not None else 0.0
         self._last_correct = 0.0
+        self._map_wall = None      # (wall_bool, res, w, h, ox, oy, n_wall)
         if self.drift is not None and self._correct_period > 0:
+            if self._correct_ref == "map":
+                map_qos = QoSProfile(
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,  # slam 的 /map 是锁存的
+                    history=HistoryPolicy.KEEP_LAST, depth=1)
+                self.create_subscription(OccupancyGrid, "/map", self._map_cb, map_qos)
             self.create_timer(1.0, self._correction_cb)
-            self.get_logger().info("🛰 周期 LiDAR 重定位 ON：每 %.0fs scan-match 修正里程计漂移"
-                                   % self._correct_period)
+            self.get_logger().info(
+                "🛰 周期 LiDAR 重定位 ON：每 %.0fs 对%s scan-match 修正里程计漂移"
+                % (self._correct_period,
+                   "自建/map" if self._correct_ref == "map" else "真迷宫图(仿真特权)"))
 
     # ──────────────────────────────────────────
     def _now(self):
@@ -235,23 +249,78 @@ class SimBridge(Node):
     def _cmd_cb(self, msg: Twist):
         self._cmd = (msg.linear.x, msg.angular.z)
 
+    def _map_cb(self, msg: OccupancyGrid):
+        """缓存 slam 自建图（墙格掩膜）。data>=65 为墙；-1 未知/0 自由自动排除。"""
+        info = msg.info
+        wall = np.array(msg.data, dtype=np.int16).reshape(info.height, info.width) >= 65
+        self._map_wall = (wall, info.resolution, info.width, info.height,
+                          info.origin.position.x, info.origin.position.y,
+                          int(wall.sum()))
+
+    def _match_score_map(self, r, a, x, y, yaw):
+        """候选位姿下 scan 端点落在自建图墙格的个数。行约定 no-flip（探针实测验证）。"""
+        wall, res, w, h, ox, oy, _ = self._map_wall
+        wx = x + r * np.cos(a + yaw)
+        wy = y + r * np.sin(a + yaw)
+        col = ((wx - ox) / res).astype(np.int32)
+        row = ((wy - oy) / res).astype(np.int32)
+        inb = (col >= 0) & (col < w) & (row >= 0) & (row < h)
+        col_c = np.clip(col, 0, w - 1)
+        row_c = np.clip(row, 0, h - 1)
+        return int((wall[row_c, col_c] & inb).sum())
+
+    def _scan_match_map(self, r, a, ix, iy, iyaw):
+        """相关匹配：从漂移 odom 初始位姿出发，对自建图两层搜索（粗±1.5m/±20° → 细±0.2m/±4°）。"""
+        best, best_score = (ix, iy, iyaw), -1
+        for dyaw in np.linspace(-0.35, 0.35, 11):
+            for dx in np.linspace(-1.5, 1.5, 11):
+                for dy in np.linspace(-1.5, 1.5, 11):
+                    s = self._match_score_map(r, a, ix + dx, iy + dy, iyaw + dyaw)
+                    if s > best_score:
+                        best_score, best = s, (ix + dx, iy + dy, iyaw + dyaw)
+        bx, by, byaw = best
+        for dyaw in np.linspace(-0.07, 0.07, 7):
+            for dx in np.linspace(-0.2, 0.2, 7):
+                for dy in np.linspace(-0.2, 0.2, 7):
+                    s = self._match_score_map(r, a, bx + dx, by + dy, byaw + dyaw)
+                    if s > best_score:
+                        best_score, best = s, (bx + dx, by + dy, byaw + dyaw)
+        return best, best_score
+
     def _correction_cb(self):
-        """周期性 LiDAR 重定位：scan-match 当前 scan 到已知迷宫，把漂移里程计重置回去。"""
+        """周期性 LiDAR 重定位：scan-match 当前 scan 到参考图（真迷宫 或 slam 自建图），把漂移里程计重置回去。"""
         if self.drift is None:
             return
         if self.sim_time - self._last_correct < self._correct_period:
             return
+        if self._correct_ref == "map":
+            # 自建图未就绪（太年轻/墙格太少）→ 不更新 _last_correct，1s 后重试
+            if self._map_wall is None or self._map_wall[-1] < 300:
+                return
         self._last_correct = self.sim_time
         ranges, angles = self.sim.get_scan()
-        (lx, ly, lyaw), score = self.sim.scan_match(
-            ranges, angles, self.drift.x, self.drift.y, self.drift.yaw)
+        valid = np.isfinite(ranges) & (ranges < self.sim.lidar_range)
+        r = ranges[valid].astype(np.float32)
+        a = angles[valid].astype(np.float32)
+        if self._correct_ref == "map":
+            (lx, ly, lyaw), score = self._scan_match_map(
+                r, a, self.drift.x, self.drift.y, self.drift.yaw)
+            # 得分太低=当前区域建图质量差，匹配不可信 → 拒绝修正（保持原 odom）
+            if score < 40:
+                self.get_logger().warn(
+                    "🛰(map) @t=%.0fs 匹配得分 %d/%d 过低，跳过本次修正（该区域建图不足）"
+                    % (self.sim_time, score, len(r)))
+                return
+        else:
+            (lx, ly, lyaw), score = self.sim.scan_match(
+                ranges, angles, self.drift.x, self.drift.y, self.drift.yaw)
         dpos = math.hypot(lx - self.drift.x, ly - self.drift.y)
         dyaw = (lyaw - self.drift.yaw + math.pi) % (2 * math.pi) - math.pi
         self.drift.x, self.drift.y, self.drift.yaw = lx, ly, lyaw
-        n_hit = int(np.isfinite(ranges).sum())
         self.get_logger().info(
-            "🛰 LiDAR重定位 @t=%.0fs：修正 pos %.2fm yaw %+.1f° (命中 %d/%d rays)"
-            % (self.sim_time, dpos, math.degrees(dyaw), score, n_hit))
+            "🛰(%s) LiDAR重定位 @t=%.0fs：修正 pos %.2fm yaw %+.1f° (命中 %d/%d rays)"
+            % ("map" if self._correct_ref == "map" else "true",
+               self.sim_time, dpos, math.degrees(dyaw), score, len(r)))
 
     # ──────────────────────────────────────────
     def _physics_cb(self):

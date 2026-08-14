@@ -75,7 +75,7 @@ class GoalRunner(Node):
             return False
         return self.latest_map.data[row * info.width + col] == 0
 
-    def _step_target(self, robot, wx, wy, max_step=3.0, grid=0.2):
+    def _step_target(self, robot, wx, wy, max_step=3.0, grid=0.2, min_step=0.5):
         """沿 robot→waypoint 射线，返回地图上已知 free 的最远点（≤max_step）。
         逐 0.2m 探：让狗始终往"已探明 free"的方向走，狗一动地图就长大，下一步能走更远——
         解决 slam 关键帧式建图下"静止狗地图不长大、远航点永不 free"的冷启动死锁。"""
@@ -94,9 +94,111 @@ class GoalRunner(Node):
                 d += grid
             else:
                 break
-        if best is None or math.hypot(best[0] - rx, best[1] - ry) < 0.5:
+        if best is None or math.hypot(best[0] - rx, best[1] - ry) < min_step:
             return None
         return best
+
+    def _fan_step(self, robot, wx, wy):
+        """直线步进被墙挡时的兜底：朝航点方向 ±15°..±90° 扇形扫，返回首个能走 ≥0.8m 的
+        已知 free 步进点。效果=贴墙滑行，直到门口出现在步进方向上。
+        没有 it 会死锁：slam 关键帧式建图下静止狗地图不长大，"等地图"永远等不到。"""
+        base = math.atan2(wy - robot[1], wx - robot[0])
+        for off in (15, -15, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90):
+            ang = base + math.radians(off)
+            probe = (robot[0] + math.cos(ang) * 3.0,
+                     robot[1] + math.sin(ang) * 3.0)
+            tgt = self._step_target(robot, probe[0], probe[1], min_step=0.8)
+            if tgt is not None:
+                return tgt
+        return None
+
+    def _route_step(self, robot, wx, wy, pad=3.0, max_expand=40000):
+        """A* 规划 dog→waypoint：free=1、unknown=8（可穿但贵）、墙=∞。
+        门已知 → 路径自然穿门（free 便宜）；门未知 → 路径乐观穿 unknown——包括**地图数组
+        边界外**（数组外=从未观测=unknown，不是错误；航点常在地图外）。
+        子目标 = 路径上"从狗出发连续 free 段"的最后一格（=前沿）：NavFn 对它必成功，
+        狗推进后地图长大、下个 tick 重规划。比"closest-to-waypoint"目标强：后者在墙前
+        有鞍点（绕行两侧到航点直线距离几乎相等），狗会钉在离航点最近的墙点上来回蹭。"""
+        if self.latest_map is None:
+            return None
+        import heapq
+        info = self.latest_map.info
+        res, W, H = info.resolution, info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        data = self.latest_map.data
+        sc, sr = int((robot[0] - ox) / res), int((robot[1] - oy) / res)
+        gc, gr = int((wx - ox) / res), int((wy - oy) / res)
+        if not (0 <= sc < W and 0 <= sr < H):
+            return None
+        p = int(pad / res)
+        c0, c1 = min(sc, gc) - p, max(sc, gc) + p   # 盒子不裁剪到地图内——数组外=unknown
+        r0, r1 = min(sr, gr) - p, max(sr, gr) + p
+
+        def cost(c, r):
+            if not (0 <= c < W and 0 <= r < H):
+                return 8.0                    # 数组外：从未观测 → unknown
+            v = data[r * W + c]
+            if v == 0:
+                return 1.0
+            if v < 0:
+                return 8.0                    # unknown：可穿但贵
+            return None                       # 墙
+
+        def h(c, r):
+            return math.hypot(c - gc, r - gr)
+
+        openq = [(h(sc, sr), 0.0, sc, sr)]
+        came, gsc = {}, {(sc, sr): 0.0}
+        found, n_exp = False, 0
+        while openq and n_exp < max_expand:
+            _, g, c, r = heapq.heappop(openq)
+            if (c, r) == (gc, gr):
+                found = True
+                break
+            n_exp += 1
+            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nc, nr = c + dc, r + dr
+                if not (c0 <= nc <= c1 and r0 <= nr <= r1):
+                    continue
+                w = cost(nc, nr)
+                if w is None:
+                    continue
+                ng = g + w
+                if ng < gsc.get((nc, nr), 1e18):
+                    gsc[(nc, nr)] = ng
+                    came[(nc, nr)] = (c, r)
+                    heapq.heappush(openq, (ng + h(nc, nr), ng, nc, nr))
+        if not found:
+            return None
+        # 回溯路径（goal→start），再从 start 向前找"连续 free 段"末尾作子目标
+        path = [(gc, gr)]
+        while path[-1] != (sc, sr):
+            path.append(came[path[-1]])
+        path.reverse()
+        # 狗贴墙时自身格可能读作占据（A* 不穿墙，脏格最多只有起点这一格）→ 跳过
+        start_i = 0 if data[path[0][1] * W + path[0][0]] == 0 else 1
+        last_free = start_i
+        for i in range(start_i, len(path)):
+            c, r = path[i]
+            if data[r * W + c] == 0:
+                last_free = i
+            else:
+                break
+        c, r = path[last_free]
+        px, py = ox + (c + 0.5) * res, oy + (r + 0.5) * res
+        if math.hypot(px - robot[0], py - robot[1]) < 0.8:
+            # 连续 free 段太短=狗已在前沿边缘：允许子目标越入 unknown 1.5m
+            # （NavFn 对近距离 unknown 目标没问题；卡死的是远距离全程 unknown）
+            if last_free + 1 < len(path):
+                nc, nr = path[last_free + 1]
+                v = data[nr * W + nc] if 0 <= nc < W and 0 <= nr < H else -1
+                if v < 0:
+                    qx = px + 0.75 * (nc - c)
+                    qy = py + 0.75 * (nr - r)
+                    if math.hypot(qx - robot[0], qy - robot[1]) >= 0.8:
+                        return (qx, qy)
+            return None   # 前方是墙不是 unknown → 交给扇形兜底
+        return (px, py)
 
     def _tick(self):
         if self.busy:
@@ -134,15 +236,21 @@ class GoalRunner(Node):
                                    % (self.idx, len(WAYPOINTS) - 1, wx, wy, d))
             self._send(wx, wy)
             return
-        # 航点未探明（冷启动/探索在前）→ 沿射线找已知 free 最远点逐步推进
-        tgt = self._step_target(robot, wx, wy)
+        # 航点未探明（冷启动/探索在前）→ 两级推进：A* 找门/前沿 > 扇形兜底
+        tgt = self._route_step(robot, wx, wy)
+        how = "route" if tgt is not None else None
+        if tgt is None:
+            tgt = self._fan_step(robot, wx, wy)
+            how = "fan" if tgt is not None else None
         if tgt is None:
             self.get_logger().info("航点 #%d (%.1f,%.1f)：前方待探明，等地图…"
                                    % (self.idx, wx, wy), throttle_duration_sec=5.0)
             return
         d = math.hypot(tgt[0] - robot[0], tgt[1] - robot[1])
-        self.get_logger().info("→ 航点 #%d/%d (%.1f,%.1f) 步进至 (%.1f,%.1f) +%.1fm"
-                               % (self.idx, len(WAYPOINTS) - 1, wx, wy, tgt[0], tgt[1], d))
+        self.get_logger().info("→ 航点 #%d/%d (%.1f,%.1f) %s (%.1f,%.1f) +%.1fm"
+                               % (self.idx, len(WAYPOINTS) - 1, wx, wy,
+                                  {"route": "A*推进至", "fan": "扇形绕行至"}[how],
+                                  tgt[0], tgt[1], d))
         self._send(tgt[0], tgt[1])
 
     def _send(self, wx, wy):
