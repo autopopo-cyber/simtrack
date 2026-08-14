@@ -198,6 +198,15 @@ class SimBridge(Node):
             self.true_pub = None
         self._prev_true = (self.sim.x, self.sim.y, self.sim.yaw)
 
+        # 周期性 LiDAR 重定位（env CORRECT_PERIOD_S，默认 30s；0=关）——航向/位置不裸积分，
+        # 每隔 N 秒拿当前 scan 在已知迷宫上 scan-match 估出真实位姿，把漂移里程计重置回去。
+        self._correct_period = float(os.environ.get("CORRECT_PERIOD_S", "30")) if self.drift is not None else 0.0
+        self._last_correct = 0.0
+        if self.drift is not None and self._correct_period > 0:
+            self.create_timer(1.0, self._correction_cb)
+            self.get_logger().info("🛰 周期 LiDAR 重定位 ON：每 %.0fs scan-match 修正里程计漂移"
+                                   % self._correct_period)
+
     # ──────────────────────────────────────────
     def _now(self):
         """wall-clock 时间戳（不用 sim_time，避免 /clock 同步问题）。"""
@@ -225,6 +234,24 @@ class SimBridge(Node):
 
     def _cmd_cb(self, msg: Twist):
         self._cmd = (msg.linear.x, msg.angular.z)
+
+    def _correction_cb(self):
+        """周期性 LiDAR 重定位：scan-match 当前 scan 到已知迷宫，把漂移里程计重置回去。"""
+        if self.drift is None:
+            return
+        if self.sim_time - self._last_correct < self._correct_period:
+            return
+        self._last_correct = self.sim_time
+        ranges, angles = self.sim.get_scan()
+        (lx, ly, lyaw), score = self.sim.scan_match(
+            ranges, angles, self.drift.x, self.drift.y, self.drift.yaw)
+        dpos = math.hypot(lx - self.drift.x, ly - self.drift.y)
+        dyaw = (lyaw - self.drift.yaw + math.pi) % (2 * math.pi) - math.pi
+        self.drift.x, self.drift.y, self.drift.yaw = lx, ly, lyaw
+        n_hit = int(np.isfinite(ranges).sum())
+        self.get_logger().info(
+            "🛰 LiDAR重定位 @t=%.0fs：修正 pos %.2fm yaw %+.1f° (命中 %d/%d rays)"
+            % (self.sim_time, dpos, math.degrees(dyaw), score, n_hit))
 
     # ──────────────────────────────────────────
     def _physics_cb(self):

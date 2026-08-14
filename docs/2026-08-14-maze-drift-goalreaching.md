@@ -83,3 +83,28 @@ python record_traj.py 900 _traj.csv          # 记录
 # 本地：分析
 python scripts/analyze_drift.py _traj.csv    # 出 _traj.png + _error.png + 统计
 ```
+
+## 七、周期性 LiDAR 重定位修正（航向/位置不裸积分）✅
+
+**核心设计**（用户提议）：航向、距离不能一直积分累加——每隔 ~30s 找个已知方向的房间，
+用激光在已知地图上 scan-match 重定位，把漂移里程计**重置**回去。
+
+**实现**：
+- `sim_server.py` 加 `scan_match()`：相关扫描匹配——候选位姿下把当前 scan 端点投到迷宫高度图，
+  命中墙越多越贴合；粗搜 ±1.5m/±20° + 细搜 ±0.2m/±4°，估出真实位姿。诚实：只用 scan+地图，不读真值。
+- `sim_bridge.py` 加周期定时器（env `CORRECT_PERIOD_S`，默认 30，0=关）：每 30s 调 scan_match，
+  把 `OdometryDrift` 的 (x,y,yaw) 重置到激光估计值。
+
+**实测（无 IMU 最坏情况 0.4°/s 偏航漂移 + 30s 修正）**：
+
+| | slam_err max | slam_err mean | 到终点 |
+|---|---|---|---|
+| **不修正** | 8.54m（>房间宽，迷路） | — | 迷路到不了 |
+| **30s LiDAR 修正** | **1.81m** | **0.87m** | **dist_goal 5.5m（走到终点区！）** |
+
+**结论**：周期性 LiDAR 重定位把漂移从"无限积分→迷路"压成"有界 ~1-2m"，**即使没有 IMU（0.4°/s），
+狗也能维持亚米-米级定位并走到终点**。这正是真实机器人 AMCL/scan-matching localization 干的事。
+对比图见 `correction_effect.png`（蓝=修正后 bounded，红=不修正 → 8.5m 迷路）。
+
+> 仍有的小工程点：scan_match 每次约 0.1-0.2s（在 rclpy 单线程里会短暂阻塞物理），30s 一次可接受；
+> 偶尔 scan-match 在局部弱特征处估偏一点点（slam_err 缓爬到 1.8m），但远好于不修正。

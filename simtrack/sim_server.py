@@ -239,6 +239,52 @@ class SimBackend:
         """便捷：返回 (ranges, angles) 同 get_scan。"""
         return self.get_scan()
 
+    # ──────────────────────────────────────────────
+    # 周期性 LiDAR 重定位（修正里程计漂移，航向/位置不无限积分）
+    # ──────────────────────────────────────────────
+    def scan_match(self, ranges, angles, init_x, init_y, init_yaw,
+                   sxy=1.5, syaw=0.35, n=11):
+        """相关扫描匹配：在 init 位姿附近搜索，找使当前 scan 最贴合迷宫高度图的 (x,y,yaw)。
+
+        原理：候选位姿下把 scan 端点投到迷宫图，命中墙的越多 = 越贴合。
+        用于周期性重定位——拿激光在"已知地图"上估出真实位姿，把漂移里程计重置回去，
+        这样航向/位置每 CORRECT_PERIOD_S 秒就被激光"拉回"一次，不会无限积分。
+        诚实性：只用 scan + 迷宫图（先验地图）估计位姿，不读真值。
+        """
+        valid = np.isfinite(ranges) & (ranges < self.lidar_range)
+        r = ranges[valid].astype(np.float32)
+        a = angles[valid].astype(np.float32)
+        if len(r) < 10:
+            return (init_x, init_y, init_yaw), 0
+        best, best_score = (init_x, init_y, init_yaw), -1
+        # 粗搜：±1.5m / ±20°
+        for dyaw in np.linspace(-syaw, syaw, n):
+            for dx in np.linspace(-sxy, sxy, n):
+                for dy in np.linspace(-sxy, sxy, n):
+                    s = self._match_score(r, a, init_x + dx, init_y + dy, init_yaw + dyaw)
+                    if s > best_score:
+                        best_score, best = s, (init_x + dx, init_y + dy, init_yaw + dyaw)
+        # 细搜：粗最优附近 ±0.2m / ±4°
+        bx, by, byaw = best
+        for dyaw in np.linspace(-0.07, 0.07, 7):
+            for dx in np.linspace(-0.2, 0.2, 7):
+                for dy in np.linspace(-0.2, 0.2, 7):
+                    s = self._match_score(r, a, bx + dx, by + dy, byaw + dyaw)
+                    if s > best_score:
+                        best_score, best = s, (bx + dx, by + dy, byaw + dyaw)
+        return best, best_score
+
+    def _match_score(self, r, a, x, y, yaw):
+        """候选位姿 (x,y,yaw) 下，scan 端点命中迷宫墙的个数（越多越贴合）。"""
+        wx = x + r * np.cos(a + yaw)
+        wy = y + r * np.sin(a + yaw)
+        col = (wx * self.px_per_m).astype(np.int32)
+        row = self.hf_h - 1 - (wy * self.px_per_m).astype(np.int32)
+        inb = (col >= 0) & (col < self.hf_w) & (row >= 0) & (row < self.hf_h)
+        col_c = np.clip(col, 0, self.hf_w - 1)
+        row_c = np.clip(row, 0, self.hf_h - 1)
+        return int((self._hf_bin[row_c, col_c] & inb).sum())
+
     def close(self):
         if self.viewer is not None:
             self.viewer.close()
