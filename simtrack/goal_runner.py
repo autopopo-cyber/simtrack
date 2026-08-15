@@ -14,7 +14,9 @@
 用法（远程，需 ROS env，drift/slam/nav2 已起）：
   python3 -m simtrack.goal_runner
 """
+import json
 import math
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -26,14 +28,35 @@ from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped
 import tf2_ros
 
-# rooms10x10 seed42 的 BFS 房间路径质心（世界坐标 = map 帧；IMU 漂移下 slam_err~0.1m 可忽略）
-WAYPOINTS = [
+# 兜底：rooms10x10 seed42 的 BFS 房间路径质心。正常应从 maze meta.json 读数据驱动航点表
+# （maze_gen 生成时写入 waypoints=path_rooms 各房间中心）。
+_FALLBACK_WAYPOINTS = [
     (2.5, 2.5), (2.5, 7.5), (7.5, 7.5), (12.5, 7.5), (12.5, 2.5),
     (17.5, 2.5), (22.5, 2.5), (27.5, 2.5), (32.5, 2.5), (37.5, 2.5),
     (42.5, 2.5), (47.5, 2.5), (47.5, 7.5), (47.5, 12.5), (47.5, 17.5),
     (47.5, 22.5), (47.5, 27.5), (47.5, 32.5), (47.5, 37.5), (47.5, 42.5),
     (47.5, 47.5),
 ]
+
+
+def _load_waypoints():
+    """数据驱动航点：env MAZE → confirmed/maze_<name>.meta.json 的 waypoints。
+    网格抖动后房间中心随 seed 变化，硬编码表只对 seed42 有效。"""
+    name = os.environ.get("MAZE", "")
+    proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    meta_path = os.path.join(proj, "confirmed", "maze_%s.meta.json" % name)
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        wps = [(float(x), float(y)) for x, y in meta.get("waypoints", [])]
+        if len(wps) >= 2:
+            return wps, meta
+    except Exception:
+        pass
+    return list(_FALLBACK_WAYPOINTS), None
+
+
+WAYPOINTS, META = _load_waypoints()
 
 
 class GoalRunner(Node):
@@ -53,7 +76,10 @@ class GoalRunner(Node):
         self.retries = 0
         self._ff_done = False  # 是否已快进到离狗最近的航点（重启续跑用）
         self.create_timer(2.0, self._tick)
-        self.get_logger().info("goal_runner: %d 个航点，终点 (47.5,47.5)" % len(WAYPOINTS))
+        g = WAYPOINTS[-1]
+        src = "meta(MAZE=%s)" % os.environ.get("MAZE", "?") if META else "硬编码兜底"
+        self.get_logger().info("goal_runner: %d 个航点（%s），终点 (%.1f,%.1f)"
+                               % (len(WAYPOINTS), src, g[0], g[1]))
 
     def _map_cb(self, msg):
         self.latest_map = msg

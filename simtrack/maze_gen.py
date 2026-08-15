@@ -63,7 +63,7 @@ def gen_loop20():
 
 
 def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18,
-                   wall_jitter=0.0, seed=42):
+                   wall_jitter=0.0, seed=42, narrow_w=None):
     """网格房间迷宫：rows×cols 个 room×room 的房间，相邻房间间的墙上有门(宽 door_w)。
 
     生成保证：
@@ -74,6 +74,8 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18,
       - wall_jitter>0：9 排横墙/9 排纵墙**每排整体**±wall_jitter 随机抖动（边界固定），
         → 每个房间长宽/位置都不同，**破掉 4 重旋转对称**，让 scan matching/回环不再
         被对称歧义卡死。抖动是"整排线"抖（不是逐段），保证网格仍连贯、墙角无缝。
+      - narrow_w：**把 BFS 最短路径中段那扇门**改成 narrow_w 宽（其余门仍 door_w）——
+        用于"随机迷宫+单窄门"批量统计：狗必须过这扇门才能沿航点到终点。
 
     房间 (r,c) 占据四边形 (X[c],Y[r])-(X[c+1],Y[r+1])，X/Y 为（可能抖动的）网格线。
     """
@@ -126,13 +128,41 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18,
         adj[b].add(a)
     door_count = {rc: len(adj[rc]) for rc in adj}
 
-    # ── 渲染墙段：每条内部墙，有门则中间留 door_w 缺口，否则整墙（用抖动网格线 X/Y）──
-    walls = _rooms_to_walls(R, C, X, Y, door_w, doors)
-    W, H = C * room, R * room
+    # ── BFS 最短路径 start→goal（窄门选这上面 + meta 航点表用）──
     goal_room = (R - 1, C - 1)
+    prev = {start_room: None}
+    bq = deque([start_room])
+    while bq:
+        cur = bq.popleft()
+        for n in adj[cur]:
+            if n not in prev:
+                prev[n] = cur
+                bq.append(n)
+    assert goal_room in prev, "起点到不了终点（不可能：生成树全连通）"
+    path_rooms = []
+    cur = goal_room
+    while cur is not None:
+        path_rooms.append(cur)
+        cur = prev[cur]
+    path_rooms.reverse()
+
+    # 窄门 = 路径中段那条边（树边概率高≈必经；extra_prob 低时基本无绕行）
+    narrow_edge = None
+    if narrow_w is not None and len(path_rooms) >= 2:
+        a = path_rooms[len(path_rooms) // 2 - 1]
+        b = path_rooms[len(path_rooms) // 2]
+        narrow_edge = frozenset({a, b})
+        assert narrow_edge in doors, "窄门边必须在门集里"
+
+    # ── 渲染墙段：每条内部墙，有门则中间留缺口，否则整墙（用抖动网格线 X/Y）──
+    walls = _rooms_to_walls(R, C, X, Y, door_w, doors, narrow_edge, narrow_w)
+    W, H = C * room, R * room
     # 房间中心用抖动后的网格线（保证落在 free 空间、不在墙上）
     cx0, cy0 = (X[0] + X[1]) / 2.0, (Y[0] + Y[1]) / 2.0              # 房间(0,0)中心
     cgx, cgy = (X[C - 1] + X[C]) / 2.0, (Y[R - 1] + Y[R]) / 2.0      # 右上房间中心
+    # 航点 = BFS 路径各房间中心（goal_runner 数据驱动航点表）
+    waypoints = [((X[c] + X[c + 1]) / 2.0, (Y[r] + Y[r + 1]) / 2.0)
+                 for (r, c) in path_rooms]
 
     return {
         "walls": walls,
@@ -144,24 +174,33 @@ def gen_rooms_grid(rows=5, cols=5, room=3.0, door_w=1.5, extra_prob=0.18,
             "rows": R, "cols": C, "room": room, "door_w": door_w, "wall_jitter": wall_jitter,
             "doors": doors, "adj": adj, "door_count": door_count,
             "start_room": start_room, "goal_room": goal_room,
+            "path_rooms": path_rooms, "waypoints": waypoints,
+            "grid_x": X, "grid_y": Y,
+            "narrow_door": sorted(narrow_edge) if narrow_edge else None,
+            "narrow_w": narrow_w,
         },
     }
 
 
-def _rooms_to_walls(R, C, X, Y, door_w, doors):
+def _rooms_to_walls(R, C, X, Y, door_w, doors, narrow_edge=None, narrow_w=0.8):
     """把房间-门图转成世界坐标墙段列表（用抖动网格线 X[0..C], Y[0..R]）。
 
-    门居中于墙段，缺口宽=door_w。每排墙整排在一条网格线上（X[c] 或 Y[r]），
-    所以抖动是"整排"抖——网格仍连贯、墙角无缝、每房间形状各异（破对称）。
+    门居中于墙段，缺口宽=door_w（narrow_edge 那扇门=narrow_w）。每排墙整排在一条
+    网格线上（X[c] 或 Y[r]），所以抖动是"整排"抖——网格仍连贯、墙角无缝、每房间形状各异。
     """
     walls = []
-    half = door_w / 2.0
+
+    def half_of(edge):
+        return (narrow_w if narrow_edge is not None and edge == narrow_edge else door_w) / 2.0
+
     # 水平内墙在 Y[r]（隔开 row r-1 与 r），r∈[1,R-1]，每段 X[c]→X[c+1]
     for r in range(1, R):
         for c in range(C):
             y = Y[r]
             x0, x1 = X[c], X[c + 1]
-            if frozenset({(r - 1, c), (r, c)}) in doors:
+            edge = frozenset({(r - 1, c), (r, c)})
+            if edge in doors:
+                half = half_of(edge)
                 cx = (x0 + x1) / 2.0
                 walls.append(((x0, y), (cx - half, y)))
                 walls.append(((cx + half, y), (x1, y)))
@@ -172,7 +211,9 @@ def _rooms_to_walls(R, C, X, Y, door_w, doors):
         for r in range(R):
             x = X[c]
             y0, y1 = Y[r], Y[r + 1]
-            if frozenset({(r, c - 1), (r, c)}) in doors:
+            edge = frozenset({(r, c - 1), (r, c)})
+            if edge in doors:
+                half = half_of(edge)
                 cy = (y0 + y1) / 2.0
                 walls.append(((x, y0), (x, cy - half)))
                 walls.append(((x, cy + half), (x, y1)))
@@ -303,22 +344,36 @@ MAZES = {
     # 狗足迹 0.8×0.4 胶囊：0.8m 门两侧各 0.2m 余量（舒服），0.6m 各 0.1m（极限）。
     "rooms10x10n80": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 0.8, 0.08, 0.5, seed),
     "rooms10x10n60": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 0.6, 0.08, 0.5, seed),
+    # 批量统计变体：随机 seed + BFS 路径中段一扇 0.8m 窄门（其余门 1.5m）。
+    # meta 带航点表/网格线/窄门标记 → goal_runner 数据驱动 + 离线精确分析。
+    "rooms10x10b": lambda seed=42: gen_rooms_grid(10, 10, 5.0, 1.5, 0.08, 0.5, seed, narrow_w=0.8),
 }
 
 
 def save_meta(maze, path):
-    """写迷宫元数据 sidecar：sim_bridge 读它决定机器狗起点（不同房间尺寸起点不同）。"""
+    """写迷宫元数据 sidecar：sim_bridge 读它定起点；goal_runner 读航点表；
+    批量分析读网格线（精确房间归属）与窄门标记。"""
+    info = maze.get("info") or {}
     meta = {
         "start": [float(maze["start"][0]), float(maze["start"][1])],
         "start_yaw": float(maze["start_yaw"]),
         "goal": [float(maze["goal"][0]), float(maze["goal"][1])] if maze["goal"] else None,
         "w": float(maze["w"]), "h": float(maze["h"]),
     }
+    if "waypoints" in info:
+        meta["waypoints"] = [[float(x), float(y)] for x, y in info["waypoints"]]
+        meta["path_rooms"] = [[int(r), int(c)] for r, c in info["path_rooms"]]
+        meta["grid_x"] = [float(v) for v in info["grid_x"]]
+        meta["grid_y"] = [float(v) for v in info["grid_y"]]
+        meta["narrow_door"] = ([list(map(int, rc)) for rc in info["narrow_door"]]
+                               if info.get("narrow_door") else None)
+        meta["narrow_w"] = info.get("narrow_w")
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
-    print("  元数据: {}  start={} goal={}".format(
+    print("  元数据: {}  start={} goal={} waypoints={} 窄门={}".format(
         path, tuple(round(v, 1) for v in meta["start"]),
-        tuple(round(v, 1) for v in meta["goal"]) if meta["goal"] else None))
+        tuple(round(v, 1) for v in meta["goal"]) if meta["goal"] else None,
+        len(meta.get("waypoints", [])), meta.get("narrow_door")))
 
 
 def main():
