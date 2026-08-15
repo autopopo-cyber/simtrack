@@ -55,10 +55,12 @@ def restart(ssh, seed):
                  "/home/qin/simtrack/confirmed/" + f)
     sftp.close()
     print("迷宫 rooms10x10b seed=%d 已部署" % seed)
-    # 干净重启（铁律：kill-session 杀不死 launch 子树，pkill+pgrep 确认）
-    sh(ssh, "pkill -9 -f simtrack.sim_bridge; pkill -9 -f simtrack.goal_runner; "
-            "pkill -9 -f slam_toolbox; pkill -9 -f nav2_bringup; pkill -9 -f record_traj; "
-            "pkill -9 -f monitor_progress; pkill -9 -f component_container; sleep 2")
+    # 干净重启。铁律两条：
+    # a) kill-session 杀不死 detached 子树 → pkill 补刀 + pgrep 确认
+    # b) pkill -f 模式匹配执行者自身 cmdline（自杀陷阱）→ 方括号技巧
+    sh(ssh, "pkill -9 -f 'simtrack.sim_[b]ridge'; pkill -9 -f 'simtrack.goal_[r]unner'; "
+            "pkill -9 -f 'slam_[t]oolbox'; pkill -9 -f 'nav2_[b]ringup'; pkill -9 -f 'record_[t]raj'; "
+            "pkill -9 -f 'monitor_[p]rogress'; pkill -9 -f 'component_[c]ontainer'; sleep 2")
     sh(ssh, "tmux kill-session -t sim 2>/dev/null; sleep 1; "
             "tmux new-session -d -s sim -n bridge; tmux new-window -t sim -n slam; "
             "tmux new-window -t sim -n nav2; tmux new-window -t sim -n drive; "
@@ -78,8 +80,9 @@ def restart(ssh, seed):
     sh(ssh, 'tmux send-keys -t sim:3 "cd ~/simtrack && source /opt/ros/jazzy/setup.bash && '
             'MAZE=rooms10x10b /usr/bin/python3 -m simtrack.goal_runner" Enter')
     time.sleep(4)
+    # monitor 在独立窗口前台跑（曾用 (… &) 脱离终端 → 孤儿进程累积耗尽 DDS participant）
     sh(ssh, 'tmux send-keys -t sim:4 "cd ~/simtrack && source /opt/ros/jazzy/setup.bash && '
-            '(/usr/bin/python3 monitor_progress.py > _mon_stdout.log 2>&1 &) " Enter')
+            '/usr/bin/python3 monitor_progress.py" Enter')
     print("全栈已起（bridge/slam/nav2/goal_runner/monitor）")
 
 

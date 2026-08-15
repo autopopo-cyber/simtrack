@@ -59,10 +59,13 @@ def run_seed(seed):
     for f in ("maze_rooms10x10b.png", "maze_rooms10x10b.meta.json"):
         sftp.put(os.path.join(REPO, "confirmed", f),
                  "/home/qin/simtrack/confirmed/" + f)
-    # 3) 干净重启（铁律：kill-session 杀不死 launch 子树，pkill+pgrep 确认）
-    sh(ssh, "pkill -9 -f simtrack.sim_bridge; pkill -9 -f simtrack.goal_runner; "
-            "pkill -9 -f slam_toolbox; pkill -9 -f nav2_bringup; pkill -9 -f record_traj; "
-            "pkill -9 -f monitor_progress; pkill -9 -f component_container; sleep 2")
+    # 3) 干净重启。铁律两条：
+    #    a) kill-session 杀不死 launch 的 detached 子树 → pkill 补刀 + pgrep 确认
+    #    b) pkill -f 的模式会匹配执行它的 bash 自身命令行（自杀陷阱，链在第一条就断）
+    #       → 方括号技巧让正则不匹配含方括号的自身 cmdline
+    sh(ssh, "pkill -9 -f 'simtrack.sim_[b]ridge'; pkill -9 -f 'simtrack.goal_[r]unner'; "
+            "pkill -9 -f 'slam_[t]oolbox'; pkill -9 -f 'nav2_[b]ringup'; pkill -9 -f 'record_[t]raj'; "
+            "pkill -9 -f 'monitor_[p]rogress'; pkill -9 -f 'component_[c]ontainer'; sleep 2")
     sh(ssh, "tmux kill-session -t sim 2>/dev/null; sleep 1; "
             "tmux new-session -d -s sim -n bridge; tmux new-window -t sim -n slam; "
             "tmux new-window -t sim -n nav2; tmux new-window -t sim -n drive; "
@@ -83,8 +86,9 @@ def run_seed(seed):
     sh(ssh, 'tmux send-keys -t sim:3 "cd ~/simtrack && source /opt/ros/jazzy/setup.bash && '
             'MAZE=rooms10x10b /usr/bin/python3 -m simtrack.goal_runner" Enter')
     time.sleep(4)
+    # 只起 record_traj（monitor 曾用 (… &) 脱离终端启动，杀 session 后变孤儿进程累积、
+    # 耗尽 CycloneDDS participant 池 → 已移除；诊断靠 runner 日志抓取 + traj.csv）
     sh(ssh, 'tmux send-keys -t sim:4 "cd ~/simtrack && source /opt/ros/jazzy/setup.bash && '
-            '(/usr/bin/python3 monitor_progress.py > _mon_stdout.log 2>&1 &) && '
             '/usr/bin/python3 record_traj.py %d _b%d_traj.csv" Enter' % (RUN_S + 30, seed))
     log("seed%d 栈已起，录制 %ds…" % (seed, RUN_S))
     # 5) 等待

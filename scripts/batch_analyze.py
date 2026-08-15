@@ -16,11 +16,16 @@ import glob
 import json
 import math
 import os
+import sys
 from bisect import bisect_right
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IN = os.path.join(REPO, "results", "batch1")
 SLOW_S = 120.0
+
+# 用法: batch_analyze.py [目录名]  → results/<目录名>/（缺省 batch1）
+if len(sys.argv) > 1:
+    IN = os.path.join(REPO, "results", sys.argv[1])
 
 
 def room_of(x, y, gx, gy):
