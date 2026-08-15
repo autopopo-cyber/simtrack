@@ -13,9 +13,10 @@
   3. 进度超时兜底：Nav2 不报错但原地门舞（基线最惨 222s）→ 30s 无推进就取消在途目标。
      推进的度量是两级：直线距离快速路径 + A* 路线剩余长度二次确认——迷宫绕行时直线
      变大而路线变短，只用直线会把有效绕行误杀（v4.0 实测教训）。
-     超时**不拉黑**（v4.1 教训：树状迷宫的门没有替代路，封门=A*无路=雪球跳站），
-     连续 2 次超时改打"换向脱离"：朝航点反方向扇形走 2-3m 改变几何+让地图生长，
-     再回攻。拉黑只用于 ABORTED 2 次的确定坏目标。同目标活跃期绝不重发。
+     超时**条件拉黑**（v4.4：拉黑后 A* 验证仍有路才保留，封死唯一通路立即回滚——
+     v4.1 seed6 封门雪球 / v4.3 脱离机动把狗扔出 15m 外，两个极端都实测否决）。
+     进度基线属航点不属单目标（防扇形流浪每 6-16s 换目标重置计时器的检测盲区）。
+     拉黑也用于 ABORTED 2 次的确定坏目标。同目标活跃期绝不重发。
   4. 航点预算兜底：单航点累计 240s 未达成 → 跳站（防拉黑/TTL 振荡活锁）。
 
 用法（远程，需 ROS env，drift/slam/nav2 已起）：
@@ -52,7 +53,6 @@ BL_KEY_M = 0.25          # 黑名单格粒度（比半径细，保证圆边采�
 BL_TTL_S = 60.0          # 拉黑存活期：到期自动解禁（explore_lite 永久拉黑的缺陷）
 PROGRESS_TIMEOUT_S = 30.0  # 无推进超过此值 → 取消在途目标（门舞兜底）
 PROGRESS_STEP_M = 0.5      # 距离至少缩短这么多才算"有推进"（噪声滤波）
-TIMEOUT_ESCAPE_AFTER = 2   # 连续超时几次后打换向脱离（不拉黑——树状迷宫门无替代路）
 WP_BUDGET_S = 240.0        # 单航点累计耗时上限（防活锁；基线最惨门舞房=222s）
 FORCE_RELEASE_S = 920.0    # 在途目标超过此值强制复位 busy（bt_navigator 自身 900s 超时）
 
@@ -103,8 +103,6 @@ class GoalRunner(Node):
         self.prog_t = 0.0      # 上次有推进的时刻
         self.sent_t = 0.0      # 当前目标发出时刻
         self.wp_t0 = None      # 当前航点开始时刻（预算兜底）
-        self.wp_timeouts = 0   # 当前航点连续进度超时次数（≥2 触发换向脱离）
-        self._escape_next = False  # 下个 _tick 先打脱离机动（朝航点反方向走一段）
         self._timeout_cancel = False  # 本次取消是进度超时主动发起（回调里不再计数）
         self.create_timer(2.0, self._tick)
         g = WAYPOINTS[-1]
@@ -139,18 +137,35 @@ class GoalRunner(Node):
 
     # ── 黑名单（0.25m 格采样 0.5m 半径圆，TTL 过期自动解禁）──
 
-    def _bl_add(self, x, y, reason):
-        """拉黑 (x,y) 周边 BL_RADIUS_M 圆内：所有中心落在圆内的 BL_KEY_M 格。"""
-        exp = self._now() + BL_TTL_S
+    def _bl_add(self, x, y, reason, cond_robot=None, cond_wp=None):
+        """拉黑 (x,y) 周边 BL_RADIUS_M 圆内：所有中心落在圆内的 BL_KEY_M 格。
+        条件拉黑（cond_robot/cond_wp 给出时）：拉黑后验证 A* 仍有路到航点，无路立即回滚
+        ——v4.1 seed6 教训：树状迷宫的门没有替代路，封门=A*无路=雪球跳站。"""
+        now = self._now()
+        exp = now + BL_TTL_S
         k0x, k1x = int((x - BL_RADIUS_M) / BL_KEY_M), int((x + BL_RADIUS_M) / BL_KEY_M)
         k0y, k1y = int((y - BL_RADIUS_M) / BL_KEY_M), int((y + BL_RADIUS_M) / BL_KEY_M)
+        added = {}
         for kx in range(k0x, k1x + 1):
             for ky in range(k0y, k1y + 1):
                 cx, cy = (kx + 0.5) * BL_KEY_M, (ky + 0.5) * BL_KEY_M
                 if math.hypot(cx - x, cy - y) <= BL_RADIUS_M:
-                    self.blacklist[(kx, ky)] = exp
+                    k = (kx, ky)
+                    if self.blacklist.get(k, 0.0) <= now:   # 只记录真新增/真过期刷新
+                        added[k] = self.blacklist.get(k)
+                    self.blacklist[k] = exp
+        if cond_robot is not None and self._route_len(cond_robot, cond_wp[0], cond_wp[1]) is None:
+            for k, old in added.items():
+                if old is None:
+                    self.blacklist.pop(k, None)
+                else:
+                    self.blacklist[k] = old
+            self.get_logger().warn("  ⛔ 拉黑 (%.1f,%.1f) 会封死唯一通路，回滚（原地重试）"
+                                   % (x, y))
+            return False
         self.get_logger().warn("  ⛔ 拉黑 (%.1f,%.1f) r=%.1fm 60s（%s）→ 重规划绕行"
                                % (x, y, BL_RADIUS_M, reason))
+        return True
 
     def _bl_blocked(self, x, y):
         exp = self.blacklist.get((int(x / BL_KEY_M), int(y / BL_KEY_M)), 0.0)
@@ -250,7 +265,7 @@ class GoalRunner(Node):
             return None
         return len(path) * self.latest_map.info.resolution
 
-    def _astar(self, robot, wx, wy, pad=3.0, max_expand=40000):
+    def _astar(self, robot, wx, wy, pad=3.0, max_expand=40000, allow_nudge=True):
         """A* 主体的独立函数：返回 (start→goal) 网格路径或 None。"""
         if self.latest_map is None:
             return None
@@ -309,13 +324,44 @@ class GoalRunner(Node):
                     came[(nc, nr)] = (c, r)
                     heapq.heappush(openq, (ng + h(nc, nr), ng, nc, nr))
         if not found:
-            return None
+            # 目标格被（变形）地图封进墙里 → 找最近 free 格代打（房间中心离墙≥1.5m，
+            # 挪 1-2m 就能出墙）。v4.2 seed1 教训：不挪就 A* 永久 None → 扇形流浪 →
+            # 240s 预算烧完跳站，连续两个航点就这么废掉。
+            nud = self._nearest_free_cell(gc, gr)
+            if nud is None:
+                return None
+            nc_, nr_ = nud
+            self.get_logger().info(
+                "  航点格在图上为墙(地图变形)，A* 改打最近 free 格 (%.1f,%.1f)"
+                % (ox + (nc_ + 0.5) * res, oy + (nr_ + 0.5) * res),
+                throttle_duration_sec=30.0)
+            return self._astar(robot, ox + (nc_ + 0.5) * res,
+                               oy + (nr_ + 0.5) * res, pad, max_expand, allow_nudge=False)
         # 回溯路径（goal→start）
         path = [(gc, gr)]
         while path[-1] != (sc, sr):
             path.append(came[path[-1]])
         path.reverse()
         return path
+
+    def _nearest_free_cell(self, gc, gr, max_ring=20):
+        """绕 (gc,gr) 一圈圈扩，返回最近的 free 格（找不到返回 None）。"""
+        if self.latest_map is None:
+            return None
+        W, H = self.latest_map.info.width, self.latest_map.info.height
+        data = self.latest_map.data
+
+        def ok(c, r):
+            return 0 <= c < W and 0 <= r < H and data[r * W + c] == 0
+
+        for ring in range(1, max_ring):
+            for c in range(gc - ring, gc + ring + 1):
+                if ok(c, gr - ring) or ok(c, gr + ring):
+                    return (c, gr - ring) if ok(c, gr - ring) else (c, gr + ring)
+            for r in range(gr - ring + 1, gr + ring):
+                if ok(gc - ring, r) or ok(gc + ring, r):
+                    return (gc - ring, r) if ok(gc - ring, r) else (gc + ring, r)
+        return None
 
     # ── 主循环 ──
 
@@ -353,8 +399,6 @@ class GoalRunner(Node):
             self.wp_t0 = self._now()
             self.prog_best = None
             self.prog_route = None
-            self.wp_timeouts = 0
-            self._escape_next = False
             return
         wx, wy = WAYPOINTS[self.idx]
         # 到达当前航点（1.5m 内）→ 下一站
@@ -365,24 +409,9 @@ class GoalRunner(Node):
             self.wp_t0 = self._now()
             self.prog_best = None
             self.prog_route = None
-            self.wp_timeouts = 0
-            self._escape_next = False
             if self.idx >= len(WAYPOINTS):
                 self.get_logger().info("🏁🏁 到达终点！(全程完成)")
             return
-        # 连续进度超时后的换向脱离：朝航点反方向扇形找一段能走的路走过去，改变几何
-        # （门舞=退化几何暴露，脱离几米+地图生长常常就能解）再回攻。不拉黑——
-        # 树状迷宫的门没有替代路，封门=A*无路=雪球跳站（v4.1 seed6 教训）。
-        if self._escape_next:
-            self._escape_next = False
-            back = (2 * robot[0] - wx, 2 * robot[1] - wy)   # 航点关于狗的镜像点
-            esc = self._fan_step(robot, back[0], back[1])
-            if esc is not None:
-                self.get_logger().warn("  ↺ 换向脱离：先去 (%.1f,%.1f) 再回攻航点 #%d"
-                                       % (esc[0], esc[1], self.idx))
-                self._send(esc[0], esc[1], "step")
-                return
-            self.get_logger().warn("  ↺ 脱离方向无路，按常规重试")
         # 航点已探明 free 且未被拉黑 → 直接发 Nav2 让它自己绕门规划（解决狗偏离门轴时
         # 直线撞墙）。拉黑中的航点强制走 A* 换个进近方向，别再从老路直冲
         if self._free_in_map(wx, wy) and not self._bl_blocked(wx, wy):
@@ -446,16 +475,13 @@ class GoalRunner(Node):
         self.get_logger().warn("⏱ 航点 #%d 进度超时 %.0fs（直线 %.1fm 路线 %s 均无推进）→ 取消在途%s"
                                % (self.idx, now - self.prog_t, d,
                                   "%.1fm" % self.prog_route if self.prog_route else "?",
-                                  "，连续%d次将脱离换向" % (TIMEOUT_ESCAPE_AFTER - self.wp_timeouts)
-                                  if self.wp_timeouts + 1 >= TIMEOUT_ESCAPE_AFTER
-                                  else "，重试"))
+                                  "并条件拉黑子目标" if self.kind == "step" else ""))
         self.prog_t = now          # 重置基准：一个停滞窗口只报一次（v4.0 每 2s 重复报）
         self.prog_route = None
         self._timeout_cancel = True
-        self.wp_timeouts += 1
-        if self.wp_timeouts >= TIMEOUT_ESCAPE_AFTER:
-            self._escape_next = True   # 取消回调释放后，下个 _tick 打脱离机动
-            self.wp_timeouts = 0
+        if self.kind == "step" and self.last_goal is not None:
+            self._bl_add(self.last_goal[0], self.last_goal[1], "进度超时",
+                         cond_robot=robot, cond_wp=(wx, wy))
         if self.gh is not None:
             self.gh.cancel_goal_async()
 
@@ -473,9 +499,9 @@ class GoalRunner(Node):
         self.kind = kind
         self.last_goal = (wx, wy)
         self.sent_t = self._now()
-        self.prog_best = None
-        self.prog_route = None
-        self.prog_t = self.sent_t
+        # 注意：prog_best/prog_route/prog_t **不重置**——进度基线属于航点而非单个目标。
+        # v4.2 seed1 教训：扇形流浪每 6-16s 换目标，若每次发目标都重置 30s 计时器，
+        # 换目标churn就永远凑不满超时窗口，卡滞检测全盲。基线只在航点推进/真实推进时重置。
         fut = self.nav.send_goal_async(goal)
         fut.add_done_callback(lambda f: self._resp(f, wx, wy))
 
@@ -530,8 +556,6 @@ class GoalRunner(Node):
                 self.wp_t0 = self._now()
                 self.prog_best = None
                 self.prog_route = None
-                self.wp_timeouts = 0
-                self._escape_next = False
             else:
                 self.get_logger().warn("  航点直冲 (%.1f,%.1f) 失败(status=%d ec=%d)，重试 %d"
                                        % (wx, wy, status, ec, n))

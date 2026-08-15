@@ -9,6 +9,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import paramiko
@@ -117,6 +118,27 @@ def run_seed(seed):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
+    # 单实例锁（心跳式）：Windows 上 TaskStop/杀外层 bash 杀不死 python 子进程，
+    # 幽灵实例会和新实例并发打架（远程栈互相 pkill，数据全废）——启动前查心跳。
+    lock = os.path.join(OUT, "_lock")
+    if os.path.exists(lock):
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except OSError:
+            age = 1e9
+        if age < 90:
+            print("另一实例心跳 %.0fs 前仍在，退出（防并发打架）" % age)
+            sys.exit(1)
+
+    def beat():
+        while True:
+            try:
+                open(lock, "w").write(str(time.time()))
+            except OSError:
+                pass
+            time.sleep(30)
+    threading.Thread(target=beat, daemon=True).start()
+
     t0 = time.time()
     for seed in SEEDS:
         try:
