@@ -20,6 +20,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(REPO, "results", "batch1")
 VENV_PY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 
+# 用法: batch_run.py [seeds逗号表] [结果目录名]
+#   例: batch_run.py 1,3,8 quick1   → results/quick1/
+if len(sys.argv) > 1:
+    SEEDS = [int(x) for x in sys.argv[1].split(",")]
+if len(sys.argv) > 2:
+    OUT = os.path.join(REPO, "results", sys.argv[2])
+
 BRIDGE_ENV = ("MAZE=rooms10x10b ODOM_DRIFT_PCT=5 ODOM_DRIFT_YAW_BIAS_DEG=0.4 "
               "ODOM_DRIFT_SEED=42 CORRECT_PERIOD_S=30 CORRECT_REF=map "
               "LIDAR_RANGE=10 LIDAR_NOISE_M=0.03")
@@ -91,7 +98,7 @@ def run_seed(seed):
         except Exception as e:
             log("seed%d 拉 %s 失败: %s" % (seed, local, e))
     for name, cap in (("seed%d_runner.log" % seed,
-                       'tmux capture-pane -p -t sim:3 -S -3000 | grep -E "✅|→|跳过|被拒" | tail -80'),
+                       'tmux capture-pane -p -t sim:3 -S -3000 | grep -E "✅|→|跳过|被拒|拉黑|超时" | tail -80'),
                       ("seed%d_progress.log" % seed, "tail -200 ~/simtrack/_progress.log")):
         try:
             _, out, _ = ssh.exec_command(cap, timeout=15)

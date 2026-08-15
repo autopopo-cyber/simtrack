@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- 自定义恢复 BT（调研 §四/§五 改造 3）：
+     - 去掉 ClearGlobalCostmap：清全局图=抹掉已观测障碍再缓慢重累积，规划算法上限没变，
+       重规划必再失败——#4655 的"清图→更糟→死循环"。未知区探索恰恰依赖已观测障碍留在图上。
+     - 去掉 Spin：门舞场景的原地旋转只加重退化几何；用 Wait/BackUp 替代。
+     - 保留 ClearLocalCostmap：local 图是 3×3m 滚动窗，清了马上从 /scan 重累积，无副作用。
+     - ComputePathToPose 失败的 context 恢复从"清全局图"改为 Wait 1s（等 slam 地图长大）。 -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <Wait wait_duration="1" name="WaitForMapGrowth"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <ClearEntireCostmap name="ClearLocalCostmap-ExceptRegion" service_name="local_costmap/clear_entirely_local_costmap"/>
+          <Wait wait_duration="5"/>
+          <BackUp backup_dist="0.30" backup_speed="0.05"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
