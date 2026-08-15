@@ -327,6 +327,10 @@ class GoalRunner(Node):
             # 目标格被（变形）地图封进墙里 → 找最近 free 格代打（房间中心离墙≥1.5m，
             # 挪 1-2m 就能出墙）。v4.2 seed1 教训：不挪就 A* 永久 None → 扇形流浪 →
             # 240s 预算烧完跳站，连续两个航点就这么废掉。
+            # allow_nudge=False 时禁止再递归：代打格也找不到=目标被墙围死，
+            # 不禁止会无限递归 RecursionError 炸掉整个节点（v4.4 seed2 实测暴毙）。
+            if not allow_nudge:
+                return None
             nud = self._nearest_free_cell(gc, gr)
             if nud is None:
                 return None
