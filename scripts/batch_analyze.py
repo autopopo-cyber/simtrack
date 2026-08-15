@@ -155,9 +155,9 @@ def main():
         # 占比分段
         for lo, hi in ((0, 30), (30, 60), (60, 120), (120, 10 ** 9)):
             n = sum(1 for d in durs if lo <= d < hi)
+            label = ("<%ds" % hi) if hi < 10 ** 9 else (">%ds" % lo)
             print("  %s: %d 房次 (%.0f%%), 时间占比 %.0f%%" % (
-                ("<30s" if hi < 10 ** 9 else ">%ds" % lo) if lo else "<30s",
-                n, 100.0 * n / len(durs),
+                label, n, 100.0 * n / len(durs),
                 100.0 * sum(d for d in durs if lo <= d < hi) / tot))
 
     out = [{"seed": R["seed"], "reached": R["reached_rooms"], "n_path": R["n_path"],
