@@ -126,10 +126,46 @@
 - 对比实验要检查 drift 抽签值（bridge 启动日志"scale_f=… yaw_bias=…"）——不同轮若 env 组合
   不同，抽签可能不同（如 yaw_bias -0.31 vs -0.05），横向误差压力差 6 倍。
 
+### 21. pkill -f 自杀陷阱：模式匹配执行者自身的命令行 ★★★
+- **症状**：清理链 `pkill -9 -f simtrack.sim_bridge; pkill …` 看似执行了，实际**第一条就把自己杀了**
+  ——SSH exec_command 的 bash cmdline 含全部模式串，`-f` 全命令行匹配时 bash 自己就是命中目标
+  （pkill 只排除 pkill 进程本身，不排除父 shell）。链中后续 pkill 全部没跑。
+- **为什么一直没炸**：tmux kill-session 触发 `ros2 launch` 的 SIGTERM 级联清了大部分子树，
+  pkill 只是"补刀"——补刀刀断了没人发现，直到 #22 累积爆雷。
+- **修法**：方括号正则 `pkill -9 -f 'monitor_[p]rogress'`——正则不匹配含方括号的自身 cmdline。
+  所有清理脚本已改（batch_run.py / restart_stack.py）。
+
+### 22. 脱离终端的 `(进程 &)` = 永生孤儿，耗尽 CycloneDDS participant 池 ★★★
+- **症状**：新进程起不来，报 `Failed to find a free participant index for domain 0`；
+  录制/监控悄悄死掉（批跑里表现为 traj 文件缺失、progress.log 为空）。
+- **根因链**：`(monitor_progress.py &)` 从 pane shell 脱离 → kill-session 后 PPID=1 永生 →
+  又因 #21 pkill 链自杀没补刀 → 跨 20+ 次重启累积 17 个 → DDS participant 池耗尽。
+- **修法**：长跑进程一律放**独立 tmux 窗口前台**（随 session 死）；批跑干脆去掉非必需 monitor。
+  排查命令：`pgrep -af 'monitor_[p]rogress'`、看 `/dev/shm`。
+
+### 23. 日志抓取不能只 grep 关键词——Traceback 被滤掉，崩溃查无此案 ★★
+- **症状**：seed 只到 2 个航点，runner 日志"恰好停在一条正常 WARN 后面"，无任何错误痕迹。
+- **根因**：抓取命令 `capture-pane | grep -E "✅|→|超时"` 把 Traceback 行滤掉了——除了
+  恰好含"进度超时"的**源码行**混进结果（那行反而成了破案线索）。
+- **修法**：抓取永远多存一份**未过滤的 pane 尾部**（batch_run 已加 seed<k>_pane.log）。
+
+### 24. 疑难崩溃上随机性质测试，几分钟顶一小时盲猜 ★★★
+- **案例**：goal_runner 在超时→条件拉黑→路线验证链上神秘暴毙。本地桩+固定场景复现不出；
+  换**随机地图/随机位姿/随机黑名单轰炸 3000 次**，第 8 次就炸出 `RecursionError`——
+  `_astar` nudge 分支传了 `allow_nudge=False` 但分支根本没检查它，代打格也被墙围死时
+  无限自递归 1000 层。
+- **教训**：① 传防御标志必须检查（写完自查一遍调用链）；② "我只改了一小处"的 bug
+  最适合性质测试兜底；③ 崩溃类问题优先让机器找，别人肉枚举路径。
+
+### 25. Windows 后台任务的 TaskStop 杀不死 python 子进程 = 幽灵实例 ★★★
+- **症状**：两个批跑实例"同时"跑，远程栈被互相 pkill/restart，数据全废。
+- **根因**：Windows 上杀外层 bash 不会级联杀 python.exe 子进程；TaskStop 后它继续跑完。
+- **修法**：批跑加**心跳锁**（`_lock` 文件每 30s touch，启动前查 mtime<90s 即退出）；
+  人工清理用 PowerShell 按 CommandLine 过滤后 Stop-Process -Force。
+
 ## 已知未修（TODO）
 
 - `record_traj.py` 的 slam 列与 monitor 不一致（疑似 TF 时间戳问题）——用 monitor + CSV odom 列替代。
-- goal_runner 航点表硬编码 seed42（换拓扑要重算 BFS 房间路径）。
 - CORRECT_PERIOD_S=15 参数扫描未做（预期收益有限，下限卡在地图变形）。
 
 ---

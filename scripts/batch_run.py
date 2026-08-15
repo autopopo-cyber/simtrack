@@ -104,6 +104,8 @@ def run_seed(seed):
             log("seed%d 拉 %s 失败: %s" % (seed, local, e))
     for name, cap in (("seed%d_runner.log" % seed,
                        'tmux capture-pane -p -t sim:3 -S -3000 | grep -E "✅|→|跳过|被拒|拉黑|超时" | tail -80'),
+                      ("seed%d_pane.log" % seed,
+                       'tmux capture-pane -p -t sim:3 -S -150 | tail -100'),
                       ("seed%d_progress.log" % seed, "tail -200 ~/simtrack/_progress.log")):
         try:
             _, out, _ = ssh.exec_command(cap, timeout=15)
